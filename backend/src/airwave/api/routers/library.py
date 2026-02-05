@@ -155,6 +155,8 @@ async def get_pending_matches(
         .where(BroadcastLog.match_reason.not_like("%Identity Bridge%"))
         .where(BroadcastLog.match_reason.not_like("%Verified by User%"))
         .where(BroadcastLog.match_reason.not_like("%Exact Text Match%"))
+        .where(BroadcastLog.match_reason.not_like("%Exact DB Match%"))
+        .where(BroadcastLog.match_reason.not_like("%High Confidence Match%"))
         .where(BroadcastLog.match_reason.not_like("%Auto-Promoted Identity%"))
         .group_by(
             BroadcastLog.raw_artist,

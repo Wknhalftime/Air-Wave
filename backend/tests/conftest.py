@@ -4,6 +4,8 @@ import pytest
 from airwave.api.deps import get_db
 from airwave.api.main import app
 from airwave.core.db import Base
+# Import all models to ensure Base.metadata is populated
+from airwave.core import models  # noqa
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -44,9 +46,12 @@ TestSessionLocal = async_sessionmaker(
 @pytest.fixture(scope="function")
 async def db_engine():
     """Create test database tables before each test, drop after."""
+    # Drop all tables first to ensure clean state
     async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     yield test_engine
+    # Clean up after test
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
 

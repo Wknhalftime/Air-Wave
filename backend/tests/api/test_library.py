@@ -1,7 +1,6 @@
 from datetime import datetime
 
 import pytest
-from airwave.api.main import app
 from airwave.core.models import (
     Artist,
     BroadcastLog,
@@ -11,23 +10,19 @@ from airwave.core.models import (
     Station,
     Work,
 )
-from httpx import ASGITransport, AsyncClient
 
 
 @pytest.mark.asyncio
-async def test_list_tracks_empty(db_session):
+async def test_list_tracks_empty(client):
     """Verify tracks endpoint with empty DB."""
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as ac:
-        response = await ac.get("/api/v1/library/tracks")
+    response = await client.get("/api/v1/library/tracks")
 
     assert response.status_code == 200
     assert response.json() == []
 
 
 @pytest.mark.asyncio
-async def test_list_tracks_with_data(db_session):
+async def test_list_tracks_with_data(client, db_session):
     """Verify tracks endpoint returns data."""
     # Seed Data
     a = Artist(name="Test Artist")
@@ -46,10 +41,7 @@ async def test_list_tracks_with_data(db_session):
     db_session.add(f)
     await db_session.commit()
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as ac:
-        response = await ac.get("/api/v1/library/tracks")
+    response = await client.get("/api/v1/library/tracks")
 
     assert response.status_code == 200
     data = response.json()
@@ -59,7 +51,7 @@ async def test_list_tracks_with_data(db_session):
 
 
 @pytest.mark.asyncio
-async def test_reject_match_creates_new_track(db_session):
+async def test_reject_match_creates_new_track(client, db_session):
     """Verify that rejecting a match creates a new virtual track."""
     from sqlalchemy import select
 
@@ -93,10 +85,7 @@ async def test_reject_match_creates_new_track(db_session):
     await db_session.commit()
 
     # 2. Call Reject API
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as ac:
-        response = await ac.post(f"/api/v1/library/matches/{log.id}/reject")
+    response = await client.post(f"/api/v1/library/matches/{log.id}/reject")
 
     assert response.status_code == 200
     data = response.json()
@@ -126,10 +115,8 @@ async def test_reject_match_creates_new_track(db_session):
 
 
 @pytest.mark.asyncio
-async def test_list_artists(db_session):
+async def test_list_artists(client, db_session):
     """Verify artists endpoint returns aggregated stats."""
-    from airwave.api.deps import get_db
-
     # Seed Data
     a = Artist(name="Stat Artist")
     db_session.add(a)
@@ -145,29 +132,16 @@ async def test_list_artists(db_session):
     r2 = Recording(work_id=w1.id, title="Track 2", version_type="Remix")
     r3 = Recording(work_id=w2.id, title="Track 3", version_type="Original")
     db_session.add_all([r1, r2, r3])
-    # No commit needed if sharing session via override
-    # await db_session.commit()
     await db_session.flush()
 
-    async def override_get_db():
-        yield db_session
+    response = await client.get("/api/v1/library/artists?search=Stat Artist")
 
-    app.dependency_overrides[get_db] = override_get_db
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data) >= 1
 
-    try:
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as ac:
-            response = await ac.get("/api/v1/library/artists?search=Stat Artist")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert len(data) >= 1
-
-        # Find our artist
-        stat = next(d for d in data if d["name"] == "Stat Artist")
-        assert stat["work_count"] == 2
-        assert stat["recording_count"] == 3
-        assert stat["avatar_url"] is None
-    finally:
-        app.dependency_overrides.clear()
+    # Find our artist
+    stat = next(d for d in data if d["name"] == "Stat Artist")
+    assert stat["work_count"] == 2
+    assert stat["recording_count"] == 3
+    assert stat["avatar_url"] is None

@@ -3,6 +3,7 @@ import { fetcher } from '../lib/api';
 import { Radio, Signal } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { CircularProgress } from '../components/CircularProgress';
+import { OnboardingAlert } from '../components/OnboardingAlert';
 
 interface Station {
   id: number;
@@ -18,7 +19,16 @@ export default function Stations() {
     queryFn: () => fetcher<Station[]>('/stations/')
   });
 
+  const { data: stats } = useQuery({
+    queryKey: ['library', 'stats'],
+    queryFn: () => fetcher<{ total_tracks: number }>('/library/stats')
+  });
+
   if (isLoading) return <div className="text-gray-500">Loading stations...</div>;
+
+  const hasNoStations = (!stations || stations.length === 0);
+  const hasEmptyLibrary = stats && stats.total_tracks === 0;
+
 
   return (
     <div>
@@ -32,6 +42,15 @@ export default function Stations() {
           {stations?.length || 0} Active Stations
         </div>
       </div>
+
+      {/* Onboarding Alert */}
+      {hasEmptyLibrary && (
+        <OnboardingAlert type="empty-library" />
+      )}
+
+      {hasNoStations && !hasEmptyLibrary && (
+        <OnboardingAlert type="no-stations" />
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {stations?.map((station) => (
@@ -62,11 +81,11 @@ export default function Stations() {
           </Link>
         ))}
 
-        {(!stations || stations.length === 0) && (
-          <div className="col-span-full py-12 text-center text-gray-500 bg-gray-50 rounded-xl border border-dashed border-gray-300">
+        {hasNoStations && (
+          <div className="col-span-full py-12 text-center text-gray-500 bg-gray-50 rounded-xl border border-dashed border-gray-300 shadow-sm">
             <Radio className="w-12 h-12 mx-auto mb-4 text-gray-300" />
-            <h3 className="text-lg font-medium text-gray-900">No Stations Found</h3>
-            <p>Import broadcast logs to populate this dashboard.</p>
+            <h3 className="text-lg font-medium text-gray-900">Awaiting Data...</h3>
+            <p className="max-w-sm mx-auto mt-2">Import broadcast logs or sync your local tracks to see analytics here.</p>
           </div>
         )}
       </div>

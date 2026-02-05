@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Search } from 'lucide-react';
 import { useArtists } from '../hooks/useArtists';
 import { ArtistGrid } from '../components/library/ArtistGrid';
+import { OnboardingAlert } from '../components/OnboardingAlert';
 
 const PAGE_LIMIT = 24;
 
@@ -15,6 +16,8 @@ export default function Library() {
         limit,
         search,
     });
+
+    const hasNoArtists = !isLoading && (!artists || artists.length === 0) && !search;
 
     return (
         <div className="space-y-6">
@@ -39,6 +42,11 @@ export default function Library() {
                     </div>
                 </div>
             </div>
+
+            {/* Onboarding Alert */}
+            {hasNoArtists && (
+                <OnboardingAlert type="empty-library" />
+            )}
 
             {error ? (
                 <div className="text-center py-12 bg-white rounded-lg border border-red-100">

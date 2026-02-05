@@ -110,7 +110,9 @@ class Normalizer:
             >>> Normalizer.clean("Café (Remastered 2023)")
             'cafe'
             >>> Normalizer.clean("Rock & Roll!")
-            'rock roll'
+            'rock and roll'
+            >>> Normalizer.clean("AC/DC")
+            'ac dc'
         """
         if not text:
             return ""
@@ -122,7 +124,12 @@ class Normalizer:
         # 2. Remove remaster tags
         text = Normalizer.remove_remaster_tags(text)
 
-        # 3. Strip all non-word characters (except spaces)
+        # 3. Normalize special characters
+        text = text.replace("&", "and")
+        text = text.replace("+", "and")
+        text = text.replace("/", " ")
+
+        # 4. Strip all non-word characters (except spaces)
         text = re.sub(r"[^\w\s]", "", text)
 
         return re.sub(r"\s+", " ", text).strip()
@@ -193,6 +200,8 @@ class Normalizer:
         text = text.replace("&", "and")
         text = text.replace("+", "and")
         text = text.replace("/", " ")
+        # Note: Commas are removed in step 5 (punctuation removal)
+        # This preserves numbers like "10,000" → "10000"
 
         # 5. Remove all punctuation/symbols (but keep spaces)
         text = re.sub(r"[^\w\s]", "", text)

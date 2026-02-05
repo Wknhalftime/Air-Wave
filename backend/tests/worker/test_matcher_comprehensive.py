@@ -8,7 +8,6 @@ This test suite covers:
 - Vector semantic search
 - Alias match threshold
 - Match explain mode
-- scan_and_promote functionality
 - link_orphaned_logs functionality
 """
 
@@ -288,12 +287,15 @@ class TestMatchExplainMode:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-class TestScanAndPromote:
-    """Test scan_and_promote functionality."""
+
+class TestRunDiscovery:
+    """Test run_discovery functionality."""
 
     @pytest.mark.asyncio
-    async def test_scan_and_promote_creates_library(self, db_session):
-        """Test that scan_and_promote creates library from unique logs."""
+    async def test_run_discovery_queues_items(self, db_session):
+        """Test that run_discovery queues unique logs."""
+        from airwave.core.models import DiscoveryQueue
+        
         # Create station
         station = Station(callsign="TEST", frequency="100.0", city="Test City")
         db_session.add(station)
@@ -317,27 +319,33 @@ class TestScanAndPromote:
 
         matcher = Matcher(db_session)
 
-        # Run scan_and_promote (returns int count)
-        created_count = await matcher.scan_and_promote()
+        # Run run_discovery (returns int count)
+        created_count = await matcher.run_discovery()
 
-        # Verify recordings were created
-        stmt = select(Recording)
+        # Verify queue items were created
+        stmt = select(DiscoveryQueue)
         res = await db_session.execute(stmt)
-        recordings = res.scalars().all()
+        queue_items = res.scalars().all()
 
-        assert len(recordings) >= 2
-        assert created_count >= 2
+        assert len(queue_items) == 2
+        assert created_count == 2
+        
+        titles = [i.raw_title for i in queue_items]
+        assert "Smells Like Teen Spirit" in titles
+        assert "Alive" in titles
 
     @pytest.mark.asyncio
-    async def test_scan_and_promote_deduplicates_signatures(
+    async def test_run_discovery_deduplicates_signatures(
         self, db_session
     ):
-        """Test that scan_and_promote handles duplicate signatures.
+        """Test that run_discovery handles duplicate signatures by aggregating count.
 
         Multiple raw inputs can normalize to the same signature
         (e.g., "GODSMACK" and "Godsmack" both normalize to "godsmack").
-        This test ensures only ONE IdentityBridge is created per signature.
+        This test ensures only ONE DiscoveryQueue item is created per signature, with count=3.
         """
+        from airwave.core.models import DiscoveryQueue
+        
         # Create station
         station = Station(callsign="TEST", frequency="100.0", city="Test")
         db_session.add(station)
@@ -365,62 +373,37 @@ class TestScanAndPromote:
         db_session.add_all([log1, log2, log3])
         await db_session.commit()
 
-        # Count existing recordings and bridges before promotion
-        stmt = select(Recording)
-        res = await db_session.execute(stmt)
-        recordings_before = len(res.scalars().all())
-
-        stmt = select(IdentityBridge)
-        res = await db_session.execute(stmt)
-        bridges_before = len(res.scalars().all())
-
         matcher = Matcher(db_session)
 
-        # Run scan_and_promote
-        created_count = await matcher.scan_and_promote()
-
-        # Verify only ONE NEW recording was created (not 3)
-        stmt = select(Recording)
-        res = await db_session.execute(stmt)
-        recordings_after = len(res.scalars().all())
-        new_recordings = recordings_after - recordings_before
-        assert new_recordings == 1, (
-            f"Expected 1 new recording, got {new_recordings}"
-        )
+        # Run run_discovery
+        created_count = await matcher.run_discovery()
+        
+        # NOTE: run_discovery returns number of *unique signatures* found/updated, 
+        # NOT the total log count processed. Wait, logic says `len(sig_map)` so unique items.
         assert created_count == 1
 
-        # Verify only ONE NEW IdentityBridge was created
-        stmt = select(IdentityBridge)
+        # Verify only ONE DiscoveryQueue item was created
+        stmt = select(DiscoveryQueue)
         res = await db_session.execute(stmt)
-        bridges_after = len(res.scalars().all())
-        new_bridges = bridges_after - bridges_before
-        assert new_bridges == 1, (
-            f"Expected 1 new bridge, got {new_bridges}"
-        )
-
-        # Verify the bridge has the correct signature
-        stmt = select(IdentityBridge).order_by(
-            IdentityBridge.id.desc()
-        ).limit(1)
-        res = await db_session.execute(stmt)
-        bridge = res.scalar_one()
-
+        queue_items = res.scalars().all()
+        
+        assert len(queue_items) == 1
+        item = queue_items[0]
+        
+        # Verify count is 3
+        assert item.count == 3
+        
         from airwave.core.normalization import Normalizer
-
         expected_sig = Normalizer.generate_signature(
             "GODSMACK", "I Stand Alone"
         )
-        assert bridge.log_signature == expected_sig
+        assert item.signature == expected_sig
 
         # Verify the reference preserves one of the raw inputs
-        assert bridge.reference_artist in [
+        assert item.raw_artist in [
             "GODSMACK",
             "Godsmack",
             "godsmack",
-        ]
-        assert bridge.reference_title in [
-            "I Stand Alone",
-            "i stand alone",
         ]
 
 

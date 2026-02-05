@@ -378,6 +378,10 @@ async def update_split(
 
 @router.get("/aliases", response_model=List[ArtistAliasSchema])
 async def get_aliases(db: AsyncSession = Depends(get_db)):
+    """List all Artist Aliases."""
+    stmt = select(ArtistAlias).order_by(ArtistAlias.created_at.desc())
+    result = await db.execute(stmt)
+    return result.scalars().all()
 @router.post("/audit/{audit_id}/undo")
 async def undo_verification_action(
     audit_id: int,

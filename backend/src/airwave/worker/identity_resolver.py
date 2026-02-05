@@ -106,7 +106,8 @@ class IdentityResolver:
                 if name not in already_proposed:
                     await self._register_proposed_split(name, proposed_split)
                 # Return the 'clean' joined name to help the matcher find existing clean tracks
-                results[name] = " & ".join(proposed_split)
+                # Using semicolon as it's rare in artist names and not used in splitting logic
+                results[name] = "; ".join(proposed_split)
             else:
                 # No split detected, but let's at least Title Case the unresolved name for better matching
                 results[name] = self._clean_artist_name(name)

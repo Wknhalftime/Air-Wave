@@ -107,26 +107,20 @@ async def run_scan(task_id: Optional[str] = None) -> None:
             matcher = Matcher(session)
             logger.info("Starting Library Scan...")
 
-            # Step 1: Promote (with progress tracking)
-            new_tracks = await matcher.scan_and_promote(task_id)
+            # Step 1: Rebuild Discovery Queue (was promote)
+            # We no longer auto-promote. We queue for verification.
+            total_items = await matcher.run_discovery(task_id)
             logger.success(
-                f"Library Population Complete. Created {new_tracks} new tracks."
+                f"Discovery Queue Rebuilt. {total_items} items awaiting verification."
             )
 
-            # Step 2: Link
-            if new_tracks > 0:
-                logger.info("Linking orphaned logs...")
-                linked_count = await matcher.link_orphaned_logs()
-                logger.success(f"Linked {linked_count} logs to tracks.")
-            else:
-                logger.info(
-                    "No new tracks created. Checking for unlinked logs anyway..."
-                )
-                linked_count = await matcher.link_orphaned_logs()
-                logger.success(f"Linked {linked_count} logs to tracks.")
-
+            # Step 2: Link Orphaned Logs?
+            # run_discovery checks for suggestions but doesn't hard-link logs to recordings yet
+            # unless we implement an 'Auto-Link' policy.
+            # For now, we trust the Queue Rebuild to be the primary 'Scan' action.
+            
             if task_id:
-                TaskStore.complete_task(task_id, success=True)
+                TaskStore.complete_task(task_id, success=True, message=f"Scan complete. {total_items} items in Discovery Queue.")
 
     except Exception as e:
         logger.exception("Scan failed")
@@ -374,6 +368,35 @@ async def run_bulk_import(root_dir: str, task_id: str = None):
     if task_id:
         TaskStore.complete_task(task_id, success=True)
     logger.success(f"Bulk import complete. Processed {total_files} files.")
+
+
+async def run_discovery_task(task_id: Optional[str] = None) -> None:
+    """Rebuild the DiscoveryQueue from unmatched logs.
+
+    This is the background task wrapper for the Matcher.run_discovery method.
+
+    Args:
+        task_id: Optional Task ID for progress tracking.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            matcher = Matcher(session)
+            logger.info("Starting Discovery Queue Rebuild...")
+
+            total_items = await matcher.run_discovery(task_id=task_id)
+
+            logger.success(f"Discovery complete. Queue size: {total_items}")
+
+            if task_id:
+                TaskStore.complete_task(
+                    task_id,
+                    success=True,
+                    message=f"Discovery complete. {total_items} items in queue."
+                )
+    except Exception as e:
+        logger.exception("Discovery failed")
+        if task_id:
+            TaskStore.complete_task(task_id, success=False, error=str(e))
 
 
 async def run_debug_match(artist: str, title: str) -> None:

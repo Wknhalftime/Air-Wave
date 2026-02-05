@@ -37,13 +37,23 @@ async def test_matcher_multi_artist_scoring():
     recording.work = work
 
     # Mock multiple execute calls
+    # 1. Identity Bridge lookup (no matches)
     mock_res_bridge = MagicMock()
-    mock_res_bridge.scalars.return_value.all.return_value = []  # No bridge matches
+    mock_res_bridge.scalars.return_value.all.return_value = []
 
-    mock_res_rec = MagicMock()
-    mock_res_rec.scalars.return_value.all.return_value = [recording]
+    # 2. Exact match lookup (no matches - Artist B is not primary artist)
+    mock_res_exact = MagicMock()
+    mock_res_exact.scalars.return_value.all.return_value = []
 
-    mock_session.execute.side_effect = [mock_res_bridge, mock_res_rec]
+    # 3. Candidate fetch (finds recording via vector search)
+    mock_res_candidates = MagicMock()
+    mock_res_candidates.scalars.return_value.all.return_value = [recording]
+
+    mock_session.execute.side_effect = [
+        mock_res_bridge,
+        mock_res_exact,
+        mock_res_candidates,
+    ]
 
     # Execute batch match
     results = await matcher.match_batch([("Artist B", "Song X")])

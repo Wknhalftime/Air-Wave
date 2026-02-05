@@ -1,7 +1,7 @@
 import { useParams, Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { fetcher } from '../lib/api';
-import { ArrowLeft, Radio, AlertTriangle } from 'lucide-react';
+import { ArrowLeft, Radio, AlertTriangle, Calendar, FileText } from 'lucide-react';
 
 interface UnmatchedTrack {
     artist: string;
@@ -9,11 +9,21 @@ interface UnmatchedTrack {
     count: number;
 }
 
+interface BatchStats {
+    id: number;
+    date: string;
+    filename: string;
+    total: number;
+    matched: number;
+    match_rate: number;
+}
+
 interface StationHealth {
     station: {
         id: number;
         callsign: string;
     };
+    recent_batches: BatchStats[];
     unmatched_tracks: UnmatchedTrack[];
 }
 
@@ -67,15 +77,48 @@ export default function StationDetail() {
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                 {/* Visualizations / Stats Section */}
                 <div className="lg:col-span-2 space-y-8">
-                    {/* Placeholder for Timeline - To be implemented with Recharts if requested */}
+                    {/* Recent Import Batches */}
                     <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200">
-                        <h3 className="text-lg font-bold text-gray-900 mb-4">Matching Activity (Last 30 Days)</h3>
-                        <div className="h-64 bg-gray-50 rounded-lg flex items-center justify-center text-gray-400">
-                            Timeline Chart Placeholder
+                        <h3 className="text-lg font-bold text-gray-900 mb-4 flex items-center gap-2">
+                            <Calendar className="w-5 h-5 text-indigo-500" />
+                            Recent Imports & Match Rates
+                        </h3>
+                        <div className="space-y-4">
+                            {health.recent_batches?.map((batch) => (
+                                <div key={batch.id} className="flex items-center justify-between p-4 bg-gray-50 rounded-lg border border-gray-100">
+                                    <div className="flex items-center gap-4">
+                                        <div className={`w-12 h-12 rounded-full flex items-center justify-center font-bold text-sm border-4 
+                                            ${batch.match_rate >= 90 ? 'border-green-100 text-green-700 bg-green-50' :
+                                                batch.match_rate >= 70 ? 'border-yellow-100 text-yellow-700 bg-yellow-50' :
+                                                    'border-red-100 text-red-700 bg-red-50'}`}>
+                                            {Math.round(batch.match_rate)}%
+                                        </div>
+                                        <div>
+                                            <div className="font-medium text-gray-900 flex items-center gap-2">
+                                                <FileText className="w-4 h-4 text-gray-400" />
+                                                {batch.filename}
+                                            </div>
+                                            <div className="text-xs text-gray-500">
+                                                {new Date(batch.date).toLocaleDateString()} • {batch.matched.toLocaleString()} / {batch.total.toLocaleString()} tracks
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="h-2 w-24 bg-gray-200 rounded-full overflow-hidden">
+                                        <div
+                                            className={`h-full rounded-full ${batch.match_rate >= 90 ? 'bg-green-500' : batch.match_rate >= 70 ? 'bg-yellow-500' : 'bg-red-500'}`}
+                                            style={{ width: `${batch.match_rate}%` }}
+                                        />
+                                    </div>
+                                </div>
+                            ))}
+
+                            {(!health.recent_batches || health.recent_batches.length === 0) && (
+                                <div className="text-center py-8 text-gray-400">
+                                    No recent import batches found for this station.
+                                </div>
+                            )}
                         </div>
                     </div>
-
-
                 </div>
 
                 {/* Sidebar: Top Unmatched */}

@@ -24,6 +24,7 @@ from airwave.core.models import SystemSetting
 from airwave.core.task_store import TaskStore
 from airwave.worker.main import (
     run_bulk_import,
+    run_discovery_task,
     run_import,
     run_scan,
     run_sync_files,
@@ -38,8 +39,42 @@ class Setting(BaseModel):
     description: Optional[str] = None
 
 
+
 class ScanRequest(BaseModel):
     path: Optional[str] = None
+
+
+@router.get("/pipeline-stats")
+async def get_pipeline_stats(session: AsyncSession = Depends(get_db)):
+    """Get stats for the mission control pipeline."""
+    from sqlalchemy import func, select
+
+    from airwave.core.models import BroadcastLog, DiscoveryQueue, Recording
+
+    # Total Logs
+    res = await session.execute(select(func.count(BroadcastLog.id)))
+    total_logs = res.scalar() or 0
+
+    # Unmatched
+    res = await session.execute(
+        select(func.count(BroadcastLog.id)).where(BroadcastLog.recording_id.is_(None))
+    )
+    unmatched_logs = res.scalar() or 0
+
+    # Discovery Queue
+    res = await session.execute(select(func.count(DiscoveryQueue.signature)))
+    discovery_count = res.scalar() or 0
+
+    # Verified Library (Tracks)
+    res = await session.execute(select(func.count(Recording.id)))
+    total_tracks = res.scalar() or 0
+
+    return {
+        "total_logs": total_logs,
+        "unmatched_logs": unmatched_logs,
+        "discovery_queue": discovery_count,
+        "total_tracks": total_tracks,
+    }
 
 
 @router.get("/settings", response_model=List[Setting])
@@ -318,19 +353,35 @@ async def trigger_internal_scan(background_tasks: BackgroundTasks):
     return {"status": "started", "task_id": task_id}
 
 
+@router.post("/trigger-discovery")
+async def trigger_discovery(background_tasks: BackgroundTasks):
+    """Rebuild the DiscoveryQueue from unmatched logs with progress tracking."""
+    task_id = str(uuid.uuid4())
+    # Pre-create task entry so SSE can connect immediately
+    TaskStore.create_task(task_id, "discovery", 1)
+    TaskStore.update_progress(task_id, 0, "Initializing discovery...")
+    background_tasks.add_task(run_discovery_task, task_id)
+    return {"status": "started", "task_id": task_id}
+
+
 @router.post("/import-folder")
 async def import_folder(background_tasks: BackgroundTasks, req: ScanRequest):
     """Trigger a recursive bulk import from a folder."""
+    logger.info(f"Bulk import request received: {req}")
+
     path = req.path
     if not path:
+        logger.error("Bulk import failed: Path is required")
         raise HTTPException(status_code=400, detail="Path is required")
 
     # Verify path exists
     if not os.path.exists(path):
+        logger.error(f"Bulk import failed: Path does not exist: {path}")
         raise HTTPException(
-            status_code=400, detail="Path does not exist on server"
+            status_code=400, detail=f"Path does not exist on server: {path}"
         )
 
+    logger.info(f"Starting bulk import from: {path}")
     task_id = str(uuid.uuid4())
     TaskStore.create_task(task_id, "import", 1)
     TaskStore.update_progress(task_id, 0, f"Initializing import for {path}...")

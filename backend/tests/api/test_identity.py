@@ -37,7 +37,7 @@ async def test_confirm_split_api(client: AsyncClient, db_session):
 
     response = await client.post(f"/api/v1/identity/splits/{split.id}/confirm")
     assert response.status_code == 200
-    assert response.json()["resolved_as"] == "Nirvana & In Utero"
+    assert response.json()["resolved_as"] == "Nirvana; In Utero"
 
     # Verify DB state
     await db_session.refresh(split)
@@ -48,7 +48,7 @@ async def test_confirm_split_api(client: AsyncClient, db_session):
     res = await db_session.execute(stmt)
     alias = res.scalar_one_or_none()
     assert alias is not None
-    assert alias.resolved_name == "Nirvana & In Utero"
+    assert alias.resolved_name == "Nirvana; In Utero"
     assert alias.is_verified is True
 
 

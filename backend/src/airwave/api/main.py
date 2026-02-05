@@ -32,6 +32,7 @@ from airwave.api.routers import (
     search,
     system,
     stations,
+    discovery,
 )
 from airwave.core.config import settings
 from airwave.core.db import AsyncSessionLocal, init_db
@@ -110,6 +111,9 @@ app.include_router(
     stations.router, prefix="/api/v1/stations", tags=["Stations"]
 )
 app.include_router(export.router, prefix="/api/v1/export", tags=["Export"])
+app.include_router(
+    discovery.router, prefix="/api/v1/discovery", tags=["Discovery"]
+)
 
 
 @app.get("/")

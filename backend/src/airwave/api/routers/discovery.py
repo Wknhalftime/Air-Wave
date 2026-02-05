@@ -92,17 +92,63 @@ async def link_discovery_item(
         if log_sig == req.signature:
             logs_to_update.append(log.id)
 
-    # 4. Create IdentityBridge
-    bridge = IdentityBridge(
-        log_signature=req.signature,
-        recording_id=req.recording_id,
-        reference_artist=queue_item.raw_artist,
-        reference_title=queue_item.raw_title
+    # 3b. Verify Signature Integrity (AC 3)
+    # The signature in the request MUST match the hash of the raw
+    # data in the queue. This prevents UI/API drift or malicious inputs.
+    expected_sig = Normalizer.generate_signature(
+        queue_item.raw_artist, queue_item.raw_title
     )
-    db.add(bridge)
-    await db.flush()  # Ensure bridge is created before updating logs
+    if req.signature != expected_sig:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Signature mismatch. Expected {expected_sig}, "
+                f"got {req.signature}"
+            )
+        )
 
-    # 5. Update BroadcastLogs
+    # 4. Upsert IdentityBridge (AC 1, 2, 4)
+    # Check for EXISTING bridge (Active or Revoked)
+    stmt = select(IdentityBridge).where(
+        IdentityBridge.log_signature == req.signature
+    )
+    bridge = (await db.execute(stmt)).scalar_one_or_none()
+
+    if bridge:
+        if bridge.is_revoked:
+            # AC 2: Revivification (Re-Link)
+            bridge.is_revoked = False
+            bridge.recording_id = req.recording_id
+            bridge.reference_artist = queue_item.raw_artist
+            bridge.reference_title = queue_item.raw_title
+            # We don't need to add() it, it's attached to session
+        else:
+            # AC 4: Conflict Prevention (Active Bridge Exists)
+            if bridge.recording_id != req.recording_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Conflict: This item is already linked to a "
+                        "different recording. Please Undo the existing "
+                        "link first."
+                    )
+                )
+            # If recording_id matches, it's a no-op (idempotent)
+    else:
+        # AC 1: Create New Bridge
+        bridge = IdentityBridge(
+            log_signature=req.signature,
+            recording_id=req.recording_id,
+            reference_artist=queue_item.raw_artist,
+            reference_title=queue_item.raw_title
+        )
+        db.add(bridge)
+    
+    await db.flush()  # Ensure bridge ID is available
+
+    # 5. Update BroadcastLogs (AC 2: Update logs even if bridge existed)
+    # We always re-scan logs because the "Revivification" might imply
+    # we missed some, or if we are switching from a "Ghost" state.
     if logs_to_update:
         update_stmt = (
             update(BroadcastLog)
@@ -163,7 +209,9 @@ async def promote_discovery_item(
         await db.flush()
         
     # 2. Get/Create Work
-    stmt_w = select(Work).where(Work.title == clean_title, Work.artist_id == artist.id)
+    stmt_w = select(Work).where(
+        Work.title == clean_title, Work.artist_id == artist.id
+    )
     work = (await db.execute(stmt_w)).scalar_one_or_none()
     if not work:
         work = Work(title=clean_title, artist_id=artist.id)
@@ -172,7 +220,9 @@ async def promote_discovery_item(
         
     # 3. Create Recording (Silver)
     # Check if exists first to avoid dupes?
-    stmt_r = select(Recording).where(Recording.work_id == work.id, Recording.title == clean_title)
+    stmt_r = select(Recording).where(
+        Recording.work_id == work.id, Recording.title == clean_title
+    )
     rec = (await db.execute(stmt_r)).scalar_one_or_none()
     
     if not rec:
@@ -190,17 +240,20 @@ async def promote_discovery_item(
         if not rec.is_verified:
              rec.is_verified = True
     
-    # 4. Create Bridge
-    bridge = IdentityBridge(
-        log_signature=req.signature,
-        recording_id=rec.id,
-        reference_artist=queue_item.raw_artist,
-        reference_title=queue_item.raw_title
+    # 3b. Verify Signature Integrity (AC 3)
+    expected_sig = Normalizer.generate_signature(
+        queue_item.raw_artist, queue_item.raw_title
     )
-    db.add(bridge)
-    await db.flush()
+    if req.signature != expected_sig:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Signature mismatch. Expected {expected_sig}, "
+                f"got {req.signature}"
+            )
+        )
 
-    # 5. Update BroadcastLogs (same logic as link)
+    # 3c. Collect affected BroadcastLog IDs
     unmatched_logs_stmt = select(BroadcastLog).where(
         BroadcastLog.recording_id.is_(None)
     )
@@ -212,6 +265,42 @@ async def promote_discovery_item(
         if log_sig == req.signature:
             logs_to_update.append(log.id)
 
+    # 4. Upsert IdentityBridge (AC 1, 2, 4)
+    stmt = select(IdentityBridge).where(
+        IdentityBridge.log_signature == req.signature
+    )
+    bridge = (await db.execute(stmt)).scalar_one_or_none()
+
+    if bridge:
+        if bridge.is_revoked:
+            # AC 2: Revivification
+            bridge.is_revoked = False
+            bridge.recording_id = rec.id
+            bridge.reference_artist = queue_item.raw_artist
+            bridge.reference_title = queue_item.raw_title
+        else:
+            # AC 4: Conflict Prevention
+            if bridge.recording_id != rec.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Conflict: This item is already linked to a "
+                        "different recording. Please Undo the existing "
+                        "link first."
+                    )
+                )
+    else:
+        bridge = IdentityBridge(
+            log_signature=req.signature,
+            recording_id=rec.id,
+            reference_artist=queue_item.raw_artist,
+            reference_title=queue_item.raw_title
+        )
+        db.add(bridge)
+    
+    await db.flush()
+
+    # 5. Update BroadcastLogs
     if logs_to_update:
         update_stmt = (
             update(BroadcastLog)

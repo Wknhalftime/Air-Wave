@@ -125,9 +125,9 @@ export default function Reports() {
                                     cx="50%"
                                     cy="50%"
                                     outerRadius={100}
-                                    label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                                    label={({ name, percent }) => `${name} ${((percent || 0) * 100).toFixed(0)}%`}
                                 >
-                                    {victory?.breakdown.map((entry, index) => (
+                                    {victory?.breakdown.map((_, index) => (
                                         <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                                     ))}
                                 </Pie>
@@ -213,7 +213,7 @@ export default function Reports() {
                         Download CSV Report
                     </button>
                     <p className="mt-4 text-sm text-gray-500">
-                        Exports a localized CSV file compatible with MusicMaster, WideOrbit, and RCS Selector.
+                        Exports a localized CSV file.
                     </p>
                 </div>
             </div>

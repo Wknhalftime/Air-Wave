@@ -35,7 +35,9 @@ from airwave.core.models import (
     IdentityBridge,
     Recording,
     Work,
+    DiscoveryQueue,
 )
+from sqlalchemy import delete, func
 from airwave.core.normalization import Normalizer
 from airwave.core.task_store import TaskStore
 from airwave.core.vector_db import VectorDB
@@ -428,176 +430,103 @@ class Matcher:
         res = await self.match_batch([(raw_artist, raw_title)])
         return res.get((raw_artist, raw_title), (None, "No Match Found"))
 
-    async def scan_and_promote(self, task_id: Optional[str] = None) -> int:
-        """Scans all BroadcastLogs, identifies unique Artist/Title pairs,
-        and promotes them to the Tracks library if they don't exist.
-        Returns the number of new tracks created.
+    async def run_discovery(self, task_id: Optional[str] = None) -> int:
+        """Rebuilds the DiscoveryQueue from unmatched logs.
+        
+        Instead of creating 'Ghost Recordings', this method aggregates unmatched
+        broadcast logs into the DiscoveryQueue table. It then attempts to find
+        suggestions by matching against the existing library.
         """
-        if not hasattr(self, "_vector_db"):
-            self._vector_db = VectorDB()
+        logger.info("Starting Run Discovery (Queue Rebuild)...")
 
-        vector_db = self._vector_db
-
-        # 1. Get all unique raw artist/title pairs
-        # Optimization: Use streaming or process in logical batches if memory is an issue,
-        # but for ~200k pairs, fetchall is usually okay.
-        logger.info("Identifying unique artist/title pairs in logs...")
-        stmt = select(
-            BroadcastLog.raw_artist, BroadcastLog.raw_title
-        ).distinct()
+        # 1. Clear existing Queue to ensure fresh state
+        await self.session.execute(delete(DiscoveryQueue))
+        
+        # 2. Fetch Unmatched Logs (Aggregated by Raw Text)
+        # We group by raw text first to let SQL do the heavy lifting of counting identical strings
+        stmt = (
+            select(
+                BroadcastLog.raw_artist, 
+                BroadcastLog.raw_title, 
+                func.count(BroadcastLog.id)
+            )
+            .where(BroadcastLog.recording_id.is_(None))
+            .group_by(BroadcastLog.raw_artist, BroadcastLog.raw_title)
+        )
         result = await self.session.execute(stmt)
-        unique_pairs = result.fetchall()
+        rows = result.all()
+        
+        if not rows:
+            logger.info("No unmatched logs found.")
+            if task_id:
+                TaskStore.update_progress(task_id, 100, "No unmatched logs found.")
+            return 0
 
-        # 2. Deduplicate by normalized signature
-        # Multiple raw inputs can normalize to the same signature
-        # (e.g., "GODSMACK" and "Godsmack" both → "godsmack")
-        # We keep the first raw input as the reference for IdentityBridge
-        logger.info(
-            f"Found {len(unique_pairs)} unique raw pairs. "
-            "Deduplicating by normalized signature..."
-        )
-        signature_map = {}  # signature -> (raw_artist, raw_title)
-        for raw_artist, raw_title in unique_pairs:
-            if not raw_artist or not raw_title:
+        # 3. Group by Normalized Signature in Python
+        # Different raw strings might normalize to the same signature (Case, minor spacing).
+        # We aggregate them here.
+        sig_map = {}  # signature -> {signature, raw_artist, raw_title, count}
+        
+        for r_artist, r_title, count in rows:
+            if not r_artist or not r_title: 
                 continue
-            sig = Normalizer.generate_signature(raw_artist, raw_title)
-            if sig not in signature_map:
-                signature_map[sig] = (raw_artist, raw_title)
-
-        deduplicated_pairs = list(signature_map.values())
-        total_pairs = len(deduplicated_pairs)
-        logger.info(
-            f"After deduplication: {total_pairs} unique signatures. "
-            "Starting promotion..."
-        )
-
+                
+            sig = Normalizer.generate_signature(r_artist, r_title)
+            
+            if sig not in sig_map:
+                sig_map[sig] = {
+                    "signature": sig,
+                    "raw_artist": r_artist, # Keep the first one encountered as display
+                    "raw_title": r_title,
+                    "count": 0
+                }
+            
+            sig_map[sig]["count"] += count
+            
+        queue_items = list(sig_map.values())
+        total_items = len(queue_items)
+        logger.info(f"Aggregated into {total_items} unique signatures.")
+        
         if task_id:
-            TaskStore.update_total(
-                task_id,
-                total_pairs,
-                f"Processing {total_pairs} unique signatures...",
-            )
+             TaskStore.update_total(task_id, total_items, f"Processing {total_items} discovery items...")
 
-        created_count = 0
+        # 4. Create Queue Objects
+        dq_objects = [DiscoveryQueue(**item) for item in queue_items]
+        self.session.add_all(dq_objects)
+        await self.session.flush() # Flush to ensure they are tracked, though we don't need IDs yet (PK is signature)
+        
+        # 5. Run Automatch for Suggestions
+        # Process in batches to efficiently find suggestions without overloading
+        BATCH_SIZE = 500
         processed = 0
-
-        for raw_artist, raw_title in deduplicated_pairs:
-            if not raw_artist or not raw_title:
-                processed += 1
-                continue
-
-            clean_artist_name = Normalizer.clean_artist(raw_artist)
-            clean_title_name = Normalizer.clean(raw_title)
-
-            if not clean_artist_name or not clean_title_name:
-                processed += 1
-                continue
-
-            # Check if exists (Clean exact match on Recording?)
-            # Optimization: We could pre-load existing recordings into a set if memory allows,
-            # but let's stick to DB queries for now but make them simpler.
-            stmt = (
-                select(Recording)
-                .join(Work)
-                .join(Artist)
-                .where(
-                    Artist.name == clean_artist_name,
-                    Recording.title == clean_title_name,
+        
+        # Map for quick update
+        obj_map = {obj.signature: obj for obj in dq_objects}
+        
+        for i in range(0, total_items, BATCH_SIZE):
+            batch_objs = dq_objects[i : i + BATCH_SIZE]
+            batch_queries = [(obj.raw_artist, obj.raw_title) for obj in batch_objs]
+            
+            # Use existing efficient match_batch
+            matches = await self.match_batch(batch_queries)
+            
+            for (qa, qt), (rec_id, _) in matches.items():
+                if rec_id:
+                    sig = Normalizer.generate_signature(qa, qt)
+                    if sig in obj_map:
+                        obj_map[sig].suggested_recording_id = rec_id
+            
+            processed += len(batch_objs)
+            if task_id and i % 1000 == 0:
+                 TaskStore.update_progress(
+                    task_id, 
+                    processed, 
+                    f"Analyzed {processed}/{total_items} items..."
                 )
-                .limit(1)
-            )
-            res = await self.session.execute(stmt)
-            track = res.scalar_one_or_none()
-
-            # Create Identity Bridge Logic
-            signature = Normalizer.generate_signature(raw_artist, raw_title)
-
-            if not track:
-                # Create Hierarchy
-                # 1. Artist
-                stmt_a = select(Artist).where(Artist.name == clean_artist_name)
-                res_a = await self.session.execute(stmt_a)
-                artist = res_a.scalar_one_or_none()
-                if not artist:
-                    artist = Artist(name=clean_artist_name)
-                    self.session.add(artist)
-                    await self.session.flush()
-
-                # 2. Work
-                stmt_w = select(Work).where(
-                    Work.title == clean_title_name, Work.artist_id == artist.id
-                )
-                res_w = await self.session.execute(stmt_w)
-                work = res_w.scalar_one_or_none()
-                if not work:
-                    work = Work(title=clean_title_name, artist_id=artist.id)
-                    self.session.add(work)
-                    await self.session.flush()
-
-                # 3. Recording (Virtual)
-                virtual_title = clean_title_name
-                stmt_r = select(Recording).where(
-                    Recording.work_id == work.id,
-                    Recording.title == virtual_title,
-                )
-                res_r = await self.session.execute(stmt_r)
-                recording = res_r.scalar_one_or_none()
-
-                if not recording:
-                    recording = Recording(
-                        work_id=work.id,
-                        title=virtual_title,
-                        version_type="Original",
-                    )
-                    self.session.add(recording)
-                    await self.session.flush()
-
-                    # Add to VectorDB
-                    vector_db.add_track(
-                        recording.id, clean_artist_name, clean_title_name
-                    )
-                    created_count += 1
-
-                track = recording
-
-            # Identity Bridge
-            stmt = select(IdentityBridge).where(
-                IdentityBridge.log_signature == signature
-            )
-            res = await self.session.execute(stmt)
-            bridge = res.scalar_one_or_none()
-
-            if not bridge:
-                bridge = IdentityBridge(
-                    log_signature=signature,
-                    recording_id=track.id,
-                    reference_artist=raw_artist,
-                    reference_title=raw_title,
-                )
-                self.session.add(bridge)
-
-            processed += 1
-
-            if processed % 100 == 0:
-                # Commit every 100 to avoid massive uncommitted state
-                await self.session.commit()
-                if task_id:
-                    TaskStore.update_progress(
-                        task_id,
-                        processed,
-                        f"Promoted {created_count} tracks ({processed}/{total_pairs})",
-                    )
-                if processed % 1000 == 0:
-                    logger.info(
-                        f"Promotion progress: {processed}/{total_pairs}..."
-                    )
 
         await self.session.commit()
-        logger.success(
-            f"Promotion complete. Created {created_count} virtual tracks."
-        )
-
-        return created_count
+        logger.success(f"Discovery Queue Rebuilt. {total_items} items active.")
+        return total_items
 
     async def link_orphaned_logs(self) -> int:
         """Links logs that have a NULL recording_id to a recording via IdentityBridge."""

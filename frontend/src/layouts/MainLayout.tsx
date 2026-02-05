@@ -3,6 +3,7 @@ import { Home, ListMusic, History, Activity, BarChart3, Settings, CheckSquare, R
 import { clsx } from 'clsx';
 import { useQuery } from '@tanstack/react-query';
 import { fetcher } from '../lib/api';
+import { GlobalTaskProgress } from '../components/GlobalTaskProgress';
 
 export default function MainLayout() {
     const location = useLocation();
@@ -58,21 +59,28 @@ export default function MainLayout() {
                 </nav>
 
                 {/* Status Footer */}
-                <div className="p-4 border-t border-gray-100 text-xs">
-                    <Link to="/admin" className="flex items-center gap-2 text-gray-500 hover:text-indigo-600 mb-4 transition-colors">
-                        <Settings className="w-4 h-4" />
-                        <span>Administration</span>
-                    </Link>
-
-                    <div className="flex items-center justify-between text-gray-500">
-                        <span>System Status</span>
-                        <span className={clsx(
-                            "w-2 h-2 rounded-full",
-                            health?.status === 'ok' ? "bg-green-500" : "bg-red-500"
-                        )} />
+                <div className="mt-auto">
+                    {/* Global Task Progress */}
+                    <div className="px-4 pb-3">
+                        <GlobalTaskProgress />
                     </div>
-                    <div className="mt-1 text-gray-400">
-                        DB: {health?.database || 'Connecting...'}
+
+                    <div className="p-4 border-t border-gray-100 text-xs">
+                        <Link to="/admin" className="flex items-center gap-2 text-gray-500 hover:text-indigo-600 mb-4 transition-colors">
+                            <Settings className="w-4 h-4" />
+                            <span>Administration</span>
+                        </Link>
+
+                        <div className="flex items-center justify-between text-gray-500">
+                            <span>System Status</span>
+                            <span className={clsx(
+                                "w-2 h-2 rounded-full",
+                                health?.status === 'ok' ? "bg-green-500" : "bg-red-500"
+                            )} />
+                        </div>
+                        <div className="mt-1 text-gray-400">
+                            DB: {health?.database || 'Connecting...'}
+                        </div>
                     </div>
                 </div>
             </aside>
