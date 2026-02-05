@@ -1,23 +1,12 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { fetcher } from '../lib/api';
-import { Check, X, AlertCircle, CheckCircle2, XCircle } from 'lucide-react';
+import { CheckCircle2, Layers, List, Search } from 'lucide-react';
 import { useState, useEffect } from 'react';
+import IdentityProposals from '../components/verification/IdentityProposals';
+import FocusDeck from '../components/verification/FocusDeck';
+import SearchDrawer from '../components/verification/SearchDrawer';
 
-
-interface PendingMatch {
-    id: number;
-    played_at: string;
-    station: string;
-    raw_artist: string;
-    raw_title: string;
-    match_reason: string;
-    track: {
-        id: number;
-        artist: string;
-        title: string;
-        path: string;
-    };
-}
+import type { QueueItem } from '../types';
 
 interface ProposedSplit {
     id: number;
@@ -31,13 +20,20 @@ interface ProposedSplit {
 export default function Verification() {
     const queryClient = useQueryClient();
     const [view, setView] = useState<'matches' | 'identity'>('matches');
-    const [processingId, setProcessingId] = useState<number | null>(null);
-    const [processingAction, setProcessingAction] = useState<'confirm' | 'reject' | null>(null);
-    const [batchSelections, setBatchSelections] = useState<Record<number, boolean>>({});
+    const [matchMode, setMatchMode] = useState<'deck' | 'list'>('deck');
+    const [processingId, setProcessingId] = useState<string | null>(null);
 
-    const { data: matches, isLoading: isLoadingMatches } = useQuery({
-        queryKey: ['matches', 'pending'],
-        queryFn: () => fetcher<PendingMatch[]>('/library/matches/pending?limit=50'),
+    // Search drawer state
+    const [isSearchDrawerOpen, setIsSearchDrawerOpen] = useState(false);
+    const [searchingForItem, setSearchingForItem] = useState<QueueItem | null>(null);
+
+    // Batch selection state (Story 3.4)
+    const [selectedSignatures, setSelectedSignatures] = useState<Set<string>>(new Set());
+    const [processingIds, setProcessingIds] = useState<Set<string>>(new Set());
+
+    const { data: queueItems, isLoading: isLoadingQueue } = useQuery({
+        queryKey: ['discovery', 'queue'],
+        queryFn: () => fetcher<QueueItem[]>('/discovery/queue?limit=100'),
     });
 
     const { data: pendingSplits, isLoading: isLoadingSplits } = useQuery({
@@ -46,106 +42,227 @@ export default function Verification() {
         enabled: view === 'identity'
     });
 
-    const verifyMutation = useMutation({
-        mutationFn: (id: number) => fetcher(`/library/matches/${id}/verify?apply_to_artist=${!!batchSelections[id]}`, { method: 'POST' }),
-        onMutate: (id) => {
-            setProcessingId(id);
-            setProcessingAction('confirm');
-        },
-        onSuccess: (_, id) => {
-            setTimeout(() => {
-                queryClient.invalidateQueries({ queryKey: ['matches', 'pending'] });
-                setProcessingId(null);
-                setProcessingAction(null);
-                setBatchSelections(prev => {
-                    const next = { ...prev };
-                    delete next[id];
-                    return next;
-                });
-            }, 600); // Wait for animation
-        }
-    });
-
-    const rejectMutation = useMutation({
-        mutationFn: (id: number) => fetcher(`/library/matches/${id}/reject?apply_to_artist=${!!batchSelections[id]}`, { method: 'POST' }),
-        onMutate: (id) => {
-            setProcessingId(id);
-            setProcessingAction('reject');
-        },
-        onSuccess: (_, id) => {
-            setTimeout(() => {
-                queryClient.invalidateQueries({ queryKey: ['matches', 'pending'] });
-                setProcessingId(null);
-                setProcessingAction(null);
-                setBatchSelections(prev => {
-                    const next = { ...prev };
-                    delete next[id];
-                    return next;
-                });
-            }, 600); // Wait for animation
-        }
-    });
-
-    const confirmSplitMutation = useMutation({
-        mutationFn: (id: number) => fetcher(`/identity/splits/${id}/confirm`, { method: 'POST' }),
+    const linkMutation = useMutation({
+        mutationFn: (item: QueueItem) => fetcher('/discovery/link', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                signature: item.signature,
+                recording_id: item.suggested_recording_id,
+            }),
+        }),
         onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['identity', 'splits', 'pending'] });
+            queryClient.invalidateQueries({ queryKey: ['discovery', 'queue'] });
         }
     });
 
-    const rejectSplitMutation = useMutation({
-        mutationFn: (id: number) => fetcher(`/identity/splits/${id}/reject`, { method: 'POST' }),
+    const dismissMutation = useMutation({
+        mutationFn: (signature: string) => fetcher(`/discovery/${encodeURIComponent(signature)}`, {
+            method: 'DELETE',
+        }),
         onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['identity', 'splits', 'pending'] });
+            queryClient.invalidateQueries({ queryKey: ['discovery', 'queue'] });
         }
     });
+
+    const promoteMutation = useMutation({
+        mutationFn: (item: QueueItem) => fetcher('/discovery/promote', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ signature: item.signature }),
+        }),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['discovery', 'queue'] });
+        }
+    });
+
+    // Handlers for deck actions
+    const handleDeckAction = (item: QueueItem, action: 'link' | 'skip' | 'publish') => {
+        // Optimistic Update: Remove from list immediately to trigger exit animation
+        queryClient.setQueryData(['discovery', 'queue'], (old: QueueItem[] | undefined) => {
+            if (!old) return [];
+            return old.filter(i => i.signature !== item.signature);
+        });
+
+        // Trigger Mutation
+        if (action === 'link') linkMutation.mutate(item);
+        else if (action === 'skip') dismissMutation.mutate(item.signature);
+        else if (action === 'publish') promoteMutation.mutate(item);
+    };
+
+    const handleOpenSearch = (item: QueueItem) => {
+        setSearchingForItem(item);
+        setIsSearchDrawerOpen(true);
+    };
+
+    const handleSearchSelect = (recording: { id: number; artist: string; title: string }) => {
+        if (!searchingForItem) return;
+
+        // Update the queue item with the selected recording
+        queryClient.setQueryData(['discovery', 'queue'], (old: QueueItem[] | undefined) => {
+            if (!old) return [];
+            return old.map(item => {
+                if (item.signature === searchingForItem.signature) {
+                    return {
+                        ...item,
+                        suggested_recording_id: recording.id,
+                        suggested_recording: {
+                            id: recording.id,
+                            title: recording.title,
+                            work: {
+                                artist: {
+                                    name: recording.artist
+                                }
+                            }
+                        }
+                    };
+                }
+                return item;
+            });
+        });
+
+        setIsSearchDrawerOpen(false);
+        setSearchingForItem(null);
+    };
+
+    // Batch selection handlers (Story 3.4)
+    const handleToggleSelect = (signature: string) => {
+        setSelectedSignatures(prev => {
+            const next = new Set(prev);
+            if (next.has(signature)) {
+                next.delete(signature);
+            } else {
+                next.add(signature);
+            }
+            return next;
+        });
+    };
+
+    const handleToggleSelectAll = () => {
+        if (!queueItems) return;
+        if (selectedSignatures.size === queueItems.length) {
+            setSelectedSignatures(new Set());
+        } else {
+            setSelectedSignatures(new Set(queueItems.map(item => item.signature)));
+        }
+    };
+
+    const handleBulkLink = async () => {
+        if (!queueItems) return;
+        const selectedItems = queueItems.filter(item => selectedSignatures.has(item.signature));
+
+        // Check all have suggestions
+        const allHaveSuggestions = selectedItems.every(item => item.suggested_recording_id);
+        if (!allHaveSuggestions) {
+            alert('All selected items must have suggestions to bulk link');
+            return;
+        }
+
+        setProcessingIds(new Set(selectedItems.map(i => i.signature)));
+
+        const results = await Promise.allSettled(
+            selectedItems.map(item =>
+                fetcher('/discovery/link', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        signature: item.signature,
+                        recording_id: item.suggested_recording_id,
+                    }),
+                })
+            )
+        );
+
+        const successCount = results.filter(r => r.status === 'fulfilled').length;
+        const failedCount = results.filter(r => r.status === 'rejected').length;
+
+        if (failedCount === 0) {
+            alert(`✅ Linked ${successCount} of ${selectedItems.length} tracks`);
+        } else {
+            alert(`⚠️ Linked ${successCount} of ${selectedItems.length}. ${failedCount} failed.`);
+        }
+
+        setProcessingIds(new Set());
+        setSelectedSignatures(new Set());
+        queryClient.invalidateQueries({ queryKey: ['discovery', 'queue'] });
+    };
+
+    const handleBulkIgnore = async () => {
+        if (!queueItems) return;
+        const selectedItems = queueItems.filter(item => selectedSignatures.has(item.signature));
+
+        setProcessingIds(new Set(selectedItems.map(i => i.signature)));
+
+        const results = await Promise.allSettled(
+            selectedItems.map(item =>
+                fetcher(`/discovery/${encodeURIComponent(item.signature)}`, {
+                    method: 'DELETE',
+                })
+            )
+        );
+
+        const successCount = results.filter(r => r.status === 'fulfilled').length;
+        const failedCount = results.filter(r => r.status === 'rejected').length;
+
+        if (failedCount === 0) {
+            alert(`✅ Ignored ${successCount} of ${selectedItems.length} tracks`);
+        } else {
+            alert(`⚠️ Ignored ${successCount} of ${selectedItems.length}. ${failedCount} failed.`);
+        }
+
+        setProcessingIds(new Set());
+        setSelectedSignatures(new Set());
+        queryClient.invalidateQueries({ queryKey: ['discovery', 'queue'] });
+    };
 
     // Keyboard Shortcuts
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
-            // Ignore if input/textarea is focused (though we don't have many here)
             if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 
-            if (view === 'matches' && matches && matches.length > 0) {
-                const topMatch = matches[0];
-                if (processingId) return; // Ignore if busy
+            // Deck Mode Shortcuts
+            if (view === 'matches' && matchMode === 'deck' && queueItems && queueItems.length > 0) {
+                const currentItem = queueItems[0];
+                if (processingId) return;
 
-                switch (e.key) {
-                    case 'ArrowRight':
-                        verifyMutation.mutate(topMatch.id);
+                switch (e.key.toLowerCase()) {
+                    case 'arrowright':
+                        if (currentItem.suggested_recording_id) {
+                            handleDeckAction(currentItem, 'link');
+                        }
                         break;
-                    case 'ArrowLeft':
-                        rejectMutation.mutate(topMatch.id);
+                    case 'arrowleft':
+                        handleDeckAction(currentItem, 'skip');
                         break;
-                    case ' ':
-                        e.preventDefault(); // Prevent scroll
-                        setBatchSelections(prev => ({
-                            ...prev,
-                            [topMatch.id]: !prev[topMatch.id]
-                        }));
+                    case 's':
+                        handleOpenSearch(currentItem);
                         break;
-                    case 'Escape':
-                        setBatchSelections({});
+                    case 'p':
+                        handleDeckAction(currentItem, 'publish');
                         break;
                 }
-            } else if (view === 'identity' && pendingSplits && pendingSplits.length > 0) {
-                const topSplit = pendingSplits[0];
-                // Can add Identity shortcuts?
-                // Right -> Confirm, Left -> Reject
-                switch (e.key) {
-                    case 'ArrowRight':
-                        confirmSplitMutation.mutate(topSplit.id);
-                        break;
-                    case 'ArrowLeft':
-                        rejectSplitMutation.mutate(topSplit.id);
-                        break;
+            }
+
+            // List Mode Shortcuts (Story 3.4)
+            if (view === 'matches' && matchMode === 'list' && queueItems && queueItems.length > 0) {
+                if (e.ctrlKey || e.metaKey) {
+                    switch (e.key.toLowerCase()) {
+                        case 'a':
+                            e.preventDefault();
+                            handleToggleSelectAll();
+                            break;
+                        case 'd':
+                            e.preventDefault();
+                            setSelectedSignatures(new Set());
+                            break;
+                    }
                 }
             }
         };
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [matches, pendingSplits, view, processingId, verifyMutation, rejectMutation, confirmSplitMutation, rejectSplitMutation]);
+    }, [queueItems, view, matchMode, processingId]);
 
     return (
         <div className="space-y-6">
@@ -159,7 +276,7 @@ export default function Verification() {
                         onClick={() => setView('matches')}
                         className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all ${view === 'matches' ? 'bg-white shadow-sm text-indigo-600' : 'text-gray-500 hover:text-gray-700'}`}
                     >
-                        Matches ({matches?.length || 0})
+                        Matches ({queueItems?.length || 0})
                     </button>
                     <button
                         onClick={() => setView('identity')}
@@ -172,201 +289,172 @@ export default function Verification() {
 
             <div className="space-y-4">
                 {view === 'matches' ? (
-                    isLoadingMatches ? (
-                        <div className="p-8 text-center text-gray-500">Loading pending matches...</div>
-                    ) : !matches || matches.length === 0 ? (
-                        <div className="text-center py-20 text-gray-400">
-                            <CheckCircle2 className="w-16 h-16 mx-auto mb-4 text-green-500" />
-                            <h2 className="text-xl font-medium text-gray-600">All caught up!</h2>
-                            <p>No matches need review.</p>
-                        </div>
-                    ) : (
-                        matches.map((match) => {
-                            const isProcessing = processingId === match.id;
-                            const isConfirming = isProcessing && processingAction === 'confirm';
-                            const isRejecting = isProcessing && processingAction === 'reject';
-
-                            return (
-                                <div
-                                    key={match.id}
-                                    className={`
-                                        bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden
-                                        transition-all duration-500 ease-out
-                                        ${isConfirming ? 'opacity-0 scale-95 bg-green-50 border-green-300' : ''}
-                                        ${isRejecting ? 'opacity-0 scale-95 bg-red-50 border-red-300' : ''}
-                                        ${!isProcessing ? 'hover:shadow-md' : ''}
-                                    `}
+                    <>
+                        {/* View Toggle */}
+                        <div className="flex justify-between items-center bg-white p-2 rounded-lg border border-gray-200 shadow-sm mb-4">
+                            <div className="text-sm text-gray-500 font-medium px-2">
+                                {queueItems?.length || 0} items in queue
+                            </div>
+                            <div className="flex bg-gray-100 p-0.5 rounded-md">
+                                <button
+                                    onClick={() => setMatchMode('deck')}
+                                    className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-all ${matchMode === 'deck' ? 'bg-white shadow-sm text-indigo-600' : 'text-gray-500 hover:text-gray-700'}`}
+                                    title="Focus Deck (Fast Mode)"
                                 >
-                                    {/* Match Reason Badge - Centered Top */}
-                                    <div className={`
-                                        px-4 py-2 border-b flex items-center justify-center gap-2 text-xs font-medium
-                                        ${match.match_reason === 'No Match Found'
-                                            ? 'bg-red-50 border-red-100 text-red-700'
-                                            : match.match_reason === 'Auto-Promoted Identity'
-                                                ? 'bg-blue-50 border-blue-100 text-blue-700'
-                                                : 'bg-gradient-to-r from-indigo-50 to-purple-50 border-indigo-100 text-indigo-700'
-                                        }
-                                    `}>
-                                        <AlertCircle className="w-3.5 h-3.5" />
-                                        <span>{match.match_reason}</span>
-                                    </div>
+                                    <Layers className="w-4 h-4" /> Deck
+                                </button>
+                                <button
+                                    onClick={() => setMatchMode('list')}
+                                    className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-all ${matchMode === 'list' ? 'bg-white shadow-sm text-indigo-600' : 'text-gray-500 hover:text-gray-700'}`}
+                                    title="List View (Batch Mode)"
+                                >
+                                    <List className="w-4 h-4" /> List
+                                </button>
+                                <button
+                                    onClick={() => queueItems && queueItems.length > 0 && handleOpenSearch(queueItems[0])}
+                                    className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium text-gray-500 hover:text-gray-700 transition-all"
+                                    title="Search Library (S)"
+                                    disabled={!queueItems || queueItems.length === 0}
+                                >
+                                    <Search className="w-4 h-4" /> Search
+                                </button>
+                            </div>
+                        </div>
 
-                                    <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto_1fr] gap-4 p-4">
-                                        {/* Broadcast Log - Left */}
-                                        <div className="space-y-2">
-                                            <div className="flex items-center gap-2">
-                                                <div className="w-1 h-4 bg-blue-500 rounded-full"></div>
-                                                <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Broadcast Log</span>
-                                            </div>
-                                            <div>
-                                                <div className="font-semibold text-gray-900 text-lg">{match.raw_title}</div>
-                                                <div className="text-gray-600">{match.raw_artist}</div>
-                                            </div>
-                                            <div className="flex items-center gap-2 text-xs text-gray-500 pt-1">
-                                                <span className="bg-blue-100 text-blue-700 px-2 py-0.5 rounded font-medium">{match.station}</span>
-                                                <span className="text-gray-400">•</span>
-                                                <span>{new Date(match.played_at).toLocaleDateString()} {new Date(match.played_at).toLocaleTimeString()}</span>
-                                            </div>
-                                        </div>
+                        {/* Content Area */}
+                        {isLoadingQueue ? (
+                            <div className="p-8 text-center text-gray-500">Loading discovery queue...</div>
+                        ) : matchMode === 'deck' ? (
+                            <FocusDeck
+                                items={queueItems || []}
+                                onAction={handleDeckAction}
+                                onSearch={handleOpenSearch}
+                                processingId={processingId}
+                            />
+                        ) : !queueItems || queueItems.length === 0 ? (
+                            <div className="text-center py-20 text-gray-400">
+                                <CheckCircle2 className="w-16 h-16 mx-auto mb-4 text-green-500" />
+                                <h2 className="text-xl font-medium text-gray-600">Queue Cleared!</h2>
+                                <p>No unmatched logs found.</p>
+                            </div>
+                        ) : (
+                            // List View with Batch Selection (Story 3.4)
+                            <div className="space-y-2">
+                                {queueItems.map((item) => {
+                                    const isSelected = selectedSignatures.has(item.signature);
+                                    const isProcessing = processingIds.has(item.signature);
+                                    const apiArtist = item.suggested_recording?.work?.artist?.name || "No suggestion";
+                                    const apiTitle = item.suggested_recording?.title || "";
 
-                                        {/* Divider with Arrow - Center */}
-                                        <div className="flex items-center justify-center">
-                                            <div className="hidden lg:flex flex-col items-center gap-2">
-                                                <div className="w-px h-full bg-gray-200"></div>
-                                                <div className="text-gray-400">→</div>
-                                                <div className="w-px h-full bg-gray-200"></div>
-                                            </div>
-                                            <div className="lg:hidden w-full h-px bg-gray-200"></div>
-                                        </div>
+                                    return (
+                                        <div
+                                            key={item.signature}
+                                            className={`
+                                                bg-white rounded-lg shadow-sm border border-gray-200 p-4
+                                                transition-all duration-200
+                                                ${isSelected ? 'bg-blue-50 border-blue-300' : 'hover:shadow-md'}
+                                                ${isProcessing ? 'opacity-50 pointer-events-none' : ''}
+                                            `}
+                                        >
+                                            <div className="flex items-start gap-4">
+                                                {/* Checkbox */}
+                                                <input
+                                                    type="checkbox"
+                                                    checked={isSelected}
+                                                    onChange={() => handleToggleSelect(item.signature)}
+                                                    className="mt-1 w-5 h-5 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500"
+                                                />
 
-                                        {/* Library Track - Right */}
-                                        <div className="space-y-2">
-                                            <div className="flex items-center gap-2">
-                                                <div className="w-1 h-4 bg-green-500 rounded-full"></div>
-                                                <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Library Track</span>
-                                            </div>
-                                            <div>
-                                                <div className="font-semibold text-gray-900 text-lg">{match.track.title}</div>
-                                                <div className="text-gray-600">{match.track.artist}</div>
-                                            </div>
-                                            <div className="text-xs pt-1 flex items-center gap-2">
-                                                {match.track.path.startsWith('virtual://') ? (
-                                                    <span className="bg-gray-100 text-gray-500 px-2 py-0.5 rounded font-medium border border-gray-200">
-                                                        No Local File (Identity Only)
-                                                    </span>
-                                                ) : (
-                                                    <span className="text-gray-400 font-mono truncate" title={match.track.path}>
-                                                        {match.track.path}
-                                                    </span>
+                                                {/* Content */}
+                                                <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                    {/* Raw Data */}
+                                                    <div>
+                                                        <div className="text-xs font-semibold text-gray-500 uppercase mb-1">Raw Data</div>
+                                                        <div className="font-semibold text-gray-900">{item.raw_title}</div>
+                                                        <div className="text-sm text-gray-600">{item.raw_artist}</div>
+                                                    </div>
+
+                                                    {/* Suggested Match */}
+                                                    <div>
+                                                        <div className="text-xs font-semibold text-gray-500 uppercase mb-1">Suggested Match</div>
+                                                        <div className="font-semibold text-gray-900">{apiTitle}</div>
+                                                        <div className="text-sm text-gray-600">{apiArtist}</div>
+                                                    </div>
+                                                </div>
+
+                                                {/* Individual Actions */}
+                                                {item.suggested_recording_id && (
+                                                    <button
+                                                        onClick={() => {
+                                                            queryClient.setQueryData(['discovery', 'queue'], (old: QueueItem[] | undefined) => {
+                                                                if (!old) return [];
+                                                                return old.filter(i => i.signature !== item.signature);
+                                                            });
+                                                            linkMutation.mutate(item);
+                                                        }}
+                                                        className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 transition-colors"
+                                                    >
+                                                        Link
+                                                    </button>
                                                 )}
                                             </div>
                                         </div>
+                                    );
+                                })}
+                            </div>
+                        )}
+
+                        {/* Bulk Action Footer (Story 3.4) - THIS IS THE KEY FIX! */}
+                        {matchMode === 'list' && selectedSignatures.size > 0 && (
+                            <div className="fixed bottom-0 left-0 right-0 backdrop-blur-sm bg-white/90 border-t border-gray-200 shadow-lg p-4 transition-transform duration-300 ease-out">
+                                <div className="max-w-7xl mx-auto flex items-center justify-between">
+                                    <div className="text-sm font-medium text-gray-700">
+                                        {selectedSignatures.size} item{selectedSignatures.size > 1 ? 's' : ''} selected
                                     </div>
-
-                                    {/* Action Buttons - Bottom */}
-                                    <div className="bg-gray-50 border-t border-gray-200 px-4 py-3 flex flex-col sm:flex-row items-center justify-between gap-3">
-                                        <label className="flex items-center gap-2 text-sm text-gray-600 hover:text-gray-900 cursor-pointer select-none bg-white px-3 py-1.5 rounded-md border border-gray-200 hover:border-gray-300 transition-colors">
-                                            <input
-                                                type="checkbox"
-                                                checked={!!batchSelections[match.id]}
-                                                onChange={(e) => {
-                                                    const val = e.target.checked;
-                                                    setBatchSelections(prev => ({ ...prev, [match.id]: val }));
-                                                }}
-                                                className="w-4 h-4 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500"
-                                            />
-                                            <span>Apply to all <strong>{match.raw_artist}</strong> ↔ <strong>{match.track.artist}</strong> matches?</span>
-                                        </label>
-
-                                        <div className="flex items-center gap-2 w-full sm:w-auto">
-                                            <button
-                                                onClick={() => verifyMutation.mutate(match.id)}
-                                                disabled={isProcessing}
-                                                className={`
-                                                    flex-1 sm:flex-none flex items-center justify-center gap-2 px-6 py-2.5 rounded-lg font-medium text-sm
-                                                    transition-all duration-200
-                                                    ${isConfirming
-                                                        ? 'bg-green-600 text-white'
-                                                        : 'bg-green-600 hover:bg-green-700 text-white hover:scale-105'
-                                                    }
-                                                    disabled:opacity-50 disabled:cursor-not-allowed
-                                                `}
-                                            >
-                                                {isConfirming ? <CheckCircle2 className="w-4 h-4 animate-bounce" /> : <Check className="w-4 h-4" />}
-                                                {isConfirming ? 'Confirmed!' : 'Confirm'}
-                                            </button>
-                                            <button
-                                                onClick={() => rejectMutation.mutate(match.id)}
-                                                disabled={isProcessing}
-                                                className={`
-                                                    flex-1 sm:flex-none flex items-center justify-center gap-2 px-6 py-2.5 rounded-lg font-medium text-sm
-                                                    transition-all duration-200
-                                                    ${isRejecting
-                                                        ? 'bg-red-600 text-white'
-                                                        : 'bg-white hover:bg-red-50 text-red-600 border-2 border-red-200 hover:border-red-300 hover:scale-105'
-                                                    }
-                                                    disabled:opacity-50 disabled:cursor-not-allowed
-                                                `}
-                                            >
-                                                {isRejecting ? <XCircle className="w-4 h-4 animate-bounce" /> : <X className="w-4 h-4" />}
-                                                {isRejecting ? 'Rejected!' : 'Reject'}
-                                            </button>
-                                        </div>
+                                    <div className="flex items-center gap-3">
+                                        <button
+                                            onClick={handleBulkLink}
+                                            disabled={!queueItems?.filter(item => selectedSignatures.has(item.signature)).every(item => item.suggested_recording_id)}
+                                            className="px-6 py-2 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                                        >
+                                            Bulk Link
+                                        </button>
+                                        <button
+                                            onClick={handleBulkIgnore}
+                                            className="px-6 py-2 bg-red-600 text-white rounded-lg font-medium hover:bg-red-700 transition-colors"
+                                        >
+                                            Bulk Ignore
+                                        </button>
+                                        <button
+                                            onClick={() => setSelectedSignatures(new Set())}
+                                            className="px-6 py-2 bg-gray-200 text-gray-700 rounded-lg font-medium hover:bg-gray-300 transition-colors"
+                                        >
+                                            Clear Selection
+                                        </button>
                                     </div>
                                 </div>
-                            );
-                        })
-                    )
+                            </div>
+                        )}
+                    </>
                 ) : (
                     isLoadingSplits ? (
                         <div className="p-8 text-center text-gray-500">Loading identity proposals...</div>
-                    ) : !pendingSplits || pendingSplits.length === 0 ? (
-                        <div className="text-center py-20 text-gray-400">
-                            <CheckCircle2 className="w-16 h-16 mx-auto mb-4 text-green-500" />
-                            <h2 className="text-xl font-medium text-gray-600">No identity resolutions needed</h2>
-                            <p>Everything is correctly aligned.</p>
-                        </div>
                     ) : (
-                        pendingSplits.map((split) => (
-                            <div key={split.id} className="bg-white rounded-lg shadow-sm border border-gray-200 p-6 flex flex-col md:flex-row items-center justify-between gap-6">
-                                <div className="space-y-3 flex-1">
-                                    <div className="flex items-center gap-2">
-                                        <span className="text-xs font-bold text-orange-500 uppercase tracking-wider bg-orange-50 px-2 py-0.5 rounded">Proposed Artist Split</span>
-                                        <span className="text-xs text-gray-400">•</span>
-                                        <span className="text-xs text-gray-500">Confidence: {(split.confidence * 100).toFixed(0)}%</span>
-                                    </div>
-                                    <div className="flex items-center gap-4">
-                                        <div className="text-lg font-bold text-gray-400 line-through decoration-red-300 decoration-2">{split.raw_artist}</div>
-                                        <div className="text-gray-400">→</div>
-                                        <div className="flex flex-wrap gap-2">
-                                            {split.proposed_artists.map((artist, idx) => (
-                                                <span key={idx} className="bg-green-100 text-green-700 font-bold px-3 py-1 rounded-md border border-green-200 shadow-sm">
-                                                    {artist}
-                                                </span>
-                                            ))}
-                                        </div>
-                                    </div>
-                                    <p className="text-sm text-gray-500 italic">Heuristic pattern matching identified multiple distinct entities in this string.</p>
-                                </div>
-                                <div className="flex items-center gap-3 w-full md:w-auto">
-                                    <button
-                                        onClick={() => confirmSplitMutation.mutate(split.id)}
-                                        className="flex-1 md:flex-none px-6 py-2.5 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 transition-all shadow-md hover:shadow-lg active:scale-95 flex items-center justify-center gap-2"
-                                    >
-                                        <Check className="w-4 h-4" /> Approve Split
-                                    </button>
-                                    <button
-                                        onClick={() => rejectSplitMutation.mutate(split.id)}
-                                        className="flex-1 md:flex-none px-6 py-2.5 bg-white text-gray-600 border border-gray-200 rounded-lg font-bold hover:bg-gray-50 transition-all active:scale-95 flex items-center justify-center gap-2"
-                                    >
-                                        <X className="w-4 h-4" /> Keep as One
-                                    </button>
-                                </div>
-                            </div>
-                        ))
+                        <IdentityProposals />
                     )
                 )}
             </div>
+
+            {/* SearchDrawer - Available for both Deck and List views */}
+            <SearchDrawer
+                isOpen={isSearchDrawerOpen}
+                onClose={() => {
+                    setIsSearchDrawerOpen(false);
+                    setSearchingForItem(null);
+                }}
+                onSelect={handleSearchSelect}
+                initialQuery={searchingForItem ? `${searchingForItem.raw_artist.trim()} ${searchingForItem.raw_title.trim()}` : ''}
+            />
         </div>
     );
 }
