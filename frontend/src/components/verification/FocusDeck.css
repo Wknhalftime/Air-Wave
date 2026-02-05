@@ -1,0 +1,53 @@
+/* Magnetic Glide Animations */
+
+@media (prefers-reduced-motion: no-preference) {
+
+    /* Primary Card (Top of stack) */
+    .card-primary-enter {
+        opacity: 0;
+        transform: translate3d(0, 20px, 0) scale(0.95);
+    }
+
+    .card-primary-enter-active {
+        opacity: 1;
+        transform: translate3d(0, 0, 0) scale(1);
+        transition: opacity 300ms ease-out, transform 300ms cubic-bezier(0, 0, 0.2, 1);
+        will-change: transform, opacity;
+    }
+
+    .card-primary-exit {
+        opacity: 1;
+        transform: translate3d(0, 0, 0) scale(1);
+    }
+
+    .card-primary-exit-active {
+        opacity: 0;
+        /* Fly UP/RIGHT */
+        transform: translate3d(100px, -20px, 0) rotate(5deg);
+        transition: opacity 200ms ease-in, transform 300ms cubic-bezier(0.4, 0, 1, 1);
+        will-change: transform, opacity;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .card-primary-enter {
+        opacity: 0;
+    }
+
+    .card-primary-enter-active {
+        opacity: 1;
+        transition: opacity 200ms;
+    }
+
+    .card-primary-exit {
+        opacity: 1;
+    }
+
+    .card-primary-exit-active {
+        opacity: 0;
+        transition: opacity 200ms;
+    }
+}
+
+/* Secondary Card (Behind) */
+/* When it promotes to Primary, it just changes class, so CSS transition handles the scale up */

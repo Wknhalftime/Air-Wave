@@ -123,6 +123,7 @@ class Recording(Base, TimestampMixin):
     isrc: Mapped[Optional[str]] = mapped_column(
         String, index=True, nullable=True
     )
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Relationships
     work: Mapped["Work"] = relationship(back_populates="recordings")
@@ -220,9 +221,40 @@ class IdentityBridge(Base, TimestampMixin):
 
     recording_id: Mapped[int] = mapped_column(ForeignKey("recordings.id"))
     confidence: Mapped[float] = mapped_column(default=1.0)
+    is_revoked: Mapped[bool] = mapped_column(Boolean, default=False)
     
     # Relationships
     recording: Mapped["Recording"] = relationship()
+
+
+class VerificationAudit(Base, TimestampMixin):
+    """Audit trail for verification actions (link, promote, undo, etc.)."""
+
+    __tablename__ = "verification_audit"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    action_type: Mapped[str] = mapped_column(String, index=True)
+    signature: Mapped[str] = mapped_column(String, index=True)
+    raw_artist: Mapped[str] = mapped_column(String, index=True)
+    raw_title: Mapped[str] = mapped_column(String, index=True)
+    recording_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("recordings.id"), nullable=True, index=True
+    )
+    log_ids: Mapped[list] = mapped_column(JSON, default=list)
+    bridge_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("identity_bridge.id"), nullable=True, index=True
+    )
+    is_undone: Mapped[bool] = mapped_column(Boolean, default=False)
+    undone_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    performed_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    recording: Mapped[Optional["Recording"]] = relationship()
+    bridge: Mapped[Optional["IdentityBridge"]] = relationship()
+
+    __table_args__ = (
+        Index("idx_verification_audit_created_at", "created_at"),
+        Index("idx_verification_audit_artist_title", "raw_artist", "raw_title"),
+    )
 
 
 class ImportBatch(Base, TimestampMixin):
@@ -289,3 +321,26 @@ class ProposedSplit(Base, TimestampMixin):
         String, default="PENDING"
     )  # PENDING, APPROVED, REJECTED
     confidence: Mapped[float] = mapped_column(default=0.0)
+
+
+class DiscoveryQueue(Base, TimestampMixin):
+    """Aggregation layer for unmatched logs.
+
+    Acts as the 'Inbox' for the Verification Hub. Instead of creating thousands
+    of 'Ghost Rankings', we aggregate unmatched signatures here.
+    """
+
+    __tablename__ = "discovery_queue"
+
+    signature: Mapped[str] = mapped_column(String, primary_key=True)
+    raw_artist: Mapped[str] = mapped_column(String)
+    raw_title: Mapped[str] = mapped_column(String)
+    count: Mapped[int] = mapped_column(Integer, default=1)
+    
+    # If the system identifies a potential existing match, it suggests it here.
+    suggested_recording_id: Mapped[Optional[int]] = mapped_column(
+         ForeignKey("recordings.id"), nullable=True
+    )
+    
+    # Relationships
+    suggested_recording: Mapped[Optional["Recording"]] = relationship()
