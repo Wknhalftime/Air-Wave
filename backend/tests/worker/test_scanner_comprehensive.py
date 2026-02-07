@@ -105,6 +105,7 @@ class TestFileScanner:
         """Test creating a new artist."""
         scanner = FileScanner(db_session)
         artist = await scanner._get_or_create_artist("nirvana")
+        await scanner._flush_pending_artists()
 
         assert artist.name == "nirvana"
         assert artist.id is not None
@@ -128,8 +129,10 @@ class TestFileScanner:
         """Test artist creation with empty name defaults to 'unknown artist'."""
         scanner = FileScanner(db_session)
         artist = await scanner._get_or_create_artist("")
+        await scanner._flush_pending_artists()
 
         assert artist.name == "unknown artist"
+        assert artist.id is not None
 
     @pytest.mark.asyncio
     async def test_get_or_create_work_new(self, db_session):
@@ -268,8 +271,12 @@ class TestFileScanner:
         scanner = FileScanner(db_session)
         stats = ScanStats()
 
-        # Mock the file path
-        with patch.object(Path, "exists", return_value=True):
+        # Mock stat so Path("/test/path.mp3") does not fail (file does not exist on disk)
+        mock_stat = MagicMock(st_size=1000, st_mtime=12345.0)
+        with patch.object(Path, "stat", return_value=mock_stat), patch(
+            "asyncio.get_running_loop"
+        ) as mock_loop:
+            mock_loop.return_value.run_in_executor = AsyncMock(return_value=None)
             await scanner.process_file(Path("/test/path.mp3"), stats)
 
         assert stats.skipped == 1
@@ -312,4 +319,129 @@ class TestFileScanner:
             assert result is None
         finally:
             temp_path.unlink()
+
+    @pytest.mark.asyncio
+    async def test_move_detection_updates_path_and_increments_moved(
+        self, db_session
+    ):
+        """Move detection: file at new path with same PID+size updates existing LibraryFile and sets stats.moved."""
+        artist = Artist(name="move artist")
+        db_session.add(artist)
+        await db_session.flush()
+        work = Work(title="move song", artist_id=artist.id)
+        db_session.add(work)
+        await db_session.flush()
+        recording = Recording(
+            work_id=work.id, title="move song", version_type="Original"
+        )
+        db_session.add(recording)
+        await db_session.flush()
+        lib_file = LibraryFile(
+            recording_id=recording.id,
+            path="/old/path/move song.mp3",
+            size=2048,
+            mtime=99999.0,
+            format="mp3",
+        )
+        db_session.add(lib_file)
+        await db_session.commit()
+
+        scanner = FileScanner(db_session)
+        scanner._path_index = {
+            "/old/path/move song.mp3": {
+                "id": lib_file.id,
+                "size": 2048,
+                "mtime": 99999.0,
+            }
+        }
+        scanner._path_index_seen = set()
+        scanner._touch_ids = set()
+        scanner._missing_candidates = None
+        stats = ScanStats()
+
+        new_path = Path("/new/path/move song.mp3")
+        mock_stat = MagicMock(st_size=2048, st_mtime=99999.0)
+        mock_audio = MagicMock()
+        mock_audio.get = Mock(
+            side_effect=lambda k, d=None: {
+                "artist": ["move artist"],
+                "albumartist": [""],
+                "title": ["move song"],
+                "album": [""],
+                "isrc": [""],
+                "date": [""],
+            }.get(k, d)
+        )
+        mock_audio.info = MagicMock(length=180.0, bitrate=320000)
+
+        with patch.object(Path, "stat", return_value=mock_stat), patch(
+            "asyncio.get_running_loop"
+        ) as mock_loop:
+            mock_loop.return_value.run_in_executor = AsyncMock(
+                return_value=mock_audio
+            )
+            await scanner.process_file(new_path, stats)
+
+        assert stats.moved == 1
+        assert stats.created == 0
+        await db_session.refresh(lib_file)
+        assert lib_file.path == str(new_path)
+        assert lib_file.size == 2048
+        assert lib_file.mtime == 99999.0
+
+    @pytest.mark.asyncio
+    async def test_touch_updates_updated_at_for_unchanged_file(
+        self, db_session
+    ):
+        """TOUCH path: unchanged file (size+mtime match) gets updated_at batch-updated after _flush_touch."""
+        artist = Artist(name="touch artist")
+        db_session.add(artist)
+        await db_session.flush()
+        work = Work(title="touch song", artist_id=artist.id)
+        db_session.add(work)
+        await db_session.flush()
+        recording = Recording(
+            work_id=work.id, title="touch song", version_type="Original"
+        )
+        db_session.add(recording)
+        await db_session.flush()
+        touch_path = Path("/music/touch song.mp3")
+        # Normalize path to forward slashes for cross-platform compatibility
+        path_str = str(touch_path).replace("\\", "/")
+        lib_file = LibraryFile(
+            recording_id=recording.id,
+            path=path_str,
+            size=1024,
+            mtime=11111.0,
+            format="mp3",
+        )
+        db_session.add(lib_file)
+        await db_session.commit()
+        old_updated = lib_file.updated_at
+
+        scanner = FileScanner(db_session)
+        # Path index uses forward slashes for cross-platform compatibility
+        scanner._path_index = {
+            path_str: {
+                "id": lib_file.id,
+                "size": 1024,
+                "mtime": 11111.0,
+            }
+        }
+        scanner._path_index_seen = set()
+        scanner._touch_ids = set()
+        scanner._missing_candidates = None
+        stats = ScanStats()
+
+        mock_stat = MagicMock(st_size=1024, st_mtime=11111.0)
+        with patch.object(Path, "stat", return_value=mock_stat):
+            await scanner.process_file(touch_path, stats)
+
+        assert stats.skipped == 1
+        assert len(scanner._touch_ids) == 1
+        old_ts = old_updated.timestamp()
+        await scanner._flush_touch()
+        await db_session.refresh(lib_file)
+        assert lib_file.updated_at is not None
+        assert lib_file.updated_at.timestamp() >= old_ts
 

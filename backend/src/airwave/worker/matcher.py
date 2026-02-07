@@ -59,16 +59,18 @@ class Matcher:
 
     Attributes:
         session: Async SQLAlchemy database session.
-        _vector_db: Lazy-loaded VectorDB instance for semantic search.
+        _vector_db: VectorDB instance for semantic search (injectable).
     """
 
-    def __init__(self, session: AsyncSession):
-        """Initializes the matcher with a database session.
+    def __init__(self, session: AsyncSession, vector_db: Optional[VectorDB] = None):
+        """Initializes the matcher with a database session and optional VectorDB.
 
         Args:
             session: Async SQLAlchemy session for database operations.
+            vector_db: Optional VectorDB instance. If not provided, creates a new instance.
         """
         self.session = session
+        self._vector_db = vector_db or VectorDB()
 
     async def match_batch(
         self, queries: List[Tuple[str, str]], explain: bool = False
@@ -245,9 +247,6 @@ class Matcher:
 
         if not residual_norms_list:
              return results
-
-        if not hasattr(self, "_vector_db"):
-            self._vector_db = VectorDB()
 
         # 3. Batch Search
         # Returns List of Lists of (recording_id, distance)

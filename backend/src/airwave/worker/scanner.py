@@ -18,14 +18,15 @@ import asyncio
 import concurrent.futures
 import hashlib
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import mutagen
 from loguru import logger
 from mutagen.id3 import ID3NoHeaderError
-from sqlalchemy import select
+from sqlalchemy import and_, insert, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from airwave.core.models import (
@@ -38,10 +39,35 @@ from airwave.core.models import (
     WorkArtist,
 )
 from airwave.core.normalization import Normalizer
+from airwave.core.performance import PerformanceMetrics
+from airwave.core.scanner_config import ScannerConfig
 from airwave.core.stats import ScanStats
 from airwave.core.task_store import TaskStore
 from airwave.core.vector_db import VectorDB
 from airwave.worker.matcher import Matcher
+
+
+class _ArtistRef:
+    """Stand-in for Artist until _flush_pending_artists() fills cache; .id requires flush first."""
+
+    __slots__ = ("_scanner", "_name")
+
+    def __init__(self, scanner: "FileScanner", name: str):
+        self._scanner = scanner
+        self._name = name
+
+    @property
+    def id(self) -> int:
+        if self._name not in self._scanner._artist_cache:
+            raise RuntimeError(
+                f"Artist {self._name!r} not in cache. "
+                "Call _flush_pending_artists() before using .id on a newly added artist."
+            )
+        return self._scanner._artist_cache[self._name].id
+
+    @property
+    def name(self) -> str:
+        return self._name
 
 
 class LibraryMetadata:
@@ -134,17 +160,72 @@ class FileScanner:
     Attributes:
         session: Async SQLAlchemy database session.
         matcher: Matcher instance for duplicate detection.
+        vector_db: VectorDB instance for semantic search (injectable).
+        config: ScannerConfig instance for configurable behavior.
         executor: Thread pool executor for parallel metadata extraction.
         SUPPORTED_EXTENSIONS: Set of supported audio file extensions.
     """
 
     SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".ogg"}
 
-    def __init__(self, session: AsyncSession):
+    def __init__(
+        self,
+        session: AsyncSession,
+        task_store: Optional[TaskStore] = None,
+        vector_db: Optional[VectorDB] = None,
+        config: Optional[ScannerConfig] = None,
+        max_concurrent_files: Optional[int] = None  # Deprecated: use config instead
+    ):
         self.session = session
-        self.matcher = Matcher(session)
+        self.task_store = task_store or TaskStore.get_global()  # Use global if not provided
+        self.vector_db = vector_db or VectorDB()  # Create VectorDB if not provided
+
+        # Handle backward compatibility for max_concurrent_files parameter
+        if max_concurrent_files is not None and config is None:
+            # Create config with custom max_concurrent_files
+            config = ScannerConfig(max_concurrent_files=max_concurrent_files)
+        elif max_concurrent_files is not None and config is not None:
+            # Both provided - config takes precedence, but warn
+            logger.warning(
+                "Both 'config' and 'max_concurrent_files' provided to FileScanner. "
+                "Using 'config' and ignoring 'max_concurrent_files'. "
+                "Please use 'config' parameter only."
+            )
+
+        self.config = config or ScannerConfig()  # Use default config if not provided
+        self.matcher = Matcher(session, vector_db=self.vector_db)  # Inject VectorDB into Matcher
         # Initialize ThreadPool for blocking I/O (mutagen)
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        # Performance monitoring
+        self.perf_metrics: Optional[PerformanceMetrics] = None
+        # Concurrency control
+        self._processing_lock = asyncio.Lock()  # For thread-safe stats updates
+
+    # ========== Thread-Safe Helper Methods (Phase 1: Race Condition Fixes) ==========
+
+    async def _mark_path_seen(self, path: str) -> None:
+        """Thread-safe: Mark path as seen in this scan."""
+        async with self._processing_lock:
+            self._path_index_seen.add(path)
+
+    async def _add_touch_id(self, file_id: int) -> None:
+        """Thread-safe: Add file ID to touch batch and flush if threshold reached."""
+        async with self._processing_lock:
+            self._touch_ids.add(file_id)
+            if len(self._touch_ids) >= self.config.touch_batch_size:
+                await self._flush_touch()
+
+    async def _update_path_index_for_move(
+        self, old_path: str, new_path: str, file_id: int, size: int, mtime: float
+    ) -> None:
+        """Thread-safe: Update path index when file is moved."""
+        async with self._processing_lock:
+            self._path_index.pop(old_path, None)
+            self._path_index[new_path] = {
+                "id": file_id,
+                "size": size,
+                "mtime": mtime,
+            }
 
     def _extract_metadata(self, file_path: Path):
         """Blocking metadata extraction to be run in thread."""
@@ -153,6 +234,147 @@ class FileScanner:
         except Exception as e:
             logger.warning(f"Metadata extraction failed for {file_path}: {e}")
             return None
+
+    async def _process_recursive(
+        self,
+        current_path: str,
+        stats: ScanStats,
+        task_id: Optional[str]
+    ) -> None:
+        """Recursively process directory and subdirectories.
+
+        Args:
+            current_path: Directory path to process
+            stats: Scan statistics (mutable, updated in place)
+            task_id: Optional task ID for progress tracking
+        """
+        # Check for cancellation request (at dir entry and after each batch)
+        if task_id and (stats.cancelled or self.task_store.is_cancelled(task_id)):
+            if not stats.cancelled:
+                stats.cancelled = True
+            logger.info(f"Scan cancelled by user at {stats.processed} files")
+            return
+
+        try:
+            # Track directory processing
+            if self.perf_metrics:
+                self.perf_metrics.directories_processed += 1
+
+            entries = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: list(os.scandir(current_path))
+            )
+
+            # Separate files and directories
+            files_to_process = []
+            dirs_to_process = []
+
+            for entry in entries:
+                if entry.is_dir():
+                    dirs_to_process.append(entry.path)
+                elif entry.is_file():
+                    p = Path(entry.path)
+                    if p.suffix.lower() in self.SUPPORTED_EXTENSIONS:
+                        files_to_process.append(p)
+
+            # Process files in this directory concurrently with semaphore
+            if files_to_process:
+                await self._process_files_with_semaphore(files_to_process, stats, task_id)
+
+            if stats.cancelled:
+                return
+
+            # Recursively process subdirectories (sequentially to avoid too much concurrency)
+            for dir_path in dirs_to_process:
+                if stats.cancelled:
+                    return
+                await self._process_recursive(dir_path, stats, task_id)
+        except PermissionError:
+            logger.warning(f"Permission denied: {current_path}")
+        except Exception as e:
+            logger.error(f"Error scanning directory {current_path}: {e}")
+
+    async def _process_files_with_semaphore(
+        self,
+        files_to_process: List[Path],
+        stats: ScanStats,
+        task_id: Optional[str]
+    ) -> None:
+        """Process files concurrently with semaphore control.
+
+        Args:
+            files_to_process: List of file paths to process
+            stats: Scan statistics (mutable, updated in place)
+            task_id: Optional task ID for progress tracking
+        """
+        semaphore = asyncio.Semaphore(self.config.max_concurrent_files)
+
+        # Track last processed count to detect commit boundaries
+        last_processed_count = 0
+        commit_lock = asyncio.Lock()
+
+        async def process_with_semaphore(file_path):
+            nonlocal last_processed_count
+
+            async with semaphore:
+                await self.process_file(file_path, stats)
+
+                # Thread-safe progress update and commit check
+                async with commit_lock:
+                    current_processed = stats.processed
+                    prev_processed = last_processed_count
+                    last_processed_count = current_processed
+
+                    # Update progress and check for cancellation
+                    if task_id and current_processed % self.config.progress_update_interval == 0:
+                        self.task_store.update_progress(
+                            task_id,
+                            current_processed,
+                            f"Scanned {current_processed} files ({stats.created} new)",
+                        )
+                        if self.task_store.is_cancelled(task_id):
+                            stats.cancelled = True
+
+                    # Check if we crossed a commit boundary
+                    # This handles parallel processing correctly by checking if THIS file
+                    # caused us to cross a multiple of commit_interval
+                    prev_interval = prev_processed // self.config.commit_interval
+                    current_interval = current_processed // self.config.commit_interval
+
+                    if current_interval > prev_interval:
+                        # We crossed a commit boundary, check if there are changes
+                        has_changes = (
+                            stats.created > self._last_commit_created
+                            or stats.moved > self._last_commit_moved
+                            or len(self._touch_ids) > 0
+                            or self.session.new  # New objects added
+                            or self.session.dirty  # Existing objects modified
+                        )
+
+                        if has_changes:
+                            touch_count = len(self._touch_ids)
+                            await self._flush_touch()  # Flush pending touch updates
+                            await self.session.commit()
+                            # Update last commit counters
+                            self._last_commit_created = stats.created
+                            self._last_commit_moved = stats.moved
+                            # Performance tracking
+                            if self.perf_metrics:
+                                self.perf_metrics.commits_executed += 1
+                            logger.debug(
+                                f"Committed at {current_processed} files "
+                                f"(created={stats.created}, moved={stats.moved}, "
+                                f"touched={touch_count})"
+                            )
+                        else:
+                            # Performance tracking
+                            if self.perf_metrics:
+                                self.perf_metrics.commits_skipped += 1
+                            logger.debug(
+                                f"Skipped commit at {current_processed} files (no changes)"
+                            )
+
+        # Process all files in this directory concurrently
+        await asyncio.gather(*[process_with_semaphore(f) for f in files_to_process])
 
     async def scan_directory(
         self, root_path: str, task_id: Optional[str] = None
@@ -166,7 +388,7 @@ class FileScanner:
         if not root.exists():
             logger.error(f"Directory not found: {root_path}")
             if task_id:
-                TaskStore.complete_task(
+                self.task_store.complete_task(
                     task_id, success=False, error="Directory not found"
                 )
             # Return empty stats with error counted
@@ -174,131 +396,266 @@ class FileScanner:
             error_stats.errors = 1
             return error_stats
 
-        # Count total files first for progress tracking (ScanDir is faster)
-        logger.info(f"Counting files in {root_path}...")
-        total_files = 0
-
-        # Helper to count recursively using scandir
-        def count_recursive(path):
-            count = 0
-            try:
-                with os.scandir(path) as it:
-                    for entry in it:
-                        if entry.is_dir():
-                            count += count_recursive(entry.path)
-                        elif (
-                            entry.is_file()
-                            and Path(entry.name).suffix.lower()
-                            in self.SUPPORTED_EXTENSIONS
-                        ):
-                            count += 1
-            except PermissionError:
-                logger.warning(
-                    f"Permission denied while counting files in: {path}"
-                )
-                pass
-            return count
-
-        total_files = await asyncio.get_running_loop().run_in_executor(
-            None, count_recursive, root_path
-        )
-
-        if task_id:
-            TaskStore.update_total(
-                task_id, total_files, f"Starting scan... ({total_files} files)"
-            )
-            logger.info(f"Updated task {task_id} with {total_files} files")
-
         stats = ScanStats()
 
-        logger.info(f"Starting scan of {root_path}... ({total_files} files)")
-
-        # Load cache for matcher optimization
-        if not hasattr(self.matcher, "_vector_db"):
-            self.matcher._vector_db = VectorDB()
-
-        # Recursive Scan using scandir
-        async def process_recursive(current_path):
-            try:
-                entries = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: list(os.scandir(current_path))
-                )
-
-                for entry in entries:
-                    if entry.is_dir():
-                        await process_recursive(entry.path)
-                    elif entry.is_file():
-                        p = Path(entry.path)
-                        if p.suffix.lower() in self.SUPPORTED_EXTENSIONS:
-                            try:
-                                await self.process_file(p, stats)
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to process {entry.name}: {e}"
-                                )
-                                stats.errors += 1
-
-                            stats.processed += 1
-
-                            if task_id and (
-                                stats.processed % 10 == 0
-                                or stats.processed == total_files
-                            ):
-                                TaskStore.update_progress(
-                                    task_id,
-                                    stats.processed,
-                                    f"Scanned {entry.name} ({stats.created} new)",
-                                )
-
-                            if stats.processed % 100 == 0:
-                                await self.session.commit()
-            except PermissionError:
-                logger.warning(f"Permission denied: {current_path}")
-            except Exception as e:
-                logger.error(f"Error scanning directory {current_path}: {e}")
-
-        await process_recursive(root_path)
-
-        await self.session.commit()
+        # Initialize performance monitoring
+        self.perf_metrics = PerformanceMetrics()
+        self.perf_metrics.max_concurrent_files = self.config.max_concurrent_files
 
         if task_id:
-            TaskStore.complete_task(task_id, success=True)
+            self.task_store.update_total(task_id, 0, "Starting scan...")
+        logger.info(f"Starting scan of {root_path}... (parallel processing with max {self.config.max_concurrent_files} concurrent files)")
+
+        # Load path index (id, path, size, mtime) for stat-first skip without per-file DB hit
+        # Normalize paths to use forward slashes for cross-platform compatibility
+        stmt = select(LibraryFile.id, LibraryFile.path, LibraryFile.size, LibraryFile.mtime)
+        result = await self.session.execute(stmt)
+        path_index: Dict[str, Dict[str, Any]] = {}
+        for row in result.all():
+            # Normalize path to use forward slashes (cross-platform)
+            normalized_path = row.path.replace("\\", "/")
+            path_index[normalized_path] = {"id": row.id, "size": row.size, "mtime": row.mtime}
+        self._path_index = path_index
+        self._path_index_seen: set = set()
+        self._touch_ids: set = set()
+        self._missing_candidates: Optional[List[Dict[str, Any]]] = None
+        self._artist_cache: Dict[str, Artist] = {}
+        self._pending_artists: set = set()
+        self._work_cache: Dict[Tuple[str, int], Work] = {}
+        self._pending_works: List[Tuple[str, int]] = []
+        self._vector_tracks_to_add: List[Tuple[int, str, str]] = []
+        self._last_commit_created: int = 0  # Track created count at last commit
+        self._last_commit_moved: int = 0    # Track moved count at last commit
+        logger.info(f"Loaded path index: {len(path_index)} files")
+
+        # Recursive Scan using scandir with parallel file processing
+        await self._process_recursive(root_path, stats, task_id)
+
+        # Check if scan was cancelled
+        if task_id and self.task_store.is_cancelled(task_id):
+            # Flush any pending changes before cancelling
+            await self._flush_touch()
+            self._flush_vector_tracks()
+            await self.session.commit()
+
+            self.task_store.mark_cancelled(task_id)
+            logger.warning(f"Scan cancelled after processing {stats.processed} files")
+            return stats
+
+        await self._flush_touch()
+        self._flush_vector_tracks()
+        await self.session.commit()
+
+        # Finalize performance metrics
+        if self.perf_metrics:
+            self.perf_metrics.files_processed = stats.processed
+            self.perf_metrics.files_skipped = stats.skipped
+            self.perf_metrics.files_created = stats.created
+            self.perf_metrics.files_moved = stats.moved
+            self.perf_metrics.files_errored = stats.errors
+            self.perf_metrics.finish()
+            self.perf_metrics.log_summary("Scanner")
+
+        if task_id:
+            self.task_store.complete_task(task_id, success=True)
             logger.success(f"Task {task_id} completed: {stats}")
 
         return stats
 
-    async def _get_or_create_artist(self, clean_name: str) -> Artist:
-        """Get or create artist using pre-cleaned name."""
+    def _flush_vector_tracks(self) -> None:
+        """Flush queued (recording_id, artist, title) to vector DB in one batch."""
+        buf = getattr(self, "_vector_tracks_to_add", None)
+        if not buf:
+            return
+        tracks = list(buf)
+        buf.clear()
+        if tracks:
+            self.vector_db.add_tracks(tracks)
+
+    async def _flush_touch(self) -> None:
+        """Batch-update updated_at for LibraryFile ids in _touch_ids (TOUCH path)."""
+        touch_ids = getattr(self, "_touch_ids", None)
+        if not touch_ids:
+            return
+        ids_list = list(touch_ids)
+        touch_count = len(ids_list)
+        self._touch_ids.clear()
+        now = datetime.now(timezone.utc)
+        await self.session.execute(
+            update(LibraryFile).where(LibraryFile.id.in_(ids_list)).values(updated_at=now)
+        )
+        # Performance tracking
+        if self.perf_metrics:
+            self.perf_metrics.touch_batches += 1
+            self.perf_metrics.touch_files_total += touch_count
+            self.perf_metrics.db_queries_update += 1
+
+    @staticmethod
+    def _content_pid(artist: str, title: str, file_path: Path) -> Tuple[str, Optional[str]]:
+        """Content PID for move detection. With metadata: hash(artist|title); without: filename.
+        Returns (pid_primary, pid_fallback). pid_fallback is filename when no real metadata."""
+        no_meta = (
+            (artist or "").lower() == "unknown artist"
+            and (title or "").lower() in ("untitled", "unknown title")
+        )
+        if no_meta:
+            return (file_path.name, file_path.name)
+        key = f"{(artist or '').strip()}|{(title or '').strip()}"
+        return (hashlib.md5(key.encode()).hexdigest(), None)
+
+    async def _ensure_missing_candidates(self) -> None:
+        """Populate _missing_candidates from DB: LibraryFiles whose path was not seen this scan."""
+        if self._missing_candidates is not None:
+            return
+
+        # FIX 4: Skip expensive 4-table JOIN query if no files are missing
+        missing_paths = set(self._path_index.keys()) - self._path_index_seen
+        if not missing_paths:
+            self._missing_candidates = []
+            # Performance tracking
+            if self.perf_metrics:
+                self.perf_metrics.move_detection_queries_skipped += 1
+            logger.debug("No missing files detected - skipping move detection query")
+            return
+        # Files are missing - need to check for moves
+        path_list = list(missing_paths)
+        # Performance tracking
+        if self.perf_metrics:
+            self.perf_metrics.move_detection_queries += 1
+        logger.info(f"Detected {len(missing_paths)} missing files - running move detection query")
+        self._missing_candidates = []
+        for start in range(0, len(path_list), self.config.missing_chunk_size):
+            chunk = path_list[start : start + self.config.missing_chunk_size]
+            stmt = (
+                select(LibraryFile.id, LibraryFile.path, LibraryFile.size, Artist.name, Work.title)
+                .select_from(LibraryFile)
+                .join(Recording, LibraryFile.recording_id == Recording.id)
+                .join(Work, Recording.work_id == Work.id)
+                .outerjoin(Artist, Work.artist_id == Artist.id)
+                .where(LibraryFile.path.in_(chunk))
+            )
+            result = await self.session.execute(stmt)
+            rows = result.all()
+            for row in rows:
+                artist_name = (row.name or "unknown artist").strip()
+                work_title = (row.title or "untitled").strip()
+                no_meta = artist_name.lower() == "unknown artist" and work_title.lower() in (
+                    "untitled",
+                    "unknown title",
+                )
+                if no_meta:
+                    pid_primary = Path(row.path).name
+                    pid_fallback = pid_primary
+                else:
+                    pid_primary = hashlib.md5(f"{artist_name}|{work_title}".encode()).hexdigest()
+                    pid_fallback = None
+                self._missing_candidates.append({
+                    "lib_id": row.id,
+                    "old_path": row.path,
+                    "size": row.size,
+                    "pid_primary": pid_primary,
+                    "pid_fallback": pid_fallback,
+                })
+
+    async def _find_move_candidate(
+        self, pid_primary: str, pid_fallback: Optional[str], size: int
+    ) -> Optional[Dict[str, Any]]:
+        """Find a missing LibraryFile matching (PID, size). Removes it from _missing_candidates.
+
+        Thread-safe: Protected by _processing_lock to prevent concurrent list mutations.
+        """
+        async with self._processing_lock:
+            if not self._missing_candidates:
+                return None
+            for i, c in enumerate(self._missing_candidates):
+                if c["size"] != size:
+                    continue
+                if c["pid_primary"] == pid_primary:
+                    return self._missing_candidates.pop(i)
+                if pid_fallback and c["pid_fallback"] and c["pid_fallback"] == pid_fallback:
+                    return self._missing_candidates.pop(i)
+            return None
+
+    async def _flush_pending_artists(self) -> None:
+        """Bulk insert pending artists and fill _artist_cache."""
+        pending = getattr(self, "_pending_artists", None)
+        if not pending:
+            return
+        names = list(pending)
+        self._pending_artists.clear()
+        await self.session.execute(
+            insert(Artist), [{"name": n} for n in names]
+        )
+        await self.session.flush()
+        res = await self.session.execute(select(Artist).where(Artist.name.in_(names)))
+        for a in res.scalars().all():
+            self._artist_cache[a.name] = a
+
+    async def _flush_pending_works(self) -> None:
+        """Bulk insert pending works and fill _work_cache."""
+        pending = getattr(self, "_pending_works", None)
+        if not pending:
+            return
+        pairs = list(pending)
+        self._pending_works.clear()
+        await self.session.execute(
+            insert(Work),
+            [{"title": t, "artist_id": a} for t, a in pairs],
+        )
+        await self.session.flush()
+        stmt = select(Work).where(
+            or_(*(and_(Work.title == t, Work.artist_id == a) for t, a in pairs))
+        )
+        res = await self.session.execute(stmt)
+        for w in res.scalars().all():
+            self._work_cache[(w.title, w.artist_id)] = w
+
+    def _ensure_batch_caches(self) -> None:
+        """Init artist/work caches and pending when not set (e.g. standalone tests)."""
+        if hasattr(self, "_artist_cache") and isinstance(self._artist_cache, dict):
+            return
+        self._artist_cache = {}
+        self._pending_artists = set()
+        self._work_cache = {}
+        self._pending_works = []
+
+    async def _get_or_create_artist(self, clean_name: str):
+        """Get or create artist (batched). Call _flush_pending_artists() before using .id."""
         if not clean_name:
             clean_name = "unknown artist"
-
+        self._ensure_batch_caches()
+        if clean_name in self._artist_cache:
+            return self._artist_cache[clean_name]
+        # Check DB for existing (e.g. from another session or test pre-seed)
         stmt = select(Artist).where(Artist.name == clean_name)
         res = await self.session.execute(stmt)
-        artist = res.scalar_one_or_none()
-
-        if not artist:
-            artist = Artist(name=clean_name)
-            self.session.add(artist)
-            await self.session.flush()
-
-        return artist
+        existing = res.scalar_one_or_none()
+        if existing:
+            self._artist_cache[clean_name] = existing
+            return existing
+        self._pending_artists.add(clean_name)
+        return _ArtistRef(self, clean_name)
 
     async def _get_or_create_work(
         self, clean_title: str, artist_id: int
     ) -> Work:
-        """Get or create work using pre-cleaned title."""
+        """Get or create work using pre-cleaned title (batched inserts).
+        Call _flush_pending_works() before using .id if work was just added."""
+        self._ensure_batch_caches()
+        key = (clean_title, artist_id)
+        if key in self._work_cache:
+            return self._work_cache[key]
         stmt = select(Work).where(
             Work.title == clean_title, Work.artist_id == artist_id
         )
         res = await self.session.execute(stmt)
-        work = res.scalar_one_or_none()
-
-        if not work:
-            work = Work(title=clean_title, artist_id=artist_id)
-            self.session.add(work)
-            await self.session.flush()
-
-        return work
+        existing = res.scalar_one_or_none()
+        if existing:
+            self._work_cache[key] = existing
+            return existing
+        self._pending_works.append(key)
+        await self._flush_pending_works()
+        return self._work_cache[key]
 
     async def _get_or_create_recording(
         self,
@@ -308,7 +665,10 @@ class FileScanner:
         duration: float = None,
         isrc: str = None,
     ) -> Recording:
-        """Get or create recording using pre-cleaned title."""
+        """Get or create recording using pre-cleaned title.
+
+        NOTE: Caller must hold _processing_lock to prevent race conditions.
+        """
         stmt = select(Recording).where(
             Recording.work_id == work_id, Recording.title == clean_title
         )
@@ -336,7 +696,10 @@ class FileScanner:
         artist_id: int,
         release_date: datetime = None,
     ) -> Album:
-        """Get or create an album using pre-cleaned title."""
+        """Get or create an album using pre-cleaned title.
+
+        NOTE: Caller must hold _processing_lock to prevent race conditions.
+        """
         stmt = select(Album).where(
             Album.title == clean_album_title, Album.artist_id == artist_id
         )
@@ -465,13 +828,13 @@ class FileScanner:
                 )
 
     async def _link_multi_artists(
-        self, work: Work, primary_artist: Artist, raw_artist: str, album_artist: str
+        self, work: Work, primary_artist, raw_artist: str, album_artist: str
     ) -> None:
         """Link all artists (primary + featured) to the work.
 
         Args:
             work: Work object to link artists to.
-            primary_artist: Primary artist object.
+            primary_artist: Primary artist object or _ArtistRef.
             raw_artist: Raw artist string from metadata.
             album_artist: Album artist string from metadata.
         """
@@ -487,6 +850,7 @@ class FileScanner:
 
         for a_clean in unique_targets:
             a_obj = await self._get_or_create_artist(a_clean)
+            await self._flush_pending_artists()
             stmt_wa = select(WorkArtist).where(
                 WorkArtist.work_id == work.id,
                 WorkArtist.artist_id == a_obj.id,
@@ -505,7 +869,12 @@ class FileScanner:
                 )
 
     async def _create_library_file(
-        self, recording: Recording, file_path: Path, file_hash: str, bitrate: Optional[int]
+        self,
+        recording: Recording,
+        file_path: Path,
+        file_hash: str,
+        bitrate: Optional[int],
+        mtime: Optional[float] = None,
     ) -> LibraryFile:
         """Create and persist a LibraryFile record.
 
@@ -514,14 +883,24 @@ class FileScanner:
             file_path: Path to the audio file.
             file_hash: MD5 hash of the file.
             bitrate: Bitrate of the audio file.
+            mtime: Optional filesystem mtime (st_mtime) for scan index.
 
         Returns:
             The created LibraryFile object.
+
+        Raises:
+            OSError: If the file cannot be stat'd (e.g. deleted between stat and create).
         """
+        try:
+            st = file_path.stat()
+        except OSError as e:
+            logger.warning(f"File gone or inaccessible when creating LibraryFile {file_path}: {e}")
+            raise
         new_file = LibraryFile(
             recording_id=recording.id,
             path=str(file_path),
-            size=file_path.stat().st_size,
+            size=st.st_size,
+            mtime=(mtime if mtime is not None else float(st.st_mtime)),
             format=file_path.suffix.replace(".", ""),
             file_hash=file_hash,
             bitrate=bitrate,
@@ -530,76 +909,242 @@ class FileScanner:
         await self.session.flush()
         return new_file
 
-    async def process_file(self, file_path: Path, stats: ScanStats):
-        """Extracts metadata from an audio file and upserts it to the database.
+    # ========== Phase 5: Extracted Methods for process_file() ==========
 
-        This method handles:
-        1. ID3/Metadata extraction via mutagen.
-        2. Creation of normalized 'Air-lock' metadata.
-        3. Deduplication against existing LibraryFile records.
-        4. Hierarchy creation (Artist -> Album -> Work -> Recording).
-        5. File hashing for integrity.
+    def _ensure_scan_state_initialized(self) -> None:
+        """Initialize scan state if process_file is called standalone (e.g., in tests)."""
+        if not hasattr(self, "_path_index") or self._path_index is None:
+            self._path_index = {}
+        if not hasattr(self, "_path_index_seen"):
+            self._path_index_seen = set()
+        if not hasattr(self, "_touch_ids"):
+            self._touch_ids = set()
+        if not hasattr(self, "_missing_candidates"):
+            self._missing_candidates = None
+        if not hasattr(self, "_artist_cache"):
+            self._artist_cache = {}
+        if not hasattr(self, "_pending_artists"):
+            self._pending_artists = set()
+        if not hasattr(self, "_work_cache"):
+            self._work_cache = {}
+        if not hasattr(self, "_pending_works"):
+            self._pending_works = []
+        if not hasattr(self, "_vector_tracks_to_add"):
+            self._vector_tracks_to_add = []
+        if not hasattr(self, "_last_commit_created"):
+            self._last_commit_created = 0
+        if not hasattr(self, "_last_commit_moved"):
+            self._last_commit_moved = 0
 
-        Args:
-            file_path: Absolute path to the audio file.
-            stats: ScanStats object to track processing statistics.
+    async def _should_skip_file_stat_first(
+        self,
+        file_path: Path,
+        stats: ScanStats
+    ) -> tuple[bool, Optional[os.stat_result]]:
+        """Check if file should be skipped based on stat-first optimization.
 
-        Raises:
-            Exception: If file reading fails (unless it's a simple no-header error).
+        Returns:
+            Tuple of (should_skip, stat_result)
+            - should_skip: True if file should be skipped, False if it needs processing
+            - stat_result: os.stat_result if successful, None if stat failed
         """
+        # Get file stats
         try:
-            # 1. Metadata extraction
-            loop = asyncio.get_running_loop()
-            audio = await loop.run_in_executor(
-                self.executor, self._extract_metadata, file_path
-            )
+            stat = file_path.stat()
+        except OSError as e:
+            logger.warning(f"Could not stat {file_path}: {e}")
+            async with self._processing_lock:
+                stats.errors += 1
+                stats.processed += 1
+            return (True, None)  # Skip file
 
-            if not audio:
+        # Mark path as seen
+        # Normalize path to use forward slashes for cross-platform compatibility
+        path_str = str(file_path).replace("\\", "/")
+        await self._mark_path_seen(path_str)
+
+        # Check if file is in path index
+        if path_str not in self._path_index:
+            return (False, stat)  # New file, needs processing
+
+        ent = self._path_index[path_str]
+        idx_size = ent.get("size")
+        idx_mtime = ent.get("mtime")
+        lib_id = ent.get("id")
+
+        # Size doesn't match - needs processing
+        if idx_size is None or idx_size != stat.st_size:
+            # FIX 2: File exists but size changed - update size/mtime without re-creating hierarchy
+            if lib_id is not None:
+                logger.info(f"File size changed for {path_str}: {idx_size} → {stat.st_size}")
+                await self.session.execute(
+                    update(LibraryFile)
+                    .where(LibraryFile.id == lib_id)
+                    .values(size=stat.st_size, mtime=float(stat.st_mtime))
+                )
+                async with self._processing_lock:
+                    stats.skipped += 1
+                    stats.processed += 1
+                    # Performance tracking
+                    if self.perf_metrics:
+                        self.perf_metrics.size_changed_files += 1
+                        self.perf_metrics.db_queries_update += 1
+                return (True, stat)  # Skip file (already updated)
+            return (False, stat)  # New file, needs processing
+
+        # EXACT MATCH: size + mtime both match
+        if idx_mtime is not None and idx_mtime == stat.st_mtime:
+            async with self._processing_lock:
                 stats.skipped += 1
-                return
+                stats.processed += 1
+            # TOUCH: enqueue id for batch update of updated_at (last seen this scan)
+            if lib_id is not None:
+                await self._add_touch_id(lib_id)
+            return (True, stat)  # Skip file
 
-            # Parse metadata from audio tags
-            (artist_name, album_artist, title, album_title, isrc, release_date, duration, bitrate) = self._parse_metadata_from_audio(audio, file_path)
-
-            # Apply filename fallback if needed
-            raw_artist, raw_title = self._apply_filename_fallback(artist_name, title, file_path)
-
-            # 2. CREATE AIR-LOCK METADATA (Normalized immediately)
-            meta = LibraryMetadata(
-                raw_artist=raw_artist,
-                raw_title=raw_title,
-                album_artist=album_artist,
-                album_title=album_title,
-                duration=duration,
-                isrc=isrc,
-                release_date=release_date,
+        # FIX 1: Legacy row with mtime=None but size matches
+        # Just update mtime WITHOUT extracting metadata (HUGE performance win!)
+        if idx_mtime is None and lib_id is not None:
+            await self.session.execute(
+                update(LibraryFile)
+                .where(LibraryFile.id == lib_id)
+                .values(mtime=float(stat.st_mtime))
             )
-
-            # 3. Check if File exists
-            stmt = select(LibraryFile).where(LibraryFile.path == str(file_path))
-            result = await self.session.execute(stmt)
-            existing_file = result.scalar_one_or_none()
-
-            if existing_file:
+            # Also touch updated_at to mark as seen this scan
+            await self._add_touch_id(lib_id)
+            async with self._processing_lock:
                 stats.skipped += 1
-                return
+                stats.processed += 1
+                # Performance tracking
+                if self.perf_metrics:
+                    self.perf_metrics.metadata_extractions_skipped += 1
+                    self.perf_metrics.legacy_files_updated += 1
+                    self.perf_metrics.db_queries_update += 1
+            logger.debug(f"Updated mtime for legacy file: {path_str}")
+            return (True, stat)  # Skip file
 
-            # 4. Create Hierarchy using AIR-LOCK CLEANED DATA
+        # File needs processing (mtime changed)
+        return (False, stat)
+
+    async def _extract_and_parse_metadata(
+        self,
+        file_path: Path,
+        stats: ScanStats
+    ) -> Optional[tuple[LibraryMetadata, Optional[int]]]:
+        """Extract and parse metadata from audio file.
+
+        Returns:
+            Tuple of (LibraryMetadata, bitrate) if successful, None if extraction failed
+        """
+        # 1. Metadata extraction
+        loop = asyncio.get_running_loop()
+        audio = await loop.run_in_executor(
+            self.executor, self._extract_metadata, file_path
+        )
+
+        # Performance tracking
+        if self.perf_metrics:
+            self.perf_metrics.metadata_extractions += 1
+
+        if not audio:
+            async with self._processing_lock:
+                stats.skipped += 1
+                stats.processed += 1
+            return None
+
+        # Parse metadata from audio tags
+        (artist_name, album_artist, title, album_title, isrc, release_date, duration, bitrate) = self._parse_metadata_from_audio(audio, file_path)
+
+        # Apply filename fallback if needed
+        raw_artist, raw_title = self._apply_filename_fallback(artist_name, title, file_path)
+
+        # 2. CREATE AIR-LOCK METADATA (Normalized immediately)
+        meta = LibraryMetadata(
+            raw_artist=raw_artist,
+            raw_title=raw_title,
+            album_artist=album_artist,
+            album_title=album_title,
+            duration=duration,
+            isrc=isrc,
+            release_date=release_date,
+        )
+
+        return (meta, bitrate)
+
+    async def _handle_moved_file(
+        self,
+        file_path: Path,
+        path_str: str,
+        meta: LibraryMetadata,
+        stat: os.stat_result,
+        stats: ScanStats
+    ) -> bool:
+        """Check for and handle moved files.
+
+        Returns:
+            True if file was moved (and handled), False if it's a new file
+        """
+        await self._ensure_missing_candidates()
+        pid_primary, pid_fallback = self._content_pid(meta.artist, meta.title, file_path)
+        candidate = await self._find_move_candidate(pid_primary, pid_fallback, stat.st_size)
+
+        if not candidate:
+            return False  # Not a moved file
+
+        # Update LibraryFile with new path
+        await self.session.execute(
+            update(LibraryFile)
+            .where(LibraryFile.id == candidate["lib_id"])
+            .values(
+                path=path_str,
+                size=stat.st_size,
+                mtime=float(stat.st_mtime),
+            )
+        )
+
+        # Update path index (thread-safe)
+        await self._update_path_index_for_move(
+            candidate["old_path"], path_str, candidate["lib_id"], stat.st_size, stat.st_mtime
+        )
+
+        async with self._processing_lock:
+            stats.moved += 1
+            stats.processed += 1
+
+        return True  # File was moved
+
+    async def _create_new_library_file(
+        self,
+        file_path: Path,
+        meta: LibraryMetadata,
+        bitrate: Optional[int],
+        stat: os.stat_result,
+        stats: ScanStats
+    ) -> None:
+        """Create new library file with full hierarchy.
+
+        Creates: Artist → Work → Recording → LibraryFile
+        Also handles vector indexing and stats updates.
+        """
+        # Lock database operations to prevent "Session is already flushing" errors
+        # Metadata extraction above is still parallel (the slow part)
+        async with self._processing_lock:
             # Determine primary artist (for Work)
-            is_compilation = album_artist and album_artist.lower() in [
+            is_compilation = meta.album_artist and meta.album_artist.lower() in [
                 "various artists",
                 "various",
                 "va",
             ]
 
             # Ambiguous Split Detection
-            await self._check_ambiguous_artist_split(meta.raw_artist, album_artist)
+            await self._check_ambiguous_artist_split(meta.raw_artist, meta.album_artist)
 
-            # Artist Records
+            # Artist Records (batched: flush once so .id is available)
             primary_artist = await self._get_or_create_artist(meta.artist)
             album_artist_obj = await self._get_or_create_artist(
                 meta.album_artist
             )
+            await self._flush_pending_artists()
 
             # Album
             album = None
@@ -614,32 +1159,120 @@ class FileScanner:
             )
 
             # Multi-Artist Scoring: Link all artists
-            await self._link_multi_artists(work, primary_artist, meta.raw_artist, album_artist)
+            await self._link_multi_artists(work, primary_artist, meta.raw_artist, meta.album_artist)
 
             recording = await self._get_or_create_recording(
                 work.id, meta.title, meta.version_type, meta.duration, meta.isrc
             )
 
-            # 4. Calculate file hash (MD5 for deduplication)
+            # Calculate file hash (MD5 for deduplication)
+            loop = asyncio.get_running_loop()
             file_hash = await loop.run_in_executor(
                 self.executor, self._calculate_file_hash, file_path
             )
 
-            # 5. Create LibraryFile
-            await self._create_library_file(recording, file_path, file_hash, bitrate)
-
-            # Add to VectorDB (Using Recording ID)
-            self.matcher._vector_db.add_track(
-                recording.id, meta.artist, meta.title
+            # Create LibraryFile (mtime from stat for scan index)
+            await self._create_library_file(
+                recording, file_path, file_hash, bitrate, mtime=float(stat.st_mtime)
             )
 
-            stats.created += 1
+            # Queue for batched vector index update
+            buf = getattr(self, "_vector_tracks_to_add", None)
+            if buf is not None:
+                buf.append((recording.id, meta.artist, meta.title))
+                if len(buf) >= self.config.vector_batch_size:
+                    self._flush_vector_tracks()
+            else:
+                self.vector_db.add_track(
+                    recording.id, meta.artist, meta.title
+                )
 
-        except ID3NoHeaderError:
-            stats.errors += 1
+            stats.created += 1
+            stats.processed += 1
+
+    def _handle_file_error(
+        self,
+        file_path: Path,
+        error: Exception,
+        stats: ScanStats,
+        context: str = ""
+    ) -> None:
+        """Centralized error handling for file processing.
+
+        Args:
+            file_path: Path to the file that caused the error
+            error: The exception that was raised
+            stats: Scan statistics to update
+            context: Optional context about where the error occurred
+        """
+        error_type = type(error).__name__
+
+        if isinstance(error, ID3NoHeaderError):
+            # ID3NoHeaderError is common for non-MP3 files, just debug log
+            logger.debug(f"No ID3 header in {file_path}")
+        elif isinstance(error, OSError):
+            # File I/O errors (permission denied, file not found, etc.)
+            logger.warning(f"File I/O error for {file_path}: {error}")
+        elif isinstance(error, IntegrityError):
+            # Database integrity error (UNIQUE constraint, foreign key, etc.)
+            # This is usually a race condition from parallel processing
+            logger.warning(
+                f"Database integrity error for {file_path} "
+                f"(likely race condition): {error}"
+            )
+            # NOTE: We do NOT rollback here because:
+            # 1. We're using parallel processing with a shared session
+            # 2. Rollback would close the transaction for ALL parallel tasks
+            # 3. The error is isolated to this file, other files can continue
+        else:
+            # Unexpected errors - log with full traceback
+            context_str = f" ({context})" if context else ""
+            logger.error(
+                f"Failed to process {file_path}{context_str}: "
+                f"{error_type}: {error}",
+                exc_info=True
+            )
+
+        # Update stats
+        stats.errors += 1
+        stats.processed += 1
+
+    async def process_file(self, file_path: Path, stats: ScanStats):
+        """Extracts metadata from an audio file and upserts it to the database.
+
+        Uses stat-first skip: if path is in path_index with same size and mtime,
+        skips metadata extraction and DB write. Otherwise extracts metadata,
+        deduplicates, and creates/updates hierarchy and LibraryFile.
+        """
+        try:
+            # Initialize scan state if called standalone (e.g., in tests)
+            self._ensure_scan_state_initialized()
+
+            # 0. Stat-first: avoid opening file if unchanged
+            should_skip, stat = await self._should_skip_file_stat_first(file_path, stats)
+            if should_skip:
+                return
+
+            # path_str is used later for move detection
+            path_str = str(file_path)
+
+            # 1. Extract and parse metadata
+            result = await self._extract_and_parse_metadata(file_path, stats)
+            if result is None:
+                return  # Metadata extraction failed, already updated stats
+            meta, bitrate = result
+
+            # 2. Move detection: check if file was moved to new path
+            was_moved = await self._handle_moved_file(file_path, path_str, meta, stat, stats)
+            if was_moved:
+                return  # File was moved, already updated stats
+
+            # 3. Create new library file with full hierarchy
+            await self._create_new_library_file(file_path, meta, bitrate, stat, stats)
+
         except Exception as e:
-            # logger.debug(f"Error reading {file_path}: {e}")
-            raise e
+            # Use centralized error handler
+            self._handle_file_error(file_path, e, stats)
 
     def _calculate_file_hash(self, file_path: Path) -> str:
         """Calculate MD5 hash of file for deduplication. Blocking I/O."""

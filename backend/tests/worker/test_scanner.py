@@ -86,20 +86,24 @@ async def test_process_file_new_track():
 
 @pytest.mark.asyncio
 async def test_process_file_existing_track():
-    """Test skipping a file executed if path already exists."""
+    """Test skipping a file if path already exists (stat-first then existing_file update)."""
     mock_session = AsyncMock()
     file_scanner = FileScanner(mock_session)
 
-    file_path = Path("/music/existing.mp3")
+    file_path = MagicMock()
+    file_path.__str__.return_value = "/music/existing.mp3"
+    file_path.stat.return_value = MagicMock(st_size=1024, st_mtime=12345.0)
+    file_path.suffix = ".mp3"
+    file_path.stem = "existing"
     stats = ScanStats()
 
     with patch("asyncio.get_running_loop") as mock_loop:
         mock_loop.return_value.run_in_executor = AsyncMock(return_value={})
 
-        # Mock DB: LibraryFile exists
+        # Mock DB: LibraryFile exists (so we update size/mtime and skip)
         mock_result = MagicMock()
         mock_result.scalar_one_or_none.return_value = LibraryFile(
-            id=1, path=str(file_path)
+            id=1, path=str(file_path), size=1024, mtime=12345.0
         )
         mock_session.execute.return_value = mock_result
 
@@ -118,9 +122,18 @@ async def test_scan_directory_structure():
 
     root = "/music"
 
+    # Mock path_index load: execute() for path_index query returns result with .all() -> []
+    mock_execute_result = MagicMock()
+    mock_execute_result.all.return_value = []
+    mock_session.execute = AsyncMock(return_value=mock_execute_result)
+
+    # Create a mock that increments stats.processed when called
+    async def mock_process_file_impl(file_path, stats):
+        stats.processed += 1
+
     with patch("asyncio.get_running_loop") as mock_loop, patch(
         "pathlib.Path.exists", return_value=True
-    ), patch.object(FileScanner, "process_file") as mock_process:
+    ), patch.object(FileScanner, "process_file", side_effect=mock_process_file_impl) as mock_process:
         entry1 = MagicMock()
         entry1.is_dir.return_value = False
         entry1.is_file.return_value = True
@@ -133,11 +146,10 @@ async def test_scan_directory_structure():
         entry2.name = "song2.flac"
         entry2.path = "/music/song2.flac"
 
-        f1 = asyncio.Future()
-        f1.set_result(2)
-        f2 = asyncio.Future()
-        f2.set_result([entry1, entry2])
-        mock_loop.return_value.run_in_executor.side_effect = [f1, f2]
+        # Single-pass scan: only run_in_executor is scandir (no prior count)
+        f_entries = asyncio.Future()
+        f_entries.set_result([entry1, entry2])
+        mock_loop.return_value.run_in_executor.side_effect = [f_entries]
 
         stats = await file_scanner.scan_directory(root)
 

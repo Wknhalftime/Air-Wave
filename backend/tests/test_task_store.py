@@ -10,7 +10,9 @@ class TestTaskStore:
 
     def setup_method(self):
         """Clear task store before each test"""
-        TaskStore._tasks.clear()
+        # Access the global singleton instance
+        global_store = TaskStore.get_global()
+        global_store._tasks.clear()
 
     def test_create_task(self):
         """Test creating a new task"""
