@@ -17,6 +17,7 @@ const buttonVariants = {
 
 interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
     variant?: keyof typeof buttonVariants
+    size?: "default" | "sm" | "lg" | "icon"
 }
 
 const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
@@ -25,7 +26,11 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
             <button
                 className={cn(
                     "inline-flex items-center justify-center rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50",
-                    "h-10 px-4 py-2", // Default size
+                    "h-10 px-4 py-2", // Default size (will be overridden if variant matches)
+                    // Size variants
+                    props.size === 'sm' && "h-9 rounded-md px-3",
+                    props.size === 'lg' && "h-11 rounded-md px-8",
+                    props.size === 'icon' && "h-10 w-10",
                     buttonVariants[variant],
                     className
                 )}

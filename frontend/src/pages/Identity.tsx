@@ -1,21 +1,36 @@
+import { useState } from 'react';
+import { toast } from 'sonner';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { fetcher } from '../lib/api';
-import { Trash2, Brain, AlertTriangle, ArrowUpDown, Filter, Pencil, ExternalLink } from 'lucide-react';
-import { useState, useMemo } from 'react';
-import { OnboardingAlert } from '../components/OnboardingAlert';
+import { bridgesApi } from '../api/bridges';
+import { Input } from "../components/ui/input";
+import { Button } from "../components/ui/button";
+import { Switch } from "../components/ui/switch";
+import { Label } from "../components/ui/label";
+import {
+    Search, Ban, Undo2, Brain,
+    ExternalLink, Pencil, Trash2
+} from "lucide-react";
+import { useDebounce } from "../hooks/useDebounce";
 
 // Interfaces
-interface IdentityBridge {
+interface Bridge {
     id: number;
-    raw_artist: string;
-    raw_title: string;
+    log_signature: string;
+    reference_artist: string;
+    reference_title: string;
+    recording_id: number;
+    is_revoked: boolean;
+    updated_at: string;
     recording: {
-        id: number;
         title: string;
-        artist: string;
+        work: {
+            artist: {
+                name: string;
+            };
+        };
     };
-    confidence: number;
-    created_at: string;
+    created_at?: string;
 }
 
 interface ArtistAlias {
@@ -30,35 +45,51 @@ export default function Identity() {
     const [activeTab, setActiveTab] = useState<'bridges' | 'aliases' | 'conflicts'>('bridges');
     const queryClient = useQueryClient();
 
-    // Fetch bridges
+    // --- Bridges State ---
+    const [search, setSearch] = useState("");
+    const [includeRevoked, setIncludeRevoked] = useState(false);
+    const debouncedSearch = useDebounce(search, 500);
+
+    // Fetch Bridges (New API)
     const { data: bridges, isLoading: bridgesLoading } = useQuery({
-        queryKey: ['identity', 'bridges'],
-        queryFn: () => fetcher<IdentityBridge[]>('/identity/bridges?limit=100')
+        queryKey: ["bridges", debouncedSearch, includeRevoked],
+        queryFn: () => bridgesApi.list({
+            search: debouncedSearch,
+            include_revoked: includeRevoked,
+            page_size: 100,
+        }),
+        enabled: activeTab === 'bridges',
     });
 
-    // Fetch aliases
-    const { data: aliases, isLoading: aliasesLoading } = useQuery({
-        queryKey: ['identity', 'aliases'],
-        queryFn: () => fetcher<ArtistAlias[]>('/identity/aliases')
-    });
-
-    // Delete bridge mutation
-    const deleteBridgeMutation = useMutation({
-        mutationFn: (id: number) => fetcher(`/identity/bridges/${id}`, { method: 'DELETE' }),
-        onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['identity', 'bridges'] });
+    const bridgeMutation = useMutation({
+        mutationFn: ({ id, is_revoked }: { id: number; is_revoked: boolean }) =>
+            bridgesApi.updateStatus(id, is_revoked),
+        onSuccess: (data) => {
+            queryClient.invalidateQueries({ queryKey: ["bridges"] });
+            toast.success(data.is_revoked ? "Bridge revoked" : "Bridge restored");
+        },
+        onError: () => {
+            toast.error("Failed to update bridge status");
         }
     });
 
-    // Delete alias mutation
+    // --- Aliases State ---
+    const { data: aliases, isLoading: aliasesLoading } = useQuery({
+        queryKey: ['identity', 'aliases'],
+        queryFn: () => fetcher<ArtistAlias[]>('/identity/aliases'),
+        enabled: activeTab === 'aliases',
+    });
+
+    // Alias Mutations
     const deleteAliasMutation = useMutation({
         mutationFn: (id: number) => fetcher(`/identity/aliases/${id}`, { method: 'DELETE' }),
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['identity', 'aliases'] });
-        }
+            toast.success("Alias deleted");
+        },
+        onError: () => toast.error("Failed to delete alias")
     });
 
-    // Update alias mutation
     const updateAliasMutation = useMutation({
         mutationFn: ({ id, resolved_name }: { id: number, resolved_name: string }) =>
             fetcher(`/identity/aliases/${id}`, {
@@ -69,17 +100,12 @@ export default function Identity() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['identity', 'aliases'] });
             setEditingAliasId(null);
-        }
+            toast.success("Alias updated");
+        },
+        onError: () => toast.error("Failed to update alias")
     });
 
-    // State for filtering/sorting
-    const [sortField, setSortField] = useState<'date' | 'artist' | 'title'>('date');
-    const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
-    const [filterSelf, setFilterSelf] = useState(false);
-    const [filterText, setFilterText] = useState('');
-    const [selectedIds, setSelectedIds] = useState<number[]>([]);
-
-    // Editing State
+    // Alias UI State
     const [editingAliasId, setEditingAliasId] = useState<number | null>(null);
     const [editValue, setEditValue] = useState('');
 
@@ -89,97 +115,9 @@ export default function Identity() {
     };
 
     const handleSaveAlias = (id: number) => {
-        if (!editValue.trim()) return; // Don't allow empty
+        if (!editValue.trim()) return;
         updateAliasMutation.mutate({ id, resolved_name: editValue });
     };
-
-
-
-    // Reset selection when tab changes
-    const handleTabChange = (tab: any) => {
-        setActiveTab(tab);
-        setSelectedIds([]);
-        setFilterText('');
-    };
-
-    // Derived Data: Bridges
-    const processedBridges = useMemo(() => {
-        if (!bridges) return [];
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        let result = [...bridges];
-
-        // Filter
-        if (filterText) {
-            const lower = filterText.toLowerCase();
-            result = result.filter(b =>
-                b.raw_artist.toLowerCase().includes(lower) ||
-                b.raw_title.toLowerCase().includes(lower) ||
-                b.recording.artist.toLowerCase().includes(lower)
-            );
-        }
-        if (filterSelf) {
-            result = result.filter(b => b.raw_artist.toLowerCase() === b.recording.artist.toLowerCase());
-        }
-
-        // Sort
-        result.sort((a, b) => {
-            let valA: any = '';
-            let valB: any = '';
-
-            switch (sortField) {
-                case 'date':
-                    valA = new Date(a.created_at).getTime();
-                    valB = new Date(b.created_at).getTime();
-                    break;
-                case 'artist':
-                    valA = a.raw_artist.toLowerCase();
-                    valB = b.raw_artist.toLowerCase();
-                    break;
-                case 'title':
-                    valA = a.raw_title.toLowerCase();
-                    valB = b.raw_title.toLowerCase();
-                    break;
-            }
-
-            if (valA < valB) return sortDirection === 'asc' ? -1 : 1;
-            if (valA > valB) return sortDirection === 'asc' ? 1 : -1;
-            return 0;
-        });
-
-        return result;
-    }, [bridges, sortField, sortDirection, filterText, filterSelf]);
-
-    // Bulk Delete
-    const handleBulkDelete = async () => {
-        if (!confirm(`Delete ${selectedIds.length} items?`)) return;
-
-        // Parallel delete (MVP)
-        const promises = selectedIds.map(id =>
-            activeTab === 'bridges'
-                ? deleteBridgeMutation.mutateAsync(id)
-                : deleteAliasMutation.mutateAsync(id)
-        );
-
-        await Promise.all(promises);
-        setSelectedIds([]);
-    };
-
-    const toggleSelect = (id: number) => {
-        setSelectedIds(prev =>
-            prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
-        );
-    };
-
-    const toggleAll = () => {
-        const source = activeTab === 'bridges' ? processedBridges : aliases || [];
-        if (selectedIds.length === source.length) {
-            setSelectedIds([]);
-        } else {
-            setSelectedIds(source.map(x => x.id));
-        }
-    };
-
-    // const conflicts = []; 
 
     return (
         <div className="space-y-6">
@@ -196,10 +134,10 @@ export default function Identity() {
             {/* Tabs */}
             <div className="border-b border-gray-200">
                 <nav className="flex gap-8">
-                    {['bridges', 'aliases', 'conflicts'].map((tab) => (
+                    {['bridges', 'aliases'].map((tab) => (
                         <button
                             key={tab}
-                            onClick={() => handleTabChange(tab as any)}
+                            onClick={() => setActiveTab(tab as any)}
                             className={`py-3 px-1 border-b-2 font-medium text-sm transition-colors ${activeTab === tab
                                 ? 'border-indigo-600 text-indigo-600'
                                 : 'border-transparent text-gray-500 hover:text-gray-700'
@@ -207,124 +145,99 @@ export default function Identity() {
                         >
                             {tab === 'bridges' && 'Recall Bridges'}
                             {tab === 'aliases' && 'Artist Aliases'}
-                            {tab === 'conflicts' && 'Conflicts'}
                         </button>
                     ))}
                 </nav>
             </div>
 
-            {/* Tab Content */}
             <div className="pt-6">
                 {activeTab === 'bridges' && (
-                    <>
-                        {/* Onboarding Alert */}
-                        {!bridgesLoading && (!bridges || bridges.length === 0) && (
-                            <OnboardingAlert type="no-bridges" />
-                        )}
-
-                        {/* Toolbar */}
-                        <div className="flex items-center gap-4 mb-4 bg-white p-3 rounded-lg border border-gray-200 shadow-sm">
-                            <input
-                                type="text"
-                                placeholder="Search bridges..."
-                                value={filterText}
-                                onChange={e => setFilterText(e.target.value)}
-                                className="flex-1 border-gray-300 rounded-md text-sm focus:ring-indigo-500 focus:border-indigo-500"
-                            />
-
-                            <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer select-none">
-                                <Filter className="w-4 h-4 text-gray-400" />
-                                <input
-                                    type="checkbox"
-                                    checked={filterSelf}
-                                    onChange={e => setFilterSelf(e.target.checked)}
-                                    className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                    <div className="space-y-6">
+                        {/* Filters */}
+                        <div className="flex items-center gap-4 bg-white p-4 rounded-lg border border-gray-200 shadow-sm">
+                            <div className="relative flex-1 max-w-sm">
+                                <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                                <Input
+                                    placeholder="Search mappings..."
+                                    className="pl-9"
+                                    value={search}
+                                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearch(e.target.value)}
                                 />
-                                <span>Show Self-Matches Only</span>
-                            </label>
-
-                            <div className="h-6 w-px bg-gray-200 mx-2"></div>
-
-                            {selectedIds.length > 0 && (
-                                <button
-                                    onClick={handleBulkDelete}
-                                    className="bg-red-50 text-red-600 px-3 py-1.5 rounded-md text-sm font-medium hover:bg-red-100 transition-colors flex items-center gap-2"
-                                >
-                                    <Trash2 className="w-4 h-4" />
-                                    Delete {selectedIds.length}
-                                </button>
-                            )}
+                            </div>
+                            <div className="flex items-center space-x-2">
+                                <Switch
+                                    id="show-revoked"
+                                    checked={includeRevoked}
+                                    onCheckedChange={setIncludeRevoked}
+                                />
+                                <Label htmlFor="show-revoked">Show Revoked</Label>
+                            </div>
                         </div>
 
+                        {/* Bridges Table */}
                         {bridgesLoading ? (
-                            <div className="text-gray-500">Loading bridges...</div>
-                        ) : processedBridges.length === 0 ? (
-                            <div className="text-gray-500 italic text-center py-8">No matching bridges found.</div>
+                            <div className="text-gray-500 text-center py-8">Loading bridges...</div>
+                        ) : !bridges || bridges.length === 0 ? (
+                            <div className="text-center py-8">
+                                <p className="text-gray-500">No matching bridges found.</p>
+                                {!includeRevoked && <p className="text-sm text-gray-400 mt-2">Try checking "Show Revoked" or clearing search.</p>}
+                            </div>
                         ) : (
                             <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
                                 <table className="min-w-full divide-y divide-gray-200 text-sm">
                                     <thead className="bg-gray-50">
                                         <tr>
-                                            <th className="px-4 py-3 w-10">
-                                                <input
-                                                    type="checkbox"
-                                                    checked={processedBridges.length > 0 && selectedIds.length === processedBridges.length}
-                                                    onChange={toggleAll}
-                                                    className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-                                                />
-                                            </th>
-                                            <th
-                                                className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100"
-                                                onClick={() => {
-                                                    if (sortField === 'artist') setSortDirection(prev => prev === 'asc' ? 'desc' : 'asc');
-                                                    else setSortField('artist');
-                                                }}
-                                            >
-                                                <div className="flex items-center gap-1">
-                                                    Raw Input
-                                                    {sortField === 'artist' && <ArrowUpDown className="w-3 h-3" />}
-                                                </div>
-                                            </th>
-                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Mapped To Library</th>
-                                            <th
-                                                className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100"
-                                                onClick={() => {
-                                                    if (sortField === 'date') setSortDirection(prev => prev === 'asc' ? 'desc' : 'asc');
-                                                    else setSortField('date');
-                                                }}
-                                            >
-                                                <div className="flex items-center gap-1">
-                                                    Created
-                                                    {sortField === 'date' && <ArrowUpDown className="w-3 h-3" />}
-                                                </div>
-                                            </th>
-                                            <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">confidence</th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Log Signature</th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Resolved To</th>
+                                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                                            <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody className="bg-white divide-y divide-gray-200">
-                                        {processedBridges.map((bridge) => (
-                                            <tr key={bridge.id} className={`hover:bg-gray-50 ${selectedIds.includes(bridge.id) ? 'bg-indigo-50' : ''}`}>
-                                                <td className="px-4 py-4">
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={selectedIds.includes(bridge.id)}
-                                                        onChange={() => toggleSelect(bridge.id)}
-                                                        className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-                                                    />
+                                        {bridges.map((bridge: Bridge) => (
+                                            <tr key={bridge.id} className={`hover:bg-gray-50 ${bridge.is_revoked ? 'bg-gray-50 opacity-75' : ''}`}>
+                                                <td className="px-6 py-4">
+                                                    <div className="font-medium text-gray-900">{bridge.reference_title}</div>
+                                                    <div className="text-gray-500 text-xs">{bridge.reference_artist}</div>
                                                 </td>
                                                 <td className="px-6 py-4">
-                                                    <div className="font-medium text-gray-900">{bridge.raw_title}</div>
-                                                    <div className="text-gray-500">{bridge.raw_artist}</div>
+                                                    <div className="font-medium text-green-700">{bridge.recording?.title}</div>
+                                                    <div className="text-green-600 text-xs">{bridge.recording?.work?.artist?.name}</div>
                                                 </td>
                                                 <td className="px-6 py-4">
-                                                    <div className="font-medium text-green-700">{bridge.recording.title}</div>
-                                                    <div className="text-green-600">{bridge.recording.artist}</div>
-                                                </td>
-                                                <td className="px-6 py-4 text-gray-500">
-                                                    {new Date(bridge.created_at).toLocaleDateString()}
+                                                    {bridge.is_revoked ? (
+                                                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">
+                                                            Revoked
+                                                        </span>
+                                                    ) : (
+                                                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                                                            Active
+                                                        </span>
+                                                    )}
                                                 </td>
                                                 <td className="px-6 py-4 text-right">
-                                                    {(bridge.confidence * 100).toFixed(0)}%
+                                                    {bridge.is_revoked ? (
+                                                        <Button
+                                                            variant="ghost"
+                                                            size="sm"
+                                                            onClick={() => bridgeMutation.mutate({ id: bridge.id, is_revoked: false })}
+                                                            disabled={bridgeMutation.isPending}
+                                                        >
+                                                            <Undo2 className="w-4 h-4 mr-2" />
+                                                            Restore
+                                                        </Button>
+                                                    ) : (
+                                                        <Button
+                                                            variant="ghost"
+                                                            size="sm"
+                                                            className="text-red-500 hover:text-red-700 hover:bg-red-50"
+                                                            onClick={() => bridgeMutation.mutate({ id: bridge.id, is_revoked: true })}
+                                                            disabled={bridgeMutation.isPending}
+                                                        >
+                                                            <Ban className="w-4 h-4 mr-2" />
+                                                            Revoke
+                                                        </Button>
+                                                    )}
                                                 </td>
                                             </tr>
                                         ))}
@@ -332,11 +245,11 @@ export default function Identity() {
                                 </table>
                             </div>
                         )}
-                    </>
+                    </div>
                 )}
 
                 {activeTab === 'aliases' && (
-                    <>
+                    <div className="space-y-6">
                         {aliasesLoading ? (
                             <div className="text-gray-500">Loading aliases...</div>
                         ) : !aliases || aliases.length === 0 ? (
@@ -411,14 +324,6 @@ export default function Identity() {
                                 </table>
                             </div>
                         )}
-                    </>
-                )}
-
-                {activeTab === 'conflicts' && (
-                    <div className="text-center py-12 bg-gray-50 rounded-xl border border-dashed border-gray-300">
-                        <AlertTriangle className="w-12 h-12 text-yellow-500 mx-auto mb-4" />
-                        <h3 className="text-lg font-medium text-gray-900">No Conflicts Detected</h3>
-                        <p className="text-gray-500">Your memory banks are consistent.</p>
                     </div>
                 )}
             </div>
