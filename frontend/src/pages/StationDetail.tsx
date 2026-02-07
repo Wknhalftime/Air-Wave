@@ -1,7 +1,8 @@
+import { useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { fetcher } from '../lib/api';
-import { ArrowLeft, Radio, AlertTriangle, Calendar, FileText } from 'lucide-react';
+import { fetcher, API_BASE } from '../lib/api';
+import { ArrowLeft, Radio, AlertTriangle, Calendar, FileText, Music, Loader2 } from 'lucide-react';
 
 interface UnmatchedTrack {
     artist: string;
@@ -29,6 +30,51 @@ interface StationHealth {
 
 export default function StationDetail() {
     const { id } = useParams();
+    const [exportingM3U, setExportingM3U] = useState(false);
+    const [exportMessage, setExportMessage] = useState<string | null>(null);
+    const [exportError, setExportError] = useState<string | null>(null);
+
+    const exportM3U = async () => {
+        if (!id) return;
+        setExportingM3U(true);
+        setExportError(null);
+        setExportMessage(null);
+        try {
+            const params = new URLSearchParams();
+            params.append('station_id', id);
+            params.append('matched_only', 'true');
+            const res = await fetch(`${API_BASE}/export/m3u?${params}`);
+            if (!res.ok) throw new Error('Export failed');
+            const blob = await res.blob();
+            const included = res.headers.get('X-Airwave-M3U-Included');
+            const skipped = res.headers.get('X-Airwave-M3U-Skipped');
+            let msg = 'Playlist exported.';
+            if (included != null) {
+                const n = parseInt(included, 10);
+                if (!isNaN(n)) msg = n === 1 ? 'Exported 1 track.' : `Exported ${n} tracks.`;
+                if (skipped != null) {
+                    const m = parseInt(skipped, 10);
+                    if (!isNaN(m) && m > 0) msg += ` (${m} skipped, no library file.)`;
+                }
+            }
+            setExportMessage(msg);
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            const disp = res.headers.get('Content-Disposition');
+            const match = disp?.match(/filename="(.+)"/);
+            a.download = match?.[1] ?? 'airwave_playlist.m3u';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+        } catch (e) {
+            console.error(e);
+            setExportError('Failed to export M3U playlist.');
+        } finally {
+            setExportingM3U(false);
+        }
+    };
 
     const { data: health, isLoading } = useQuery({
         queryKey: ['stations', id, 'health'],
@@ -54,6 +100,18 @@ export default function StationDetail() {
                         <h1 className="text-3xl font-bold text-gray-900">{health.station.callsign}</h1>
                         <p className="text-gray-500">Detailed health and matching analysis</p>
                     </div>
+                    <button
+                        type="button"
+                        onClick={exportM3U}
+                        disabled={exportingM3U}
+                        className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        title="Export matched logs as M3U playlist"
+                    >
+                        {exportingM3U ? <Loader2 className="w-5 h-5 animate-spin" /> : <Music className="w-5 h-5" />}
+                        {exportingM3U ? 'Exporting…' : 'Export M3U'}
+                    </button>
+                    {exportMessage && <p className="text-sm text-green-600" data-testid="export-message">{exportMessage}</p>}
+                    {exportError && <p className="text-sm text-red-600" data-testid="export-error">{exportError}</p>}
                 </div>
                 {/* Add Gauge here? No, maybe just in the header row if I want. */}
                 {/* Actually adding it now */}

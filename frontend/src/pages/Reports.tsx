@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
-import { fetcher } from '../lib/api';
-import { Download, TrendingUp, CheckCircle, XCircle, Brain } from 'lucide-react';
+import { fetcher, API_BASE } from '../lib/api';
+import { Download, TrendingUp, CheckCircle, XCircle, Brain, Music, Loader2 } from 'lucide-react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts';
 import { useState } from 'react';
 
@@ -20,6 +20,9 @@ export default function Reports() {
     const [endDate, setEndDate] = useState('');
     const [stationId, setStationId] = useState<number | null>(null);
     const [exportType, setExportType] = useState<'all' | 'matched' | 'unmatched'>('all');
+    const [exportingM3U, setExportingM3U] = useState(false);
+    const [exportM3UMessage, setExportM3UMessage] = useState<string | null>(null);
+    const [exportM3UError, setExportM3UError] = useState<string | null>(null);
 
     // Fetch victory stats
     const { data: victory, isLoading } = useQuery<VictoryStats>({
@@ -44,9 +47,50 @@ export default function Reports() {
 
         // Direct window open downloads the file
         // For production, using blob logic is better for auth handling, but window.open works for cookie/basic scenarios
-        // Assuming base URL needs to be handled:
-        const baseUrl = 'http://localhost:8000/api/v1'; // Should come from config
-        window.open(`${baseUrl}/export/logs?${params.toString()}`, '_blank');
+        window.open(`${API_BASE}/export/logs?${params.toString()}`, '_blank');
+    };
+
+    const handleExportM3U = async () => {
+        setExportingM3U(true);
+        setExportM3UError(null);
+        setExportM3UMessage(null);
+        try {
+            const params = new URLSearchParams();
+            if (startDate) params.append('start_date', startDate);
+            if (endDate) params.append('end_date', endDate);
+            if (stationId) params.append('station_id', stationId.toString());
+            params.append('matched_only', 'true');
+            const res = await fetch(`${API_BASE}/export/m3u?${params}`);
+            if (!res.ok) throw new Error('Export failed');
+            const blob = await res.blob();
+            const included = res.headers.get('X-Airwave-M3U-Included');
+            const skipped = res.headers.get('X-Airwave-M3U-Skipped');
+            let msg = 'Playlist exported.';
+            if (included != null) {
+                const n = parseInt(included, 10);
+                if (!isNaN(n)) msg = n === 1 ? 'Exported 1 track.' : `Exported ${n} tracks.`;
+                if (skipped != null) {
+                    const m = parseInt(skipped, 10);
+                    if (!isNaN(m) && m > 0) msg += ` (${m} skipped, no library file.)`;
+                }
+            }
+            setExportM3UMessage(msg);
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            const disp = res.headers.get('Content-Disposition');
+            const match = disp?.match(/filename="(.+)"/);
+            a.download = match?.[1] ?? 'airwave_playlist.m3u';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+        } catch (e) {
+            console.error(e);
+            setExportM3UError('Failed to export M3U playlist.');
+        } finally {
+            setExportingM3U(false);
+        }
     };
 
     // Pie chart colors (8 distinct colors for match categories)
@@ -205,15 +249,29 @@ export default function Reports() {
                         </div>
                     </div>
 
-                    <button
-                        onClick={handleExport}
-                        className="w-full md:w-auto px-8 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 flex items-center justify-center gap-2 font-medium shadow-md transition-all hover:shadow-lg focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
-                    >
-                        <Download className="w-5 h-5" />
-                        Download CSV Report
-                    </button>
+                    <div className="flex flex-wrap gap-4 items-center">
+                        <button
+                            onClick={handleExport}
+                            className="px-8 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 flex items-center justify-center gap-2 font-medium shadow-md transition-all hover:shadow-lg focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+                        >
+                            <Download className="w-5 h-5" />
+                            Download CSV Report
+                        </button>
+                        <button
+                            type="button"
+                            onClick={handleExportM3U}
+                            disabled={exportingM3U}
+                            className="px-8 py-3 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 flex items-center justify-center gap-2 font-medium shadow-md transition-all hover:shadow-lg focus:ring-2 focus:ring-offset-2 focus:ring-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                            title="Export matched logs as M3U playlist"
+                        >
+                            {exportingM3U ? <Loader2 className="w-5 h-5 animate-spin" /> : <Music className="w-5 h-5" />}
+                            {exportingM3U ? 'Exporting…' : 'Export M3U'}
+                        </button>
+                        {exportM3UMessage && <p className="text-sm text-green-600" data-testid="export-m3u-message">{exportM3UMessage}</p>}
+                        {exportM3UError && <p className="text-sm text-red-600" data-testid="export-m3u-error">{exportM3UError}</p>}
+                    </div>
                     <p className="mt-4 text-sm text-gray-500">
-                        Exports a localized CSV file.
+                        CSV: exports a localized report. M3U: exports matched logs as a playlist (absolute paths to library files).
                     </p>
                 </div>
             </div>
