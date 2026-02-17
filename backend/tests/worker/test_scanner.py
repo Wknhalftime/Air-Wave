@@ -27,7 +27,8 @@ async def test_process_file_new_track():
     file_scanner = FileScanner(mock_session)
     file_scanner.matcher = AsyncMock(spec=Matcher)
     file_scanner.matcher._vector_db = MagicMock()
-    file_scanner.executor = MagicMock()  # Mock Executor
+    file_scanner.metadata_executor = MagicMock()
+    file_scanner.hashing_executor = MagicMock()
 
     file_path = MagicMock()
     file_path.__str__.return_value = "/music/Artist - Title.mp3"
@@ -146,10 +147,14 @@ async def test_scan_directory_structure():
         entry2.name = "song2.flac"
         entry2.path = "/music/song2.flac"
 
-        # Single-pass scan: only run_in_executor is scandir (no prior count)
+        # run_in_executor order: 1) os.stat (folder skip), 2) scandir
+        from types import SimpleNamespace
+        stat_result = SimpleNamespace(st_mtime=12345.0)
         f_entries = asyncio.Future()
         f_entries.set_result([entry1, entry2])
-        mock_loop.return_value.run_in_executor.side_effect = [f_entries]
+        mock_loop.return_value.run_in_executor = AsyncMock(
+            side_effect=[stat_result, [entry1, entry2]]
+        )
 
         stats = await file_scanner.scan_directory(root)
 
@@ -165,7 +170,8 @@ async def test_process_file_with_albumartist():
     file_scanner = FileScanner(mock_session)
     file_scanner.matcher = AsyncMock(spec=Matcher)
     file_scanner.matcher._vector_db = MagicMock()
-    file_scanner.executor = MagicMock()
+    file_scanner.metadata_executor = MagicMock()
+    file_scanner.hashing_executor = MagicMock()
 
     file_path = MagicMock()
     file_path.__str__.return_value = "/music/Collaboration.mp3"
@@ -244,7 +250,8 @@ async def test_process_file_compilation():
     file_scanner = FileScanner(mock_session)
     file_scanner.matcher = AsyncMock(spec=Matcher)
     file_scanner.matcher._vector_db = MagicMock()
-    file_scanner.executor = MagicMock()
+    file_scanner.metadata_executor = MagicMock()
+    file_scanner.hashing_executor = MagicMock()
 
     file_path = MagicMock()
     file_path.__str__.return_value = "/music/Compilation.mp3"
@@ -323,7 +330,8 @@ async def test_process_file_multi_artist():
     file_scanner = FileScanner(mock_session)
     file_scanner.matcher = AsyncMock(spec=Matcher)
     file_scanner.matcher._vector_db = MagicMock()
-    file_scanner.executor = MagicMock()
+    file_scanner.metadata_executor = MagicMock()
+    file_scanner.hashing_executor = MagicMock()
 
     file_path = MagicMock()
     file_path.__str__.return_value = "/music/Collaboration.mp3"
@@ -412,7 +420,8 @@ async def test_process_file_duplicate_artist_ids():
     file_scanner = FileScanner(mock_session)
     file_scanner.matcher = AsyncMock(spec=Matcher)
     file_scanner.matcher._vector_db = MagicMock()
-    file_scanner.executor = MagicMock()
+    file_scanner.metadata_executor = MagicMock()
+    file_scanner.hashing_executor = MagicMock()
 
     file_path = MagicMock()
     file_path.__str__.return_value = "/music/POD.mp3"

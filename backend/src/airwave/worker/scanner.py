@@ -17,16 +17,25 @@ Typical usage example:
 import asyncio
 import concurrent.futures
 import hashlib
+import json
 import os
+import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    import blake3
+    HAS_BLAKE3 = True
+except ImportError:
+    HAS_BLAKE3 = False
 
 import mutagen
 from loguru import logger
 from mutagen.id3 import ID3NoHeaderError
-from sqlalchemy import and_, insert, or_, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import and_, delete, insert, or_, select, update
+from sqlalchemy.exc import IntegrityError, InvalidRequestError, MissingGreenlet
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from airwave.core.models import (
@@ -38,6 +47,7 @@ from airwave.core.models import (
     Work,
     WorkArtist,
 )
+from airwave.core.config import settings
 from airwave.core.normalization import Normalizer
 from airwave.core.performance import PerformanceMetrics
 from airwave.core.scanner_config import ScannerConfig
@@ -45,6 +55,57 @@ from airwave.core.stats import ScanStats
 from airwave.core.task_store import TaskStore
 from airwave.core.vector_db import VectorDB
 from airwave.worker.matcher import Matcher
+
+
+# MusicBrainz Artist ID: standard UUID format (8-4-4-4-12 hex)
+_MBID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _parse_mbid_list(raw: Optional[str]) -> List[str]:
+    """Parse raw MBID tag value (single UUID or comma-separated) into list of valid UUIDs."""
+    if not raw or not raw.strip():
+        return []
+    result = []
+    for part in raw.split(","):
+        s = part.strip()
+        if s and _MBID_PATTERN.match(s):
+            result.append(s)
+    return result
+
+
+def _extract_mbid_from_tags(tags: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Extract MusicBrainz Artist Id and Album Artist Id from Mutagen tags.
+
+    Supports ID3 (TXXX frames) and Vorbis/FLAC (MUSICBRAINZ_* keys).
+    Returns (artist_mbid_raw, album_artist_mbid_raw); each may be comma-separated.
+    """
+    artist_raw: Optional[str] = None
+    album_artist_raw: Optional[str] = None
+    if tags is None:
+        return (None, None)
+    # Vorbis / FLAC / OGG
+    if hasattr(tags, "get"):
+        v_artist = tags.get("MUSICBRAINZ_ARTISTID", [""])
+        v_album = tags.get("MUSICBRAINZ_ALBUMARTISTID", [""])
+        if v_artist and v_artist[0]:
+            artist_raw = (v_artist[0] or "").strip()
+        if v_album and v_album[0]:
+            album_artist_raw = (v_album[0] or "").strip()
+    # ID3 TXXX frames
+    if hasattr(tags, "getall"):
+        for frame in tags.getall("TXXX") or []:
+            desc = getattr(frame, "desc", None)
+            text = getattr(frame, "text", None) or []
+            val = (text[0] or "").strip() if text else ""
+            if not val:
+                continue
+            if desc == "MusicBrainz Artist Id":
+                artist_raw = val
+            elif desc == "MusicBrainz Album Artist Id":
+                album_artist_raw = val
+    return (artist_raw or None, album_artist_raw or None)
 
 
 class _ArtistRef:
@@ -90,6 +151,8 @@ class LibraryMetadata:
         duration: Track duration in seconds.
         isrc: International Standard Recording Code.
         release_date: Album/track release date.
+        artist_mbids: Valid MusicBrainz Artist IDs from track artist tag.
+        album_artist_mbids: Valid MusicBrainz Artist IDs from album artist tag.
     """
 
     def __init__(
@@ -101,6 +164,8 @@ class LibraryMetadata:
         duration: Optional[float] = None,
         isrc: Optional[str] = None,
         release_date: Optional[datetime] = None,
+        artist_mbids: Optional[List[str]] = None,
+        album_artist_mbids: Optional[List[str]] = None,
     ):
         """Initializes metadata with normalization and version parsing.
 
@@ -112,6 +177,8 @@ class LibraryMetadata:
             duration: Track duration in seconds.
             isrc: International Standard Recording Code.
             release_date: Release date of the track/album.
+            artist_mbids: List of valid MusicBrainz Artist IDs for track artist.
+            album_artist_mbids: List of valid MusicBrainz Artist IDs for album artist.
         """
         self.raw_artist = raw_artist
         self.raw_title = raw_title
@@ -140,6 +207,8 @@ class LibraryMetadata:
         self.duration = duration
         self.isrc = isrc
         self.release_date = release_date
+        self.artist_mbids = artist_mbids or []
+        self.album_artist_mbids = album_artist_mbids or []
 
 
 class FileScanner:
@@ -168,6 +237,36 @@ class FileScanner:
 
     SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".ogg"}
 
+    @staticmethod
+    def _count_audio_files_sync(
+        root_path: str,
+        target_subdirs: Optional[set],
+        extensions: Set[str],
+    ) -> int:
+        """Count audio files under root_path (optionally under target_subdirs only).
+        Uses same extension and directory filtering as the main scan. Intended for
+        progress total; run in executor to avoid blocking.
+        """
+        count = 0
+        try:
+            entries = list(os.scandir(root_path))
+        except (OSError, PermissionError):
+            return 0
+        for entry in entries:
+            if entry.is_file():
+                if Path(entry.path).suffix.lower() in extensions:
+                    count += 1
+            elif entry.is_dir():
+                dir_norm = str(Path(entry.path).resolve()).replace("\\", "/")
+                if target_subdirs is None or any(
+                    t == dir_norm or dir_norm.startswith(t + "/") or t.startswith(dir_norm + "/")
+                    for t in target_subdirs
+                ):
+                    count += FileScanner._count_audio_files_sync(
+                        entry.path, target_subdirs, extensions
+                    )
+        return count
+
     def __init__(
         self,
         session: AsyncSession,
@@ -194,12 +293,67 @@ class FileScanner:
 
         self.config = config or ScannerConfig()  # Use default config if not provided
         self.matcher = Matcher(session, vector_db=self.vector_db)  # Inject VectorDB into Matcher
-        # Initialize ThreadPool for blocking I/O (mutagen)
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+        # Log hash algorithm being used
+        if HAS_BLAKE3:
+            logger.info("Using BLAKE3 for file hashing (fast, parallel, cryptographically secure)")
+        else:
+            logger.warning("BLAKE3 not available, falling back to MD5 for file hashing")
+
+        # Initialize separate ThreadPools for blocking I/O operations
+        # Separate executors prevent contention between metadata extraction and file hashing
+        self.metadata_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.config.metadata_workers,
+            thread_name_prefix="metadata"
+        )
+        self.hashing_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.config.hashing_workers,
+            thread_name_prefix="hashing"
+        )
+        logger.info(
+            f"Initialized executors: {self.config.metadata_workers} metadata workers, "
+            f"{self.config.hashing_workers} hashing workers"
+        )
         # Performance monitoring
         self.perf_metrics: Optional[PerformanceMetrics] = None
         # Concurrency control
         self._processing_lock = asyncio.Lock()  # For thread-safe stats updates
+        self._session_lock = asyncio.Lock()  # For commit/rollback synchronization
+        self._batch_lock = asyncio.Lock()  # For artist/work batch operations
+
+    # ========== Session Helpers (IntegrityError / Race Condition Handling) ==========
+
+    async def _safe_flush(self, context: str) -> bool:
+        """Flush session, handling IntegrityError from race conditions in parallel processing.
+
+        Returns:
+            True if flush succeeded, False if IntegrityError occurred and rollback was performed.
+        """
+        try:
+            await self.session.flush()
+            return True
+        except IntegrityError as e:
+            logger.debug(
+                f"IntegrityError during {context} (race condition in parallel processing): {e}"
+            )
+            await self.session.rollback()
+            return False
+
+    async def _safe_commit(self, context: str) -> bool:
+        """Commit session, handling IntegrityError from race conditions in parallel processing.
+
+        Returns:
+            True if commit succeeded, False if IntegrityError occurred and rollback was performed.
+        """
+        try:
+            await self.session.commit()
+            return True
+        except IntegrityError as e:
+            logger.debug(
+                f"IntegrityError during {context} (race condition in parallel processing): {e}"
+            )
+            await self.session.rollback()
+            return False
 
     # ========== Thread-Safe Helper Methods (Phase 1: Race Condition Fixes) ==========
 
@@ -209,11 +363,13 @@ class FileScanner:
             self._path_index_seen.add(path)
 
     async def _add_touch_id(self, file_id: int) -> None:
-        """Thread-safe: Add file ID to touch batch and flush if threshold reached."""
+        """Thread-safe: Add file ID to touch batch and flush if threshold reached.
+        Flush acquires _session_lock to serialize with commits."""
         async with self._processing_lock:
             self._touch_ids.add(file_id)
             if len(self._touch_ids) >= self.config.touch_batch_size:
-                await self._flush_touch()
+                async with self._session_lock:
+                    await self._flush_touch()
 
     async def _update_path_index_for_move(
         self, old_path: str, new_path: str, file_id: int, size: int, mtime: float
@@ -256,6 +412,38 @@ class FileScanner:
             return
 
         try:
+            # Folder-level skip: if directory mtime unchanged, skip entire dir (Navidrome optimization)
+            # Only applies in incremental mode (full_scan=False); full_scan=True processes all
+            stat_dir = None
+            dir_path_normalized = str(Path(current_path).resolve()).replace("\\", "/")
+            if self.config.enable_folder_skip:
+                try:
+                    stat_dir = await asyncio.get_running_loop().run_in_executor(
+                        None, os.stat, current_path
+                    )
+                except OSError:
+                    stat_dir = None
+            if (
+                self.config.enable_folder_skip
+                and not getattr(self, "_full_scan", True)
+                and stat_dir is not None
+                and getattr(self, "_folder_mtime_cache", None) is not None
+            ):
+                cached_mtime = self._folder_mtime_cache.get(dir_path_normalized)
+                if cached_mtime is not None and stat_dir.st_mtime == cached_mtime:
+                    if self.perf_metrics:
+                        self.perf_metrics.directories_skipped += 1
+                    # Mark paths under this dir as seen so orphan GC won't delete them
+                    dir_prefix = dir_path_normalized.rstrip("/") + "/"
+                    async with self._processing_lock:
+                        for p in list(getattr(self, "_path_index", {}).keys()):
+                            if p == dir_path_normalized or p.startswith(dir_prefix):
+                                self._path_index_seen.add(p)
+                    logger.debug(
+                        f"Skipping unchanged directory (folder-level): {current_path}"
+                    )
+                    return
+
             # Track directory processing
             if self.perf_metrics:
                 self.perf_metrics.directories_processed += 1
@@ -263,6 +451,10 @@ class FileScanner:
             entries = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: list(os.scandir(current_path))
             )
+
+            # Update folder cache with current mtime for next scan
+            if self.config.enable_folder_skip and stat_dir is not None:
+                self._folder_mtime_cache[dir_path_normalized] = stat_dir.st_mtime
 
             # Separate files and directories
             files_to_process = []
@@ -276,12 +468,37 @@ class FileScanner:
                     if p.suffix.lower() in self.SUPPORTED_EXTENSIONS:
                         files_to_process.append(p)
 
+            # Selective scan: skip file processing when at ancestor of target (not target itself)
+            target_subdirs_check = getattr(self, "_target_subdirs", None)
+            if target_subdirs_check and files_to_process:
+                # We're at an ancestor if: not in targets, but some target is under us
+                is_ancestor = (
+                    dir_path_normalized not in target_subdirs_check
+                    and any(t.startswith(dir_path_normalized.rstrip("/") + "/") for t in target_subdirs_check)
+                )
+                if is_ancestor:
+                    files_to_process = []  # Skip files in this dir, only recurse
+
             # Process files in this directory concurrently with semaphore
             if files_to_process:
                 await self._process_files_with_semaphore(files_to_process, stats, task_id)
 
             if stats.cancelled:
                 return
+
+            # Filter dirs for selective scan (target_subdirs)
+            target_subdirs = getattr(self, "_target_subdirs", None)
+            if target_subdirs:
+                filtered_dirs = []
+                for dir_path in dirs_to_process:
+                    dir_norm = str(Path(dir_path).resolve()).replace("\\", "/")
+                    # Include if dir is in targets, or is a prefix of a target, or is under a target
+                    if any(
+                        dir_norm == t or dir_norm.startswith(t + "/") or t.startswith(dir_norm + "/")
+                        for t in target_subdirs
+                    ):
+                        filtered_dirs.append(dir_path)
+                dirs_to_process = filtered_dirs
 
             # Recursively process subdirectories (sequentially to avoid too much concurrency)
             for dir_path in dirs_to_process:
@@ -352,8 +569,9 @@ class FileScanner:
 
                         if has_changes:
                             touch_count = len(self._touch_ids)
-                            await self._flush_touch()  # Flush pending touch updates
-                            await self.session.commit()
+                            async with self._session_lock:
+                                await self._flush_touch()  # Flush pending touch updates
+                                await self._safe_commit("periodic commit")
                             # Update last commit counters
                             self._last_commit_created = stats.created
                             self._last_commit_moved = stats.moved
@@ -377,9 +595,22 @@ class FileScanner:
         await asyncio.gather(*[process_with_semaphore(f) for f in files_to_process])
 
     async def scan_directory(
-        self, root_path: str, task_id: Optional[str] = None
+        self,
+        root_path: str,
+        task_id: Optional[str] = None,
+        target_subdirs: Optional[List[str]] = None,
+        full_scan: bool = True,
     ) -> ScanStats:
         """Recursively scans a directory for audio files and syncs them to DB.
+
+        Args:
+            root_path: Root directory to scan.
+            task_id: Optional task ID for progress tracking.
+            target_subdirs: Optional list of subpaths (relative to root_path) to scan.
+                If provided, only these paths and their descendants are scanned.
+                E.g. ["2024", "Albums/New"] scans only root/2024 and root/Albums/New.
+            full_scan: If True (default), scan all files. If False (incremental),
+                use folder mtime cache to skip unchanged directories.
 
         Returns:
             ScanStats object with processing statistics.
@@ -428,6 +659,43 @@ class FileScanner:
         self._last_commit_moved: int = 0    # Track moved count at last commit
         logger.info(f"Loaded path index: {len(path_index)} files")
 
+        # Load folder mtime cache for folder-level skip optimization
+        self._folder_mtime_cache: Dict[str, float] = self._load_folder_cache(root_path)
+        self._full_scan: bool = full_scan
+
+        # Resolve target subdirs to absolute paths for selective scan
+        self._target_subdirs: Optional[set] = None
+        if target_subdirs:
+            root_resolved = str(Path(root_path).resolve()).replace("\\", "/")
+            self._target_subdirs = {
+                str((Path(root_path) / t).resolve()).replace("\\", "/")
+                for t in target_subdirs
+            }
+            # Filter to paths under root
+            self._target_subdirs = {
+                p for p in self._target_subdirs
+                if p == root_resolved or p.startswith(root_resolved + "/")
+            }
+            if self._target_subdirs:
+                logger.info(f"Selective scan: targeting {len(self._target_subdirs)} subdirs")
+
+        # Optional: count files for accurate progress (same extensions + target_subdirs)
+        if task_id:
+            loop = asyncio.get_running_loop()
+            expected_count = await loop.run_in_executor(
+                None,
+                lambda: FileScanner._count_audio_files_sync(
+                    root_path,
+                    getattr(self, "_target_subdirs", None),
+                    self.SUPPORTED_EXTENSIONS,
+                ),
+            )
+            if expected_count > 0:
+                self.task_store.update_total(
+                    task_id, expected_count, f"Scanning {expected_count} files..."
+                )
+                logger.info(f"Expected file count for progress: {expected_count}")
+
         # Recursive Scan using scandir with parallel file processing
         await self._process_recursive(root_path, stats, task_id)
 
@@ -436,7 +704,7 @@ class FileScanner:
             # Flush any pending changes before cancelling
             await self._flush_touch()
             self._flush_vector_tracks()
-            await self.session.commit()
+            await self._safe_commit("final commit (cancelled)")
 
             self.task_store.mark_cancelled(task_id)
             logger.warning(f"Scan cancelled after processing {stats.processed} files")
@@ -444,7 +712,15 @@ class FileScanner:
 
         await self._flush_touch()
         self._flush_vector_tracks()
-        await self.session.commit()
+        await self._safe_commit("final commit")
+
+        # Persist folder mtime cache for next scan
+        self._save_folder_cache(root_path)
+
+        # Post-scan orphan GC: remove LibraryFiles no longer on disk
+        gc_deleted = await self._finalize_scan_orphan_gc()
+        if gc_deleted > 0:
+            logger.info(f"Orphan GC: removed {gc_deleted} LibraryFile rows (files no longer on disk)")
 
         # Finalize performance metrics
         if self.perf_metrics:
@@ -461,6 +737,68 @@ class FileScanner:
             logger.success(f"Task {task_id} completed: {stats}")
 
         return stats
+
+    def _folder_cache_path(self, root_path: str) -> Path:
+        """Path to folder mtime cache file, scoped per library root."""
+        normalized = str(Path(root_path).resolve()).replace("\\", "/")
+        key = hashlib.md5(normalized.encode()).hexdigest()[:16]
+        return Path(settings.DATA_DIR) / "scan_folder_cache" / f"{key}.json"
+
+    def _load_folder_cache(self, root_path: str) -> Dict[str, float]:
+        """Load folder mtime cache from disk for folder-level skip optimization."""
+        path = self._folder_cache_path(root_path)
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            return dict(data) if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug(f"Could not load folder cache from {path}: {e}")
+            return {}
+
+    def _save_folder_cache(self, root_path: str) -> None:
+        """Persist folder mtime cache to disk for next scan."""
+        cache = getattr(self, "_folder_mtime_cache", None)
+        if not cache:
+            return
+        path = self._folder_cache_path(root_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(path, "w") as f:
+                json.dump(cache, f, indent=0)
+        except OSError as e:
+            logger.warning(f"Could not save folder cache to {path}: {e}")
+
+    async def _finalize_scan_orphan_gc(self) -> int:
+        """Remove LibraryFile rows for paths no longer seen on disk (orphan GC).
+        Streams rows instead of loading all into memory for large libraries."""
+        path_index_seen = getattr(self, "_path_index_seen", None)
+        if not path_index_seen:
+            return 0
+        stmt = select(LibraryFile.id, LibraryFile.path)
+        ids_to_delete: List[int] = []
+        async with self._session_lock:
+            result = await self.session.stream(stmt)
+            async for row in result:
+                if row.path.replace("\\", "/") not in path_index_seen:
+                    ids_to_delete.append(row.id)
+            await result.close()
+        if not ids_to_delete:
+            return 0
+        # Delete in batches to avoid huge IN clause
+        batch_size = 500
+        deleted = 0
+        async with self._session_lock:
+            for i in range(0, len(ids_to_delete), batch_size):
+                batch = ids_to_delete[i : i + batch_size]
+                await self.session.execute(
+                    delete(LibraryFile).where(LibraryFile.id.in_(batch))
+                )
+                deleted += len(batch)
+            if deleted > 0:
+                await self._safe_commit("orphan cleanup commit")
+        return deleted
 
     def _flush_vector_tracks(self) -> None:
         """Flush queued (recording_id, artist, title) to vector DB in one batch."""
@@ -534,6 +872,7 @@ class FileScanner:
                 .outerjoin(Artist, Work.artist_id == Artist.id)
                 .where(LibraryFile.path.in_(chunk))
             )
+            # Caller (e.g. _handle_moved_file) holds _session_lock
             result = await self.session.execute(stmt)
             rows = result.all()
             for row in rows:
@@ -577,63 +916,130 @@ class FileScanner:
             return None
 
     async def _flush_pending_artists(self) -> None:
-        """Bulk insert pending artists and fill _artist_cache."""
-        pending = getattr(self, "_pending_artists", None)
-        if not pending:
-            return
-        names = list(pending)
-        self._pending_artists.clear()
-        await self.session.execute(
-            insert(Artist), [{"name": n} for n in names]
-        )
-        await self.session.flush()
-        res = await self.session.execute(select(Artist).where(Artist.name.in_(names)))
-        for a in res.scalars().all():
-            self._artist_cache[a.name] = a
+        """Bulk insert pending artists and fill _artist_cache.
+
+        Uses _batch_lock to prevent race conditions in parallel processing where
+        multiple tasks might try to flush artists simultaneously.
+        """
+        async with self._batch_lock:
+            pending = getattr(self, "_pending_artists", None)
+            if not pending:
+                return
+            names = list(pending)
+            self._pending_artists.clear()
+            await self.session.execute(
+                insert(Artist), [{"name": n} for n in names]
+            )
+            await self._safe_flush("artist flush")
+            res = await self.session.execute(select(Artist).where(Artist.name.in_(names)))
+            for a in res.scalars().all():
+                self._cache_artist(a)
 
     async def _flush_pending_works(self) -> None:
-        """Bulk insert pending works and fill _work_cache."""
-        pending = getattr(self, "_pending_works", None)
-        if not pending:
-            return
-        pairs = list(pending)
-        self._pending_works.clear()
-        await self.session.execute(
-            insert(Work),
-            [{"title": t, "artist_id": a} for t, a in pairs],
-        )
-        await self.session.flush()
-        stmt = select(Work).where(
-            or_(*(and_(Work.title == t, Work.artist_id == a) for t, a in pairs))
-        )
-        res = await self.session.execute(stmt)
-        for w in res.scalars().all():
-            self._work_cache[(w.title, w.artist_id)] = w
+        """Bulk insert pending works and fill _work_cache.
+
+        Uses _batch_lock to prevent race conditions in parallel processing where
+        multiple tasks might try to flush works simultaneously.
+        """
+        async with self._batch_lock:
+            pending = getattr(self, "_pending_works", None)
+            if not pending:
+                return
+            pairs = list(pending)
+            self._pending_works.clear()
+            await self.session.execute(
+                insert(Work),
+                [{"title": t, "artist_id": a} for t, a in pairs],
+            )
+            await self._safe_flush("work flush")
+            stmt = select(Work).where(
+                or_(*(and_(Work.title == t, Work.artist_id == a) for t, a in pairs))
+            )
+            res = await self.session.execute(stmt)
+            for w in res.scalars().all():
+                self._work_cache[(w.title, w.artist_id)] = w
 
     def _ensure_batch_caches(self) -> None:
         """Init artist/work caches and pending when not set (e.g. standalone tests)."""
         if hasattr(self, "_artist_cache") and isinstance(self._artist_cache, dict):
+            if not hasattr(self, "_artist_cache_by_mbid") or not isinstance(
+                getattr(self, "_artist_cache_by_mbid", None), dict
+            ):
+                self._artist_cache_by_mbid = {}
             return
         self._artist_cache = {}
+        self._artist_cache_by_mbid = {}
         self._pending_artists = set()
         self._work_cache = {}
         self._pending_works = []
 
-    async def _get_or_create_artist(self, clean_name: str):
-        """Get or create artist (batched). Call _flush_pending_artists() before using .id."""
+    def _cache_artist(self, artist: Artist) -> None:
+        """Add artist to name cache and, if present, MBID cache."""
+        self._artist_cache[artist.name] = artist
+        if artist.musicbrainz_id:
+            self._artist_cache_by_mbid[artist.musicbrainz_id] = artist
+
+    async def _get_or_create_artist(
+        self, clean_name: str, mbid: Optional[str] = None
+    ):
+        """Get or create artist (batched when no MBID). Call _flush_pending_artists() before using .id when batched."""
         if not clean_name:
             clean_name = "unknown artist"
         self._ensure_batch_caches()
+
+        # When MBID is present: use it only for lookup; if not in DB, fall back to name and update if empty
+        used_mbid_fallback = False
+        if mbid:
+            if mbid in self._artist_cache_by_mbid:
+                return self._artist_cache_by_mbid[mbid]
+            stmt = select(Artist).where(Artist.musicbrainz_id == mbid)
+            res = await self.session.execute(stmt)
+            existing = res.scalar_one_or_none()
+            if existing:
+                self._cache_artist(existing)
+                return existing
+            # MBID not in system: fall back to name-based; will update artist with MBID if empty
+            used_mbid_fallback = True
+
+        async def _maybe_update_mbid(artist: Artist) -> None:
+            if not (used_mbid_fallback and mbid and artist.musicbrainz_id is None):
+                return
+            conflict_res = await self.session.execute(
+                select(Artist).where(
+                    Artist.musicbrainz_id == mbid, Artist.id != artist.id
+                )
+            )
+            if conflict_res.scalar_one_or_none():
+                return
+            artist.musicbrainz_id = mbid
+
+        # Name-based path (batched when no MBID match)
         if clean_name in self._artist_cache:
-            return self._artist_cache[clean_name]
-        # Check DB for existing (e.g. from another session or test pre-seed)
+            artist = self._artist_cache[clean_name]
+            if used_mbid_fallback and mbid and artist.musicbrainz_id is None:
+                await _maybe_update_mbid(artist)
+                await self._safe_flush("artist MBID update")
+                self._cache_artist(artist)
+            return artist
         stmt = select(Artist).where(Artist.name == clean_name)
         res = await self.session.execute(stmt)
         existing = res.scalar_one_or_none()
         if existing:
-            self._artist_cache[clean_name] = existing
+            self._cache_artist(existing)
+            if used_mbid_fallback and mbid and existing.musicbrainz_id is None:
+                await _maybe_update_mbid(existing)
+                await self._safe_flush("existing artist MBID update")
+                self._cache_artist(existing)
             return existing
         self._pending_artists.add(clean_name)
+        if used_mbid_fallback and mbid:
+            await self._flush_pending_artists()
+            artist = self._artist_cache[clean_name]
+            if artist.musicbrainz_id is None:
+                await _maybe_update_mbid(artist)
+                await self._safe_flush("pending artist MBID update")
+                self._cache_artist(artist)
+            return artist
         return _ArtistRef(self, clean_name)
 
     async def _get_or_create_work(
@@ -684,7 +1090,13 @@ class FileScanner:
                 isrc=isrc,
             )
             self.session.add(recording)
-            await self.session.flush()
+            if not await self._safe_flush("recording flush"):
+                stmt = select(Recording).where(
+                    Recording.work_id == work_id,
+                    Recording.title == clean_title,
+                )
+                res = await self.session.execute(stmt)
+                recording = res.scalar_one_or_none()
         elif isrc and not recording.isrc:
             recording.isrc = isrc
 
@@ -713,13 +1125,22 @@ class FileScanner:
                 release_date=release_date,
             )
             self.session.add(album)
-            await self.session.flush()
+            if not await self._safe_flush("album flush"):
+                stmt = select(Album).where(
+                    Album.title == clean_album_title,
+                    Album.artist_id == artist_id,
+                )
+                res = await self.session.execute(stmt)
+                album = res.scalar_one_or_none()
 
         return album
 
     def _parse_metadata_from_audio(
         self, audio: Any, file_path: Path
-    ) -> Tuple[str, str, str, str, Optional[str], Optional[datetime], Optional[float], Optional[int]]:
+    ) -> Tuple[
+        str, str, str, str, Optional[str], Optional[datetime], Optional[float], Optional[int],
+        Optional[str], Optional[str],
+    ]:
         """Parse metadata from audio tags.
 
         Args:
@@ -727,7 +1148,8 @@ class FileScanner:
             file_path: Path to the audio file (for fallback parsing).
 
         Returns:
-            Tuple of (artist_name, album_artist, title, album_title, isrc, release_date, duration, bitrate)
+            Tuple of (artist_name, album_artist, title, album_title, isrc, release_date,
+            duration, bitrate, artist_mbid_raw, album_artist_mbid_raw).
         """
         # Extract basic metadata
         artist_name = audio.get("artist", [""])[0]
@@ -736,6 +1158,11 @@ class FileScanner:
         album_title = audio.get("album", [""])[0]
         isrc = audio.get("isrc", [""])[0] or None
         date_str = audio.get("date", [""])[0] or None
+
+        # MusicBrainz Artist IDs (ID3 TXXX or Vorbis MUSICBRAINZ_*)
+        artist_mbid_raw, album_artist_mbid_raw = _extract_mbid_from_tags(
+            getattr(audio, "tags", None)
+        )
 
         # Parse release date (ID3 tags often have just year like "2003")
         release_date = None
@@ -757,7 +1184,11 @@ class FileScanner:
         duration = audio.info.length if audio.info else None
         bitrate = getattr(audio.info, "bitrate", None) if audio.info else None
 
-        return (artist_name, album_artist, title, album_title, isrc, release_date, duration, bitrate)
+        return (
+            artist_name, album_artist, title, album_title,
+            isrc, release_date, duration, bitrate,
+            artist_mbid_raw, album_artist_mbid_raw,
+        )
 
     def _apply_filename_fallback(
         self, raw_artist: str, raw_title: str, file_path: Path
@@ -851,6 +1282,8 @@ class FileScanner:
         for a_clean in unique_targets:
             a_obj = await self._get_or_create_artist(a_clean)
             await self._flush_pending_artists()
+
+            # Check if link already exists
             stmt_wa = select(WorkArtist).where(
                 WorkArtist.work_id == work.id,
                 WorkArtist.artist_id == a_obj.id,
@@ -862,17 +1295,43 @@ class FileScanner:
                     if a_obj.id == primary_artist.id
                     else "Featured"
                 )
+                # Add the work-artist link
+                # Note: There's still a race condition window between check and add,
+                # but IntegrityError will be caught during commit and handled gracefully
                 self.session.add(
                     WorkArtist(
                         work_id=work.id, artist_id=a_obj.id, role=role
                     )
                 )
 
+    async def _link_artist_objects(
+        self, work: Work, primary_artist: Artist, artist_objs: List[Artist]
+    ) -> None:
+        """Link a list of artist objects to a work (e.g. from MBID resolution)."""
+        for a_obj in artist_objs:
+            stmt_wa = select(WorkArtist).where(
+                WorkArtist.work_id == work.id,
+                WorkArtist.artist_id == a_obj.id,
+            )
+            res_wa = await self.session.execute(stmt_wa)
+            if res_wa.scalar_one_or_none():
+                continue
+            role = (
+                "Primary"
+                if a_obj.id == primary_artist.id
+                else "Featured"
+            )
+            self.session.add(
+                WorkArtist(
+                    work_id=work.id, artist_id=a_obj.id, role=role
+                )
+            )
+
     async def _create_library_file(
         self,
         recording: Recording,
         file_path: Path,
-        file_hash: str,
+        file_hash: Optional[str],
         bitrate: Optional[int],
         mtime: Optional[float] = None,
     ) -> LibraryFile:
@@ -881,7 +1340,7 @@ class FileScanner:
         Args:
             recording: Recording object to link the file to.
             file_path: Path to the audio file.
-            file_hash: MD5 hash of the file.
+            file_hash: BLAKE3/MD5 hash of the file (None if hashing failed).
             bitrate: Bitrate of the audio file.
             mtime: Optional filesystem mtime (st_mtime) for scan index.
 
@@ -890,6 +1349,7 @@ class FileScanner:
 
         Raises:
             OSError: If the file cannot be stat'd (e.g. deleted between stat and create).
+            RuntimeError: If LibraryFile not found after IntegrityError re-query (should not occur).
         """
         try:
             st = file_path.stat()
@@ -906,7 +1366,14 @@ class FileScanner:
             bitrate=bitrate,
         )
         self.session.add(new_file)
-        await self.session.flush()
+        if not await self._safe_flush("library file flush"):
+            stmt = select(LibraryFile).where(LibraryFile.path == str(file_path))
+            res = await self.session.execute(stmt)
+            new_file = res.scalar_one_or_none()
+            if new_file is None:
+                raise RuntimeError(
+                    f"LibraryFile not found after IntegrityError for path {file_path}"
+                )
         return new_file
 
     # ========== Phase 5: Extracted Methods for process_file() ==========
@@ -1036,15 +1503,18 @@ class FileScanner:
         Returns:
             Tuple of (LibraryMetadata, bitrate) if successful, None if extraction failed
         """
-        # 1. Metadata extraction
+        # 1. Metadata extraction (using dedicated metadata executor)
         loop = asyncio.get_running_loop()
+        t_start = time.time()
         audio = await loop.run_in_executor(
-            self.executor, self._extract_metadata, file_path
+            self.metadata_executor, self._extract_metadata, file_path
         )
+        t_metadata = time.time() - t_start
 
         # Performance tracking
         if self.perf_metrics:
             self.perf_metrics.metadata_extractions += 1
+            self.perf_metrics.time_metadata_extraction += t_metadata
 
         if not audio:
             async with self._processing_lock:
@@ -1053,10 +1523,18 @@ class FileScanner:
             return None
 
         # Parse metadata from audio tags
-        (artist_name, album_artist, title, album_title, isrc, release_date, duration, bitrate) = self._parse_metadata_from_audio(audio, file_path)
+        (
+            artist_name, album_artist, title, album_title,
+            isrc, release_date, duration, bitrate,
+            artist_mbid_raw, album_artist_mbid_raw,
+        ) = self._parse_metadata_from_audio(audio, file_path)
 
         # Apply filename fallback if needed
         raw_artist, raw_title = self._apply_filename_fallback(artist_name, title, file_path)
+
+        # Normalize MBID strings to list of valid UUIDs
+        artist_mbids = _parse_mbid_list(artist_mbid_raw)
+        album_artist_mbids = _parse_mbid_list(album_artist_mbid_raw)
 
         # 2. CREATE AIR-LOCK METADATA (Normalized immediately)
         meta = LibraryMetadata(
@@ -1067,6 +1545,8 @@ class FileScanner:
             duration=duration,
             isrc=isrc,
             release_date=release_date,
+            artist_mbids=artist_mbids,
+            album_artist_mbids=album_artist_mbids,
         )
 
         return (meta, bitrate)
@@ -1084,23 +1564,27 @@ class FileScanner:
         Returns:
             True if file was moved (and handled), False if it's a new file
         """
+        # Load missing candidates (session op)
         await self._ensure_missing_candidates()
+
+        # Find candidate (in-memory, uses _processing_lock)
         pid_primary, pid_fallback = self._content_pid(meta.artist, meta.title, file_path)
         candidate = await self._find_move_candidate(pid_primary, pid_fallback, stat.st_size)
 
         if not candidate:
             return False  # Not a moved file
 
-        # Update LibraryFile with new path
-        await self.session.execute(
-            update(LibraryFile)
-            .where(LibraryFile.id == candidate["lib_id"])
-            .values(
-                path=path_str,
-                size=stat.st_size,
-                mtime=float(stat.st_mtime),
+        # Update LibraryFile with new path (session op) - serialize with other session ops
+        async with self._session_lock:
+            await self.session.execute(
+                update(LibraryFile)
+                .where(LibraryFile.id == candidate["lib_id"])
+                .values(
+                    path=path_str,
+                    size=stat.st_size,
+                    mtime=float(stat.st_mtime),
+                )
             )
-        )
 
         # Update path index (thread-safe)
         await self._update_path_index_for_move(
@@ -1126,9 +1610,21 @@ class FileScanner:
         Creates: Artist → Work → Recording → LibraryFile
         Also handles vector indexing and stats updates.
         """
-        # Lock database operations to prevent "Session is already flushing" errors
-        # Metadata extraction above is still parallel (the slow part)
-        async with self._processing_lock:
+        # Serialize database operations to prevent race conditions in parallel processing
+        # This ensures artist/work/recording creation is atomic and prevents IntegrityError cascades
+        async with self._session_lock:
+            t_db_start = time.time()  # Start timer AFTER acquiring lock
+
+            # Calculate file hash (using dedicated hashing executor)
+            loop = asyncio.get_running_loop()
+            t_hash_start = time.time()
+            file_hash = await loop.run_in_executor(
+                self.hashing_executor, self._calculate_file_hash, file_path
+            )
+            t_hash = time.time() - t_hash_start
+            if self.perf_metrics:
+                self.perf_metrics.time_file_hashing += t_hash
+
             # Determine primary artist (for Work)
             is_compilation = meta.album_artist and meta.album_artist.lower() in [
                 "various artists",
@@ -1139,11 +1635,28 @@ class FileScanner:
             # Ambiguous Split Detection
             await self._check_ambiguous_artist_split(meta.raw_artist, meta.album_artist)
 
-            # Artist Records (batched: flush once so .id is available)
-            primary_artist = await self._get_or_create_artist(meta.artist)
-            album_artist_obj = await self._get_or_create_artist(
-                meta.album_artist
-            )
+            # Resolve primary artist(s) and album artist by MBID when present
+            artist_objs_from_mbid: List[Artist] = []
+            if meta.artist_mbids:
+                split_names = [
+                    Normalizer.clean_artist(a)
+                    for a in Normalizer.split_artists(meta.raw_artist or meta.artist)
+                ]
+                for i, mbid in enumerate(meta.artist_mbids):
+                    name = split_names[i] if i < len(split_names) else meta.artist
+                    a_obj = await self._get_or_create_artist(name or meta.artist, mbid=mbid)
+                    artist_objs_from_mbid.append(a_obj)
+                primary_artist = artist_objs_from_mbid[0]
+            else:
+                primary_artist = await self._get_or_create_artist(meta.artist)
+
+            if meta.album_artist_mbids:
+                album_artist_obj = await self._get_or_create_artist(
+                    meta.album_artist, mbid=meta.album_artist_mbids[0]
+                )
+            else:
+                album_artist_obj = await self._get_or_create_artist(meta.album_artist)
+
             await self._flush_pending_artists()
 
             # Album
@@ -1158,17 +1671,16 @@ class FileScanner:
                 meta.work_title, primary_artist.id
             )
 
-            # Multi-Artist Scoring: Link all artists
-            await self._link_multi_artists(work, primary_artist, meta.raw_artist, meta.album_artist)
+            # Multi-Artist: link MBID-resolved list or name-split list
+            if artist_objs_from_mbid:
+                await self._link_artist_objects(work, primary_artist, artist_objs_from_mbid)
+            else:
+                await self._link_multi_artists(
+                    work, primary_artist, meta.raw_artist, meta.album_artist
+                )
 
             recording = await self._get_or_create_recording(
                 work.id, meta.title, meta.version_type, meta.duration, meta.isrc
-            )
-
-            # Calculate file hash (MD5 for deduplication)
-            loop = asyncio.get_running_loop()
-            file_hash = await loop.run_in_executor(
-                self.executor, self._calculate_file_hash, file_path
             )
 
             # Create LibraryFile (mtime from stat for scan index)
@@ -1176,21 +1688,33 @@ class FileScanner:
                 recording, file_path, file_hash, bitrate, mtime=float(stat.st_mtime)
             )
 
-            # Queue for batched vector index update
-            buf = getattr(self, "_vector_tracks_to_add", None)
-            if buf is not None:
-                buf.append((recording.id, meta.artist, meta.title))
-                if len(buf) >= self.config.vector_batch_size:
-                    self._flush_vector_tracks()
-            else:
-                self.vector_db.add_track(
-                    recording.id, meta.artist, meta.title
-                )
+            # Store recording ID for vector indexing (outside lock)
+            recording_id = recording.id
 
-            stats.created += 1
-            stats.processed += 1
+        # Track database operation time (session lock released)
+        t_db = time.time() - t_db_start
+        if self.perf_metrics:
+            self.perf_metrics.time_database_ops += t_db
 
-    def _handle_file_error(
+        # Vector indexing (outside session lock for better parallelism)
+        t_vector_start = time.time()
+        buf = getattr(self, "_vector_tracks_to_add", None)
+        if buf is not None:
+            buf.append((recording_id, meta.artist, meta.title))
+            if len(buf) >= self.config.vector_batch_size:
+                self._flush_vector_tracks()
+        else:
+            self.vector_db.add_track(
+                recording_id, meta.artist, meta.title
+            )
+        t_vector = time.time() - t_vector_start
+        if self.perf_metrics:
+            self.perf_metrics.time_vector_indexing += t_vector
+
+        stats.created += 1
+        stats.processed += 1
+
+    async def _handle_file_error(
         self,
         file_path: Path,
         error: Exception,
@@ -1198,6 +1722,23 @@ class FileScanner:
         context: str = ""
     ) -> None:
         """Centralized error handling for file processing.
+
+        This method handles errors that occur during file processing, with special
+        handling for IntegrityError to prevent session state issues in parallel processing.
+
+        Session State Management:
+            When an IntegrityError occurs (e.g., UNIQUE constraint violation from race
+            conditions in parallel processing), SQLAlchemy automatically rolls back the
+            transaction, putting the session in 'prepared' state. This prevents any
+            further SQL operations from being executed within the same transaction.
+
+            In parallel processing scenarios, this would cause all other concurrent tasks
+            to fail with "This session is in 'prepared' state; no further SQL can be
+            emitted within this transaction."
+
+            To prevent this, we explicitly call session.rollback() after IntegrityError
+            to clear the error state and allow other parallel tasks to continue using
+            the session.
 
         Args:
             file_path: Path to the file that caused the error
@@ -1207,6 +1748,7 @@ class FileScanner:
         """
         error_type = type(error).__name__
 
+
         if isinstance(error, ID3NoHeaderError):
             # ID3NoHeaderError is common for non-MP3 files, just debug log
             logger.debug(f"No ID3 header in {file_path}")
@@ -1215,15 +1757,30 @@ class FileScanner:
             logger.warning(f"File I/O error for {file_path}: {error}")
         elif isinstance(error, IntegrityError):
             # Database integrity error (UNIQUE constraint, foreign key, etc.)
-            # This is usually a race condition from parallel processing
-            logger.warning(
-                f"Database integrity error for {file_path} "
-                f"(likely race condition): {error}"
+            # This is expected in parallel processing when multiple files try to create
+            # the same artist/work/recording. The data is already in DB from another task.
+            logger.debug(
+                f"IntegrityError for {file_path} (race condition in parallel processing): {error}"
             )
-            # NOTE: We do NOT rollback here because:
-            # 1. We're using parallel processing with a shared session
-            # 2. Rollback would close the transaction for ALL parallel tasks
-            # 3. The error is isolated to this file, other files can continue
+            await self._rollback_session_for_error(file_path, error_type, "IntegrityError")
+        elif isinstance(error, InvalidRequestError) and "prepared" in str(error).lower():
+            # InvalidRequestError: "session is in 'prepared' state" - typically a
+            # cascade from IntegrityError (or similar) in another parallel task.
+            # SQLAlchemy auto-rollback leaves session in prepared state; we must
+            # rollback to allow other parallel tasks to continue.
+            logger.debug(
+                f"Session prepared state for {file_path} (cascade from parallel task): {error}"
+            )
+            await self._rollback_session_for_error(file_path, error_type, "InvalidRequestError")
+        elif isinstance(error, MissingGreenlet):
+            # Async session used from wrong greenlet/task context.
+            # This is expected in parallel processing when session state is corrupted
+            # by errors in other tasks. Don't try to rollback (will cause another error).
+            logger.debug(
+                f"MissingGreenlet for {file_path} (session state issue from parallel processing): {error}"
+            )
+            # Don't call _rollback_session_for_error - it will just cause another MissingGreenlet
+            # The session will be reset on the next commit
         else:
             # Unexpected errors - log with full traceback
             context_str = f" ({context})" if context else ""
@@ -1236,6 +1793,32 @@ class FileScanner:
         # Update stats
         stats.errors += 1
         stats.processed += 1
+
+    async def _rollback_session_for_error(
+        self, file_path: Path, error_type: str, label: str
+    ) -> None:
+        """Rollback session after IntegrityError or InvalidRequestError (prepared state).
+
+        Call this to clear the session error state so other parallel tasks can continue.
+        Uses _session_lock to avoid calling rollback() while commit() is in progress.
+
+        Note: MissingGreenlet errors during rollback are expected in parallel processing
+        when the session is accessed from different async contexts. These are logged but
+        not treated as fatal errors since the session state will be reset on next commit.
+        """
+        async with self._session_lock:
+            try:
+                await self.session.rollback()
+                logger.debug(f"Session rolled back after {label}")
+            except MissingGreenlet as greenlet_error:
+                # Expected in parallel processing - session accessed from different greenlet
+                # The session will be reset on next commit, so this is not fatal
+                logger.debug(
+                    f"MissingGreenlet during rollback (expected in parallel processing): "
+                    f"{greenlet_error}"
+                )
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback session: {rollback_error}")
 
     async def process_file(self, file_path: Path, stats: ScanStats):
         """Extracts metadata from an audio file and upserts it to the database.
@@ -1272,17 +1855,41 @@ class FileScanner:
 
         except Exception as e:
             # Use centralized error handler
-            self._handle_file_error(file_path, e, stats)
+            await self._handle_file_error(file_path, e, stats)
 
-    def _calculate_file_hash(self, file_path: Path) -> str:
-        """Calculate MD5 hash of file for deduplication. Blocking I/O."""
-        hash_md5 = hashlib.md5()
+    def _calculate_file_hash(self, file_path: Path) -> Optional[str]:
+        """Calculate file hash for deduplication. Blocking I/O.
+
+        Uses BLAKE3 (fast, parallel, cryptographically secure) if available,
+        falls back to MD5 if not. Uses 1MB chunks for optimal performance.
+
+        Returns:
+            Hex digest string, or None if hashing failed (e.g. file inaccessible).
+        """
+        # Use BLAKE3 if available (8-25x faster than MD5)
+        if HAS_BLAKE3:
+            hasher = blake3.blake3()
+        else:
+            hasher = hashlib.md5()
+
         try:
             with open(file_path, "rb") as f:
-                # Read in chunks to handle large files
-                for chunk in iter(lambda: f.read(4096), b""):
-                    hash_md5.update(chunk)
-            return hash_md5.hexdigest()
+                # Use 1MB chunks for optimal performance (was 4KB)
+                # Larger chunks = fewer system calls = better throughput
+                for chunk in iter(lambda: f.read(1048576), b""):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
         except Exception as e:
             logger.warning(f"Failed to hash {file_path}: {e}")
             return None
+
+    def cleanup(self):
+        """Clean up resources (thread pools).
+
+        Call this when done with the scanner to ensure proper cleanup.
+        """
+        if hasattr(self, 'metadata_executor'):
+            self.metadata_executor.shutdown(wait=True)
+        if hasattr(self, 'hashing_executor'):
+            self.hashing_executor.shutdown(wait=True)
+        logger.debug("Scanner executors shut down")

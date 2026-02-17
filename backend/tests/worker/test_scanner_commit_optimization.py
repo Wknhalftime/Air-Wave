@@ -8,6 +8,7 @@ This test suite verifies:
 """
 
 import asyncio
+import stat
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch, call
@@ -16,13 +17,23 @@ from airwave.core.stats import ScanStats
 from airwave.worker.scanner import FileScanner
 
 
-def _run_in_executor_mock(scandir_entries, num_files=None):
-    """Return an AsyncMock for run_in_executor: first call returns scandir_entries, rest return None.
-    num_files = number of process_file calls (each does one run_in_executor for _extract_metadata).
+def _make_stat_result(st_mtime=12345.0):
+    """Create a minimal stat-like object for mocking."""
+    from types import SimpleNamespace
+    return SimpleNamespace(st_mtime=st_mtime)
+
+
+def _run_in_executor_mock(scandir_entries, num_files=None, stat_result=None):
+    """Return an AsyncMock for run_in_executor.
+    Order: 1) os.stat result, 2) scandir entries, 3) metadata/hashing results for each file.
     """
+    if stat_result is None:
+        stat_result = _make_stat_result()
     if num_files is None:
         num_files = len(scandir_entries) if isinstance(scandir_entries, list) else 0
-    return AsyncMock(side_effect=[scandir_entries] + [None] * num_files)
+    # First two calls: os.stat, then scandir. Rest: metadata + hashing per processed file.
+    extra = max(num_files * 2, 200)
+    return AsyncMock(side_effect=[stat_result, scandir_entries] + [None] * extra)
 
 
 @pytest.mark.asyncio
@@ -83,9 +94,10 @@ async def test_commit_skipped_when_no_changes(db_session):
 
         mock_loop.return_value.run_in_executor = _run_in_executor_mock(mock_entries, 150)
 
-        # Mock stat to return matching size/mtime (unchanged files)
-        mock_stat = MagicMock(st_size=1024, st_mtime=12345.0)
-        with patch.object(Path, "stat", return_value=mock_stat):
+        # Mock stat: include st_mode so pathlib.is_dir() works when _save_folder_cache runs.
+        mock_stat = MagicMock(st_size=1024, st_mtime=12345.0, st_mode=stat.S_IFREG | 0o644)
+        with patch.object(Path, "stat", return_value=mock_stat), \
+             patch.object(FileScanner, "_save_folder_cache"):
             stats = await scanner.scan_directory("/music")
 
     # Verify results
@@ -156,10 +168,10 @@ async def test_commit_executed_when_touch_updates_exist(db_session):
 
         mock_loop.return_value.run_in_executor = _run_in_executor_mock(mock_entries, 150)
 
-        # Mock stat to return matching size/mtime (unchanged files)
-        # This will trigger touch updates
-        mock_stat = MagicMock(st_size=1024, st_mtime=12345.0)
-        with patch.object(Path, "stat", return_value=mock_stat):
+        # Mock stat: include st_mode so pathlib.is_dir() works in _save_folder_cache
+        mock_stat = MagicMock(st_size=1024, st_mtime=12345.0, st_mode=stat.S_IFREG | 0o644)
+        with patch.object(Path, "stat", return_value=mock_stat), \
+             patch.object(FileScanner, "_save_folder_cache"):
             stats = await scanner.scan_directory("/music")
 
     # Verify results
@@ -182,7 +194,8 @@ async def test_commit_tracking_variables_initialized(db_session):
 
         mock_loop.return_value.run_in_executor = _run_in_executor_mock([])
 
-        await scanner.scan_directory("/music")
+        with patch.object(FileScanner, "_save_folder_cache"):
+            await scanner.scan_directory("/music")
 
     # Verify tracking variables exist
     assert hasattr(scanner, "_last_commit_created")
@@ -247,9 +260,10 @@ async def test_fix1_legacy_mtime_none_skips_metadata_extraction(db_session):
 
         mock_loop.return_value.run_in_executor = _run_in_executor_mock([entry], 1)
 
-        # Mock stat to return matching size (unchanged file)
-        mock_stat = MagicMock(st_size=1024, st_mtime=99999.0)
-        with patch.object(Path, "stat", return_value=mock_stat):
+        # Mock stat: include st_mode for pathlib.is_dir() in _save_folder_cache
+        mock_stat = MagicMock(st_size=1024, st_mtime=99999.0, st_mode=stat.S_IFREG | 0o644)
+        with patch.object(Path, "stat", return_value=mock_stat), \
+             patch.object(FileScanner, "_save_folder_cache"):
             stats = await scanner.scan_directory("/music")
 
     # Verify results
@@ -305,9 +319,10 @@ async def test_fix1_legacy_mtime_none_with_size_change_extracts_metadata(db_sess
 
         mock_loop.return_value.run_in_executor = _run_in_executor_mock([entry], 1)
 
-        # Mock stat to return DIFFERENT size (file changed!)
-        mock_stat = MagicMock(st_size=2048, st_mtime=99999.0)
-        with patch.object(Path, "stat", return_value=mock_stat):
+        # Mock stat to return DIFFERENT size (file changed!); st_mode for _save_folder_cache
+        mock_stat = MagicMock(st_size=2048, st_mtime=99999.0, st_mode=stat.S_IFREG | 0o644)
+        with patch.object(Path, "stat", return_value=mock_stat), \
+             patch.object(FileScanner, "_save_folder_cache"):
             stats = await scanner.scan_directory("/music")
 
     # Verify size was updated
@@ -372,9 +387,10 @@ async def test_fix2_size_change_updates_without_db_query(db_session):
 
         mock_loop.return_value.run_in_executor = _run_in_executor_mock([entry], 1)
 
-        # Mock stat to return DIFFERENT size (file changed!)
-        mock_stat = MagicMock(st_size=2048, st_mtime=99999.0)
-        with patch.object(Path, "stat", return_value=mock_stat):
+        # Mock stat to return DIFFERENT size (file changed!); st_mode for _save_folder_cache
+        mock_stat = MagicMock(st_size=2048, st_mtime=99999.0, st_mode=stat.S_IFREG | 0o644)
+        with patch.object(Path, "stat", return_value=mock_stat), \
+             patch.object(FileScanner, "_save_folder_cache"):
             stats = await scanner.scan_directory("/music")
 
     # Verify results
@@ -455,9 +471,10 @@ async def test_fix4_move_detection_skipped_when_no_missing_files(db_session):
 
         mock_loop.return_value.run_in_executor = _run_in_executor_mock(mock_entries, 100)
 
-        # Mock stat to return matching size/mtime (all files unchanged)
-        mock_stat = MagicMock(st_size=1024, st_mtime=12345.0)
-        with patch.object(Path, "stat", return_value=mock_stat):
+        # Mock stat: st_mode for pathlib.is_dir() in _save_folder_cache
+        mock_stat = MagicMock(st_size=1024, st_mtime=12345.0, st_mode=stat.S_IFREG | 0o644)
+        with patch.object(Path, "stat", return_value=mock_stat), \
+             patch.object(FileScanner, "_save_folder_cache"):
             stats = await scanner.scan_directory("/music")
 
     # Verify results
@@ -530,9 +547,10 @@ async def test_fix4_move_detection_runs_when_files_missing(db_session):
 
         mock_loop.return_value.run_in_executor = _run_in_executor_mock(mock_entries, 50)
 
-        # Mock stat to return matching size/mtime
-        mock_stat = MagicMock(st_size=1024, st_mtime=12345.0)
-        with patch.object(Path, "stat", return_value=mock_stat):
+        # Mock stat: st_mode for pathlib.is_dir() in _save_folder_cache
+        mock_stat = MagicMock(st_size=1024, st_mtime=12345.0, st_mode=stat.S_IFREG | 0o644)
+        with patch.object(Path, "stat", return_value=mock_stat), \
+             patch.object(FileScanner, "_save_folder_cache"):
             stats = await scanner.scan_directory("/music")
 
     # Verify results

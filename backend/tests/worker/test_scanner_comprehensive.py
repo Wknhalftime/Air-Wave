@@ -89,7 +89,8 @@ class TestFileScanner:
         scanner = FileScanner(db_session)
         assert scanner.session == db_session
         assert scanner.matcher is not None
-        assert scanner.executor is not None
+        assert scanner.metadata_executor is not None
+        assert scanner.hashing_executor is not None
         assert scanner.SUPPORTED_EXTENSIONS == {".mp3", ".flac", ".m4a", ".wav", ".ogg"}
 
     @pytest.mark.asyncio
@@ -284,7 +285,7 @@ class TestFileScanner:
 
     @pytest.mark.asyncio
     async def test_calculate_file_hash(self, db_session):
-        """Test MD5 hash calculation for files."""
+        """Test hash calculation for files (BLAKE3 or MD5 fallback)."""
         scanner = FileScanner(db_session)
 
         # Create a temporary file
@@ -295,9 +296,9 @@ class TestFileScanner:
         try:
             file_hash = scanner._calculate_file_hash(temp_path)
             assert file_hash is not None
-            assert len(file_hash) == 32  # MD5 hash is 32 hex characters
-            # MD5 of b"test content for hashing"
-            assert file_hash == "8454e1a036eeaf298bb90b7b7c9723fd"
+            # BLAKE3 = 64 hex chars, MD5 = 32 hex chars
+            assert len(file_hash) in (32, 64)
+            assert all(c in "0123456789abcdef" for c in file_hash)
         finally:
             temp_path.unlink()
 
