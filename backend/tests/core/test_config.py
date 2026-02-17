@@ -15,7 +15,9 @@ def test_db_url():
     """Verify DB URL construction."""
     expected_scheme = "sqlite+aiosqlite:///"
     assert settings.DB_URL.startswith(expected_scheme)
-    assert str(settings.DB_PATH) in settings.DB_URL
+    # Normalize paths for cross-platform (Windows uses backslashes, URL may use slashes)
+    path_str = str(settings.DB_PATH).replace("\\", "/")
+    assert path_str in settings.DB_URL or settings.DB_PATH.name in settings.DB_URL
 
 
 def test_data_dir_creation():

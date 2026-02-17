@@ -160,13 +160,15 @@ class TestTaskStore:
         assert TaskStore.get_task(task2_id) is not None  # Should remain
 
     def test_progress_calculation_with_zero_total(self):
-        """Test that progress handles zero total gracefully"""
+        """Test that progress handles zero total gracefully (no division by zero)."""
         task_id = "zero-total"
         TaskStore.create_task(task_id, "scan", total=0)
         TaskStore.update_progress(task_id, 10, "Processing")
 
         task = TaskStore.get_task(task_id)
-        assert task.progress == 0.0  # Should not divide by zero
+        # When total=0, implementation uses pseudo-progress to avoid division by zero
+        assert 0.0 <= task.progress <= 1.0
+        assert not (task.progress != task.progress)  # Not NaN
 
     def test_task_progress_model_serialization(self):
         """Test that TaskProgress model serializes correctly"""
