@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,7 @@ import mutagen
 from loguru import logger
 from mutagen.id3 import ID3NoHeaderError
 from sqlalchemy import and_, delete, insert, or_, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, InvalidRequestError, MissingGreenlet
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -106,29 +108,6 @@ def _extract_mbid_from_tags(tags: Any) -> Tuple[Optional[str], Optional[str]]:
             elif desc == "MusicBrainz Album Artist Id":
                 album_artist_raw = val
     return (artist_raw or None, album_artist_raw or None)
-
-
-class _ArtistRef:
-    """Stand-in for Artist until _flush_pending_artists() fills cache; .id requires flush first."""
-
-    __slots__ = ("_scanner", "_name")
-
-    def __init__(self, scanner: "FileScanner", name: str):
-        self._scanner = scanner
-        self._name = name
-
-    @property
-    def id(self) -> int:
-        if self._name not in self._scanner._artist_cache:
-            raise RuntimeError(
-                f"Artist {self._name!r} not in cache. "
-                "Call _flush_pending_artists() before using .id on a newly added artist."
-            )
-        return self._scanner._artist_cache[self._name].id
-
-    @property
-    def name(self) -> str:
-        return self._name
 
 
 class LibraryMetadata:
@@ -319,7 +298,6 @@ class FileScanner:
         # Concurrency control
         self._processing_lock = asyncio.Lock()  # For thread-safe stats updates
         self._session_lock = asyncio.Lock()  # For commit/rollback synchronization
-        self._batch_lock = asyncio.Lock()  # For artist/work batch operations
 
     # ========== Session Helpers (IntegrityError / Race Condition Handling) ==========
 
@@ -333,8 +311,8 @@ class FileScanner:
             await self.session.flush()
             return True
         except IntegrityError as e:
-            logger.debug(
-                f"IntegrityError during {context} (race condition in parallel processing): {e}"
+            logger.error(
+                f"IntegrityError during {context}: {e}"
             )
             await self.session.rollback()
             return False
@@ -355,6 +333,243 @@ class FileScanner:
             await self.session.rollback()
             return False
 
+    # ========== UPSERT Helper Methods (Atomic Database Operations) ==========
+
+    # ============================================================================
+    # UPSERT Methods - Database-Native Atomic Operations
+    # ============================================================================
+    # These methods use SQLite's INSERT...ON CONFLICT syntax to handle entity
+    # creation atomically at the database level, eliminating race conditions
+    # that were present in the old check-then-insert pattern.
+    #
+    # Benefits of UPSERT pattern:
+    # - Eliminates race conditions: Database handles conflicts atomically
+    # - Simpler code: No need for complex flush/rollback/retry logic
+    # - Better performance: Fewer round trips, atomic operations
+    # - More maintainable: Fewer moving parts, clearer intent
+    #
+    # Migration notes:
+    # - Artists: Use ON CONFLICT DO UPDATE on unique constraint (name)
+    # - Works: No unique constraint, so query first then insert with error handling
+    # - Recordings: No unique constraint, so query first then insert with error handling
+    # - WorkArtist: Use ON CONFLICT DO NOTHING on composite primary key (work_id, artist_id)
+    # ============================================================================
+
+    async def _upsert_artist(self, name: str, mbid: Optional[str] = None) -> Artist:
+        """Atomically insert or get existing artist using database UPSERT.
+
+        Uses SQLite's INSERT...ON CONFLICT to handle race conditions at the database level.
+        This replaces the old _get_or_create_artist() method which used batched inserts
+        with manual caching and flush management.
+
+        Args:
+            name: Artist name (should be pre-cleaned)
+            mbid: Optional MusicBrainz ID
+
+        Returns:
+            Artist object with ID populated
+        """
+        if not name:
+            name = "unknown artist"
+
+        # Build UPSERT statement
+        stmt = sqlite_insert(Artist).values(
+            name=name,
+            musicbrainz_id=mbid,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        # On conflict with name, update the MBID if it's NULL and we have one
+        if mbid:
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[Artist.name],
+                set_=dict(
+                    musicbrainz_id=mbid,
+                    updated_at=datetime.now(timezone.utc),
+                ),
+                where=Artist.musicbrainz_id.is_(None),
+            )
+        else:
+            # Just update the timestamp
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[Artist.name],
+                set_=dict(updated_at=datetime.now(timezone.utc)),
+            )
+
+        # Execute the UPSERT
+        await self.session.execute(stmt)
+        await self.session.flush()
+
+        # Query to get the artist (whether it was inserted or already existed)
+        stmt_select = select(Artist).where(Artist.name == name)
+        result = await self.session.execute(stmt_select)
+        artist = result.scalar_one()
+
+        return artist
+
+    async def _upsert_work(self, title: str, artist_id: int) -> Work:
+        """Atomically insert or get existing work using database UPSERT.
+
+        Uses query-first-then-insert pattern with IntegrityError handling since Works
+        don't have a unique constraint on (title, artist_id). This replaces the old
+        _get_or_create_work() method which used batched inserts with manual caching.
+
+        Args:
+            title: Work title (should be pre-cleaned)
+            artist_id: Primary artist ID
+
+        Returns:
+            Work object with ID populated
+        """
+        # Query first since there's no unique constraint on (title, artist_id)
+        stmt = select(Work).where(
+            Work.title == title,
+            Work.artist_id == artist_id
+        )
+        result = await self.session.execute(stmt)
+        existing = result.scalar_one_or_none()
+
+        if existing:
+            return existing
+
+        # Insert new work
+        stmt = sqlite_insert(Work).values(
+            title=title,
+            artist_id=artist_id,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        # Since there's no unique constraint on (title, artist_id), we can't use ON CONFLICT
+        # We'll just insert and handle IntegrityError if it happens (race condition)
+        try:
+            await self.session.execute(stmt)
+            await self.session.flush()
+
+            # Query to get the work we just created
+            stmt_select = select(Work).where(
+                Work.title == title,
+                Work.artist_id == artist_id
+            )
+            result = await self.session.execute(stmt_select)
+            work = result.scalar_one()
+            return work
+        except IntegrityError:
+            # Another thread created it, query again
+            await self.session.rollback()
+            stmt = select(Work).where(
+                Work.title == title,
+                Work.artist_id == artist_id
+            )
+            result = await self.session.execute(stmt)
+            work = result.scalar_one_or_none()
+            if not work:
+                raise RuntimeError(f"Failed to create or retrieve work: title={title!r}, artist_id={artist_id}")
+            return work
+
+    async def _upsert_recording(
+        self,
+        work_id: int,
+        title: str,
+        version_type: Optional[str] = None,
+        duration: Optional[float] = None,
+        isrc: Optional[str] = None,
+    ) -> Recording:
+        """Atomically insert or get existing recording using database UPSERT.
+
+        Uses query-first-then-insert pattern with IntegrityError handling since Recordings
+        don't have a unique constraint on (work_id, title). This replaces the old
+        _get_or_create_recording() method which used manual flush/rollback/retry logic.
+
+        Args:
+            work_id: Work ID
+            title: Recording title (should be pre-cleaned)
+            version_type: Optional version type (e.g., "Remix", "Live")
+            duration: Optional duration in seconds
+            isrc: Optional ISRC code
+
+        Returns:
+            Recording object with ID populated
+        """
+        # Query first since there's no unique constraint on (work_id, title)
+        stmt = select(Recording).where(
+            Recording.work_id == work_id,
+            Recording.title == title
+        )
+        result = await self.session.execute(stmt)
+        existing = result.scalar_one_or_none()
+
+        if existing:
+            return existing
+
+        # Insert new recording
+        stmt = sqlite_insert(Recording).values(
+            work_id=work_id,
+            title=title,
+            version_type=version_type,
+            duration=duration,
+            isrc=isrc,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        try:
+            await self.session.execute(stmt)
+            await self.session.flush()
+
+            # Query to get the recording we just created
+            stmt_select = select(Recording).where(
+                Recording.work_id == work_id,
+                Recording.title == title
+            )
+            result = await self.session.execute(stmt_select)
+            recording = result.scalar_one()
+            return recording
+        except IntegrityError:
+            # Another thread created it, query again
+            await self.session.rollback()
+            stmt = select(Recording).where(
+                Recording.work_id == work_id,
+                Recording.title == title
+            )
+            result = await self.session.execute(stmt)
+            recording = result.scalar_one_or_none()
+            if not recording:
+                raise RuntimeError(f"Failed to create or retrieve recording: work_id={work_id}, title={title!r}")
+            return recording
+
+    async def _upsert_work_artist(
+        self, work_id: int, artist_id: int, role: str = "Primary"
+    ) -> None:
+        """Atomically insert work-artist relationship using database UPSERT.
+
+        Uses SQLite's INSERT...ON CONFLICT DO NOTHING to handle duplicates at the
+        database level. This replaces the old manual check-then-insert pattern in
+        _link_multi_artists() and _link_artist_objects() which was prone to race
+        conditions when the same artist appeared multiple times.
+
+        Args:
+            work_id: Work ID
+            artist_id: Artist ID
+            role: Role (e.g., "Primary", "Featured")
+        """
+        stmt = sqlite_insert(WorkArtist).values(
+            work_id=work_id,
+            artist_id=artist_id,
+            role=role,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        # On conflict (duplicate work-artist relationship), do nothing
+        stmt = stmt.on_conflict_do_nothing(
+            index_elements=[WorkArtist.work_id, WorkArtist.artist_id]
+        )
+
+        await self.session.execute(stmt)
+        await self.session.flush()
+
     # ========== Thread-Safe Helper Methods (Phase 1: Race Condition Fixes) ==========
 
     async def _mark_path_seen(self, path: str) -> None:
@@ -374,10 +589,20 @@ class FileScanner:
     async def _update_path_index_for_move(
         self, old_path: str, new_path: str, file_id: int, size: int, mtime: float
     ) -> None:
-        """Thread-safe: Update path index when file is moved."""
+        """Thread-safe: Update path index when file is moved.
+        
+        Paths should already be normalized (resolved, forward slashes, lowercase on Windows).
+        """
         async with self._processing_lock:
-            self._path_index.pop(old_path, None)
-            self._path_index[new_path] = {
+            # Normalize paths for index update (defensive - paths should already be normalized)
+            old_normalized = old_path.replace("\\", "/")
+            new_normalized = new_path.replace("\\", "/")
+            if sys.platform == "win32":
+                old_normalized = old_normalized.lower()
+                new_normalized = new_normalized.lower()
+                
+            self._path_index.pop(old_normalized, None)
+            self._path_index[new_normalized] = {
                 "id": file_id,
                 "size": size,
                 "mtime": mtime,
@@ -415,7 +640,12 @@ class FileScanner:
             # Folder-level skip: if directory mtime unchanged, skip entire dir (Navidrome optimization)
             # Only applies in incremental mode (full_scan=False); full_scan=True processes all
             stat_dir = None
-            dir_path_normalized = str(Path(current_path).resolve()).replace("\\", "/")
+            resolved_dir = Path(current_path).resolve().as_posix()
+            # Normalize to lowercase on Windows for case-insensitive matching
+            if sys.platform == "win32":
+                dir_path_normalized = resolved_dir.lower()
+            else:
+                dir_path_normalized = resolved_dir
             if self.config.enable_folder_skip:
                 try:
                     stat_dir = await asyncio.get_running_loop().run_in_executor(
@@ -638,29 +868,47 @@ class FileScanner:
         logger.info(f"Starting scan of {root_path}... (parallel processing with max {self.config.max_concurrent_files} concurrent files)")
 
         # Load path index (id, path, size, mtime) for stat-first skip without per-file DB hit
-        # Normalize paths to use forward slashes for cross-platform compatibility
+        # Normalize paths consistently: resolve and use forward slashes
+        # On Windows, also normalize to lowercase for case-insensitive matching
         stmt = select(LibraryFile.id, LibraryFile.path, LibraryFile.size, LibraryFile.mtime)
         result = await self.session.execute(stmt)
         path_index: Dict[str, Dict[str, Any]] = {}
         for row in result.all():
-            # Normalize path to use forward slashes (cross-platform)
-            normalized_path = row.path.replace("\\", "/")
+            # Normalize path consistently: resolve to absolute, use forward slashes
+            # On Windows, also normalize to lowercase for case-insensitive matching
+            # This MUST match the normalization used when storing (line ~1423) and checking (line ~1502)
+            try:
+                # Resolve to absolute path (same as when storing/checking)
+                # This handles symlinks, relative paths, and ensures consistent format
+                resolved = Path(row.path).resolve().as_posix()
+            except (OSError, ValueError):
+                # If path doesn't exist or can't be resolved, normalize as-is
+                # This handles legacy paths or deleted files gracefully
+                resolved = row.path.replace("\\", "/")
+            
+            # On Windows, normalize to lowercase for case-insensitive matching
+            # This ensures paths match regardless of filesystem-reported casing
+            if sys.platform == "win32":
+                normalized_path = resolved.lower()
+            else:
+                normalized_path = resolved
+                
             path_index[normalized_path] = {"id": row.id, "size": row.size, "mtime": row.mtime}
         self._path_index = path_index
         self._path_index_seen: set = set()
         self._touch_ids: set = set()
         self._missing_candidates: Optional[List[Dict[str, Any]]] = None
-        self._artist_cache: Dict[str, Artist] = {}
-        self._pending_artists: set = set()
-        self._work_cache: Dict[Tuple[str, int], Work] = {}
-        self._pending_works: List[Tuple[str, int]] = []
         self._vector_tracks_to_add: List[Tuple[int, str, str]] = []
         self._last_commit_created: int = 0  # Track created count at last commit
         self._last_commit_moved: int = 0    # Track moved count at last commit
         logger.info(f"Loaded path index: {len(path_index)} files")
 
         # Load folder mtime cache for folder-level skip optimization
-        self._folder_mtime_cache: Dict[str, float] = self._load_folder_cache(root_path)
+        # On full scan, ignore cache (will rebuild it during scan)
+        if full_scan:
+            self._folder_mtime_cache: Dict[str, float] = {}
+        else:
+            self._folder_mtime_cache: Dict[str, float] = self._load_folder_cache(root_path)
         self._full_scan: bool = full_scan
 
         # Resolve target subdirs to absolute paths for selective scan
@@ -740,19 +988,39 @@ class FileScanner:
 
     def _folder_cache_path(self, root_path: str) -> Path:
         """Path to folder mtime cache file, scoped per library root."""
-        normalized = str(Path(root_path).resolve()).replace("\\", "/")
+        resolved = Path(root_path).resolve().as_posix()
+        # Normalize to lowercase on Windows for case-insensitive matching
+        if sys.platform == "win32":
+            normalized = resolved.lower()
+        else:
+            normalized = resolved
         key = hashlib.md5(normalized.encode()).hexdigest()[:16]
         return Path(settings.DATA_DIR) / "scan_folder_cache" / f"{key}.json"
 
     def _load_folder_cache(self, root_path: str) -> Dict[str, float]:
-        """Load folder mtime cache from disk for folder-level skip optimization."""
+        """Load folder mtime cache from disk for folder-level skip optimization.
+        
+        Normalizes paths to lowercase on Windows for case-insensitive matching.
+        Handles legacy cache entries gracefully.
+        """
         path = self._folder_cache_path(root_path)
         if not path.exists():
             return {}
         try:
             with open(path, "r") as f:
                 data = json.load(f)
-            return dict(data) if isinstance(data, dict) else {}
+            cache = dict(data) if isinstance(data, dict) else {}
+            # Normalize cache keys to lowercase on Windows (handles legacy entries)
+            if sys.platform == "win32":
+                normalized_cache = {}
+                for key, value in cache.items():
+                    try:
+                        normalized_key = Path(key).resolve().as_posix().lower()
+                    except (OSError, ValueError):
+                        normalized_key = key.replace("\\", "/").lower()
+                    normalized_cache[normalized_key] = value
+                return normalized_cache
+            return cache
         except (json.JSONDecodeError, OSError) as e:
             logger.debug(f"Could not load folder cache from {path}: {e}")
             return {}
@@ -781,7 +1049,15 @@ class FileScanner:
         async with self._session_lock:
             result = await self.session.stream(stmt)
             async for row in result:
-                if row.path.replace("\\", "/") not in path_index_seen:
+                # Normalize path for comparison (same as skip check)
+                try:
+                    normalized_db_path = Path(row.path).resolve().as_posix()
+                except (OSError, ValueError):
+                    normalized_db_path = row.path.replace("\\", "/")
+                if sys.platform == "win32":
+                    normalized_db_path = normalized_db_path.lower()
+                    
+                if normalized_db_path not in path_index_seen:
                     ids_to_delete.append(row.id)
             await result.close()
         if not ids_to_delete:
@@ -915,193 +1191,6 @@ class FileScanner:
                     return self._missing_candidates.pop(i)
             return None
 
-    async def _flush_pending_artists(self) -> None:
-        """Bulk insert pending artists and fill _artist_cache.
-
-        Uses _batch_lock to prevent race conditions in parallel processing where
-        multiple tasks might try to flush artists simultaneously.
-        """
-        async with self._batch_lock:
-            pending = getattr(self, "_pending_artists", None)
-            if not pending:
-                return
-            names = list(pending)
-            self._pending_artists.clear()
-            await self.session.execute(
-                insert(Artist), [{"name": n} for n in names]
-            )
-            await self._safe_flush("artist flush")
-            res = await self.session.execute(select(Artist).where(Artist.name.in_(names)))
-            for a in res.scalars().all():
-                self._cache_artist(a)
-
-    async def _flush_pending_works(self) -> None:
-        """Bulk insert pending works and fill _work_cache.
-
-        Uses _batch_lock to prevent race conditions in parallel processing where
-        multiple tasks might try to flush works simultaneously.
-        """
-        async with self._batch_lock:
-            pending = getattr(self, "_pending_works", None)
-            if not pending:
-                return
-            pairs = list(pending)
-            self._pending_works.clear()
-            await self.session.execute(
-                insert(Work),
-                [{"title": t, "artist_id": a} for t, a in pairs],
-            )
-            await self._safe_flush("work flush")
-            stmt = select(Work).where(
-                or_(*(and_(Work.title == t, Work.artist_id == a) for t, a in pairs))
-            )
-            res = await self.session.execute(stmt)
-            for w in res.scalars().all():
-                self._work_cache[(w.title, w.artist_id)] = w
-
-    def _ensure_batch_caches(self) -> None:
-        """Init artist/work caches and pending when not set (e.g. standalone tests)."""
-        if hasattr(self, "_artist_cache") and isinstance(self._artist_cache, dict):
-            if not hasattr(self, "_artist_cache_by_mbid") or not isinstance(
-                getattr(self, "_artist_cache_by_mbid", None), dict
-            ):
-                self._artist_cache_by_mbid = {}
-            return
-        self._artist_cache = {}
-        self._artist_cache_by_mbid = {}
-        self._pending_artists = set()
-        self._work_cache = {}
-        self._pending_works = []
-
-    def _cache_artist(self, artist: Artist) -> None:
-        """Add artist to name cache and, if present, MBID cache."""
-        self._artist_cache[artist.name] = artist
-        if artist.musicbrainz_id:
-            self._artist_cache_by_mbid[artist.musicbrainz_id] = artist
-
-    async def _get_or_create_artist(
-        self, clean_name: str, mbid: Optional[str] = None
-    ):
-        """Get or create artist (batched when no MBID). Call _flush_pending_artists() before using .id when batched."""
-        if not clean_name:
-            clean_name = "unknown artist"
-        self._ensure_batch_caches()
-
-        # When MBID is present: use it only for lookup; if not in DB, fall back to name and update if empty
-        used_mbid_fallback = False
-        if mbid:
-            if mbid in self._artist_cache_by_mbid:
-                return self._artist_cache_by_mbid[mbid]
-            stmt = select(Artist).where(Artist.musicbrainz_id == mbid)
-            res = await self.session.execute(stmt)
-            existing = res.scalar_one_or_none()
-            if existing:
-                self._cache_artist(existing)
-                return existing
-            # MBID not in system: fall back to name-based; will update artist with MBID if empty
-            used_mbid_fallback = True
-
-        async def _maybe_update_mbid(artist: Artist) -> None:
-            if not (used_mbid_fallback and mbid and artist.musicbrainz_id is None):
-                return
-            conflict_res = await self.session.execute(
-                select(Artist).where(
-                    Artist.musicbrainz_id == mbid, Artist.id != artist.id
-                )
-            )
-            if conflict_res.scalar_one_or_none():
-                return
-            artist.musicbrainz_id = mbid
-
-        # Name-based path (batched when no MBID match)
-        if clean_name in self._artist_cache:
-            artist = self._artist_cache[clean_name]
-            if used_mbid_fallback and mbid and artist.musicbrainz_id is None:
-                await _maybe_update_mbid(artist)
-                await self._safe_flush("artist MBID update")
-                self._cache_artist(artist)
-            return artist
-        stmt = select(Artist).where(Artist.name == clean_name)
-        res = await self.session.execute(stmt)
-        existing = res.scalar_one_or_none()
-        if existing:
-            self._cache_artist(existing)
-            if used_mbid_fallback and mbid and existing.musicbrainz_id is None:
-                await _maybe_update_mbid(existing)
-                await self._safe_flush("existing artist MBID update")
-                self._cache_artist(existing)
-            return existing
-        self._pending_artists.add(clean_name)
-        if used_mbid_fallback and mbid:
-            await self._flush_pending_artists()
-            artist = self._artist_cache[clean_name]
-            if artist.musicbrainz_id is None:
-                await _maybe_update_mbid(artist)
-                await self._safe_flush("pending artist MBID update")
-                self._cache_artist(artist)
-            return artist
-        return _ArtistRef(self, clean_name)
-
-    async def _get_or_create_work(
-        self, clean_title: str, artist_id: int
-    ) -> Work:
-        """Get or create work using pre-cleaned title (batched inserts).
-        Call _flush_pending_works() before using .id if work was just added."""
-        self._ensure_batch_caches()
-        key = (clean_title, artist_id)
-        if key in self._work_cache:
-            return self._work_cache[key]
-        stmt = select(Work).where(
-            Work.title == clean_title, Work.artist_id == artist_id
-        )
-        res = await self.session.execute(stmt)
-        existing = res.scalar_one_or_none()
-        if existing:
-            self._work_cache[key] = existing
-            return existing
-        self._pending_works.append(key)
-        await self._flush_pending_works()
-        return self._work_cache[key]
-
-    async def _get_or_create_recording(
-        self,
-        work_id: int,
-        clean_title: str,
-        version_type: str,
-        duration: float = None,
-        isrc: str = None,
-    ) -> Recording:
-        """Get or create recording using pre-cleaned title.
-
-        NOTE: Caller must hold _processing_lock to prevent race conditions.
-        """
-        stmt = select(Recording).where(
-            Recording.work_id == work_id, Recording.title == clean_title
-        )
-        res = await self.session.execute(stmt)
-        recording = res.scalar_one_or_none()
-
-        if not recording:
-            recording = Recording(
-                work_id=work_id,
-                title=clean_title,
-                version_type=version_type,
-                duration=duration,
-                isrc=isrc,
-            )
-            self.session.add(recording)
-            if not await self._safe_flush("recording flush"):
-                stmt = select(Recording).where(
-                    Recording.work_id == work_id,
-                    Recording.title == clean_title,
-                )
-                res = await self.session.execute(stmt)
-                recording = res.scalar_one_or_none()
-        elif isrc and not recording.isrc:
-            recording.isrc = isrc
-
-        return recording
-
     async def _get_or_create_album(
         self,
         clean_album_title: str,
@@ -1126,12 +1215,18 @@ class FileScanner:
             )
             self.session.add(album)
             if not await self._safe_flush("album flush"):
+                # Flush failed (race condition), re-query to get the album created by another thread
                 stmt = select(Album).where(
                     Album.title == clean_album_title,
                     Album.artist_id == artist_id,
                 )
                 res = await self.session.execute(stmt)
                 album = res.scalar_one_or_none()
+                if not album:
+                    raise RuntimeError(
+                        f"Failed to create or retrieve album: title={clean_album_title!r}, "
+                        f"artist_id={artist_id}. This indicates a database consistency issue."
+                    )
 
         return album
 
@@ -1279,53 +1374,28 @@ class FileScanner:
             for a in Normalizer.split_artists(raw):
                 unique_targets.add(Normalizer.clean_artist(a))
 
-        for a_clean in unique_targets:
-            a_obj = await self._get_or_create_artist(a_clean)
-            await self._flush_pending_artists()
+        logger.debug(f"_link_multi_artists: work_id={work.id}, unique_targets={unique_targets}")
 
-            # Check if link already exists
-            stmt_wa = select(WorkArtist).where(
-                WorkArtist.work_id == work.id,
-                WorkArtist.artist_id == a_obj.id,
-            )
-            res_wa = await self.session.execute(stmt_wa)
-            if not res_wa.scalar_one_or_none():
-                role = (
-                    "Primary"
-                    if a_obj.id == primary_artist.id
-                    else "Featured"
-                )
-                # Add the work-artist link
-                # Note: There's still a race condition window between check and add,
-                # but IntegrityError will be caught during commit and handled gracefully
-                self.session.add(
-                    WorkArtist(
-                        work_id=work.id, artist_id=a_obj.id, role=role
-                    )
-                )
+        for a_clean in unique_targets:
+            # Use UPSERT to atomically get or create artist
+            a_obj = await self._upsert_artist(a_clean)
+
+            # Determine role
+            role = "Primary" if a_obj.id == primary_artist.id else "Featured"
+
+            # Use UPSERT to atomically insert work-artist link (ignores duplicates)
+            await self._upsert_work_artist(work.id, a_obj.id, role)
 
     async def _link_artist_objects(
         self, work: Work, primary_artist: Artist, artist_objs: List[Artist]
     ) -> None:
         """Link a list of artist objects to a work (e.g. from MBID resolution)."""
         for a_obj in artist_objs:
-            stmt_wa = select(WorkArtist).where(
-                WorkArtist.work_id == work.id,
-                WorkArtist.artist_id == a_obj.id,
-            )
-            res_wa = await self.session.execute(stmt_wa)
-            if res_wa.scalar_one_or_none():
-                continue
-            role = (
-                "Primary"
-                if a_obj.id == primary_artist.id
-                else "Featured"
-            )
-            self.session.add(
-                WorkArtist(
-                    work_id=work.id, artist_id=a_obj.id, role=role
-                )
-            )
+            # Determine role
+            role = "Primary" if a_obj.id == primary_artist.id else "Featured"
+
+            # Use UPSERT to atomically insert work-artist link (ignores duplicates)
+            await self._upsert_work_artist(work.id, a_obj.id, role)
 
     async def _create_library_file(
         self,
@@ -1356,9 +1426,18 @@ class FileScanner:
         except OSError as e:
             logger.warning(f"File gone or inaccessible when creating LibraryFile {file_path}: {e}")
             raise
+        # Normalize path consistently: resolve to absolute, use forward slashes
+        # On Windows, also normalize to lowercase for case-insensitive matching
+        # This ensures paths match during skip checks
+        resolved_path = file_path.resolve().as_posix()
+        if sys.platform == "win32":
+            normalized_path = resolved_path.lower()
+        else:
+            normalized_path = resolved_path
+        
         new_file = LibraryFile(
             recording_id=recording.id,
-            path=str(file_path),
+            path=normalized_path,
             size=st.st_size,
             mtime=(mtime if mtime is not None else float(st.st_mtime)),
             format=file_path.suffix.replace(".", ""),
@@ -1367,13 +1446,39 @@ class FileScanner:
         )
         self.session.add(new_file)
         if not await self._safe_flush("library file flush"):
-            stmt = select(LibraryFile).where(LibraryFile.path == str(file_path))
+            stmt = select(LibraryFile).where(LibraryFile.path == normalized_path)
             res = await self.session.execute(stmt)
             new_file = res.scalar_one_or_none()
             if new_file is None:
                 raise RuntimeError(
                     f"LibraryFile not found after IntegrityError for path {file_path}"
                 )
+        
+        # Update path_index so subsequent checks can find this file
+        # This prevents files created during parallel processing from being detected as "new" again
+        if hasattr(self, "_path_index"):
+            # Ensure we have an ID before updating path_index
+            if new_file.id is None:
+                # If ID is None, we need to flush again or refresh
+                await self.session.flush()
+                if new_file.id is None:
+                    logger.warning(
+                        f"LibraryFile created but ID is None for path: {normalized_path}"
+                    )
+            if new_file.id is not None:
+                self._path_index[normalized_path] = {
+                    "id": new_file.id,
+                    "size": new_file.size,
+                    "mtime": new_file.mtime,
+                }
+                logger.debug(
+                    f"Added to path_index: {normalized_path} (id: {new_file.id})"
+                )
+            else:
+                logger.warning(
+                    f"Could not add to path_index - file has no ID: {normalized_path}"
+                )
+        
         return new_file
 
     # ========== Phase 5: Extracted Methods for process_file() ==========
@@ -1388,14 +1493,6 @@ class FileScanner:
             self._touch_ids = set()
         if not hasattr(self, "_missing_candidates"):
             self._missing_candidates = None
-        if not hasattr(self, "_artist_cache"):
-            self._artist_cache = {}
-        if not hasattr(self, "_pending_artists"):
-            self._pending_artists = set()
-        if not hasattr(self, "_work_cache"):
-            self._work_cache = {}
-        if not hasattr(self, "_pending_works"):
-            self._pending_works = []
         if not hasattr(self, "_vector_tracks_to_add"):
             self._vector_tracks_to_add = []
         if not hasattr(self, "_last_commit_created"):
@@ -1426,12 +1523,100 @@ class FileScanner:
             return (True, None)  # Skip file
 
         # Mark path as seen
-        # Normalize path to use forward slashes for cross-platform compatibility
-        path_str = str(file_path).replace("\\", "/")
+        # Normalize path consistently: resolve to absolute, use forward slashes
+        # On Windows, also normalize to lowercase for case-insensitive matching
+        try:
+            resolved_path = file_path.resolve().as_posix()
+        except (OSError, ValueError):
+            # If path can't be resolved (e.g., deleted), use as-is
+            resolved_path = str(file_path).replace("\\", "/")
+        
+        if sys.platform == "win32":
+            path_str = resolved_path.lower()
+        else:
+            path_str = resolved_path
+            
         await self._mark_path_seen(path_str)
 
         # Check if file is in path index
         if path_str not in self._path_index:
+            # Debug logging for path mismatches (can be removed after fixing)
+            if len(self._path_index) > 0:
+                # Check if a similar path exists (case-insensitive on Windows)
+                if sys.platform == "win32":
+                    similar_paths = [
+                        p for p in self._path_index.keys()
+                        if p.lower() == path_str.lower()
+                    ]
+                else:
+                    similar_paths = [
+                        p for p in self._path_index.keys()
+                        if p == path_str
+                    ]
+                if similar_paths:
+                    logger.warning(
+                        f"Path mismatch detected (case?): checking '{path_str}', "
+                        f"found similar '{similar_paths[0]}' in index"
+                    )
+            
+            # CRITICAL DEBUG: Check if file actually exists in database
+            # This helps identify if files are missing from path_index but exist in DB
+            # Limit to first 20 checks to avoid performance impact
+            if not hasattr(self, "_db_check_count"):
+                self._db_check_count = 0
+            
+            if self._db_check_count < 20:
+                self._db_check_count += 1
+                # We need to normalize database paths the same way as path_index loading
+                async with self._session_lock:
+                    # Query all files and normalize their paths to match path_str
+                    stmt = select(LibraryFile.id, LibraryFile.path, LibraryFile.size, LibraryFile.mtime)
+                    res = await self.session.execute(stmt)
+                    found_match = False
+                    for row in res.all():
+                        # Normalize database path the same way as path_index loading
+                        try:
+                            db_resolved = Path(row.path).resolve().as_posix()
+                        except (OSError, ValueError):
+                            db_resolved = row.path.replace("\\", "/")
+                        
+                        if sys.platform == "win32":
+                            db_normalized = db_resolved.lower()
+                        else:
+                            db_normalized = db_resolved
+                        
+                        # If normalized paths match, file exists in DB but wasn't in path_index
+                        if db_normalized == path_str:
+                            logger.warning(
+                                f"BUG: File exists in database but not in path_index! "
+                                f"Path: {path_str}, DB ID: {row.id}, "
+                                f"DB Path (raw): {row.path}, "
+                                f"Size: {row.size}, Mtime: {row.mtime}"
+                            )
+                            # Add to path_index immediately to prevent duplicate creation
+                            self._path_index[path_str] = {
+                                "id": row.id,
+                                "size": row.size,
+                                "mtime": row.mtime,
+                            }
+                            # File exists, skip processing
+                            async with self._processing_lock:
+                                stats.skipped += 1
+                                stats.processed += 1
+                            await self._add_touch_id(row.id)
+                            found_match = True
+                            return (True, stat)  # Skip file
+                    
+                    if not found_match:
+                        logger.debug(
+                            f"File not in path_index and not found in database (check #{self._db_check_count}): {path_str}"
+                        )
+            
+            # Debug: Log which files are detected as new
+            logger.debug(
+                f"File not in path_index (will be created): {path_str} "
+                f"(path_index size: {len(self._path_index)})"
+            )
             return (False, stat)  # New file, needs processing
 
         ent = self._path_index[path_str]
@@ -1449,6 +1634,10 @@ class FileScanner:
                     .where(LibraryFile.id == lib_id)
                     .values(size=stat.st_size, mtime=float(stat.st_mtime))
                 )
+                # Update path_index to reflect the new size and mtime
+                if path_str in self._path_index:
+                    self._path_index[path_str]["size"] = stat.st_size
+                    self._path_index[path_str]["mtime"] = float(stat.st_mtime)
                 async with self._processing_lock:
                     stats.skipped += 1
                     stats.processed += 1
@@ -1477,6 +1666,9 @@ class FileScanner:
                 .where(LibraryFile.id == lib_id)
                 .values(mtime=float(stat.st_mtime))
             )
+            # Update path_index to reflect the new mtime
+            if path_str in self._path_index:
+                self._path_index[path_str]["mtime"] = float(stat.st_mtime)
             # Also touch updated_at to mark as seen this scan
             await self._add_touch_id(lib_id)
             async with self._processing_lock:
@@ -1575,12 +1767,14 @@ class FileScanner:
             return False  # Not a moved file
 
         # Update LibraryFile with new path (session op) - serialize with other session ops
+        # Normalize path consistently with _create_library_file (lowercase on Windows)
+        normalized_path = path_str.lower() if sys.platform == "win32" else path_str
         async with self._session_lock:
             await self.session.execute(
                 update(LibraryFile)
                 .where(LibraryFile.id == candidate["lib_id"])
                 .values(
-                    path=path_str,
+                    path=normalized_path,
                     size=stat.st_size,
                     mtime=float(stat.st_mtime),
                 )
@@ -1588,7 +1782,7 @@ class FileScanner:
 
         # Update path index (thread-safe)
         await self._update_path_index_for_move(
-            candidate["old_path"], path_str, candidate["lib_id"], stat.st_size, stat.st_mtime
+            candidate["old_path"], normalized_path, candidate["lib_id"], stat.st_size, stat.st_mtime
         )
 
         async with self._processing_lock:
@@ -1644,20 +1838,22 @@ class FileScanner:
                 ]
                 for i, mbid in enumerate(meta.artist_mbids):
                     name = split_names[i] if i < len(split_names) else meta.artist
-                    a_obj = await self._get_or_create_artist(name or meta.artist, mbid=mbid)
+                    # Use UPSERT to atomically get or create artist
+                    a_obj = await self._upsert_artist(name or meta.artist, mbid=mbid)
                     artist_objs_from_mbid.append(a_obj)
                 primary_artist = artist_objs_from_mbid[0]
             else:
-                primary_artist = await self._get_or_create_artist(meta.artist)
+                # Use UPSERT to atomically get or create artist
+                primary_artist = await self._upsert_artist(meta.artist)
 
             if meta.album_artist_mbids:
-                album_artist_obj = await self._get_or_create_artist(
+                # Use UPSERT to atomically get or create artist
+                album_artist_obj = await self._upsert_artist(
                     meta.album_artist, mbid=meta.album_artist_mbids[0]
                 )
             else:
-                album_artist_obj = await self._get_or_create_artist(meta.album_artist)
-
-            await self._flush_pending_artists()
+                # Use UPSERT to atomically get or create artist
+                album_artist_obj = await self._upsert_artist(meta.album_artist)
 
             # Album
             album = None
@@ -1667,9 +1863,8 @@ class FileScanner:
                 )
 
             # Work & Recording (Parsing/Normalization already done in Meta object)
-            work = await self._get_or_create_work(
-                meta.work_title, primary_artist.id
-            )
+            # Use UPSERT to atomically get or create work
+            work = await self._upsert_work(meta.work_title, primary_artist.id)
 
             # Multi-Artist: link MBID-resolved list or name-split list
             if artist_objs_from_mbid:
@@ -1679,7 +1874,8 @@ class FileScanner:
                     work, primary_artist, meta.raw_artist, meta.album_artist
                 )
 
-            recording = await self._get_or_create_recording(
+            # Use UPSERT to atomically get or create recording
+            recording = await self._upsert_recording(
                 work.id, meta.title, meta.version_type, meta.duration, meta.isrc
             )
 
@@ -1696,23 +1892,30 @@ class FileScanner:
         if self.perf_metrics:
             self.perf_metrics.time_database_ops += t_db
 
-        # Vector indexing (outside session lock for better parallelism)
-        t_vector_start = time.time()
-        buf = getattr(self, "_vector_tracks_to_add", None)
-        if buf is not None:
-            buf.append((recording_id, meta.artist, meta.title))
-            if len(buf) >= self.config.vector_batch_size:
-                self._flush_vector_tracks()
-        else:
-            self.vector_db.add_track(
-                recording_id, meta.artist, meta.title
-            )
-        t_vector = time.time() - t_vector_start
-        if self.perf_metrics:
-            self.perf_metrics.time_vector_indexing += t_vector
+        # Vector indexing (outside session lock for better parallelism).
+        # Only increment stats on full success; if this raises, process_file's except
+        # will call _handle_file_error (errors += 1, processed += 1) - never double-count.
+        try:
+            t_vector_start = time.time()
+            buf = getattr(self, "_vector_tracks_to_add", None)
+            if buf is not None:
+                buf.append((recording_id, meta.artist, meta.title))
+                if len(buf) >= self.config.vector_batch_size:
+                    self._flush_vector_tracks()
+            else:
+                self.vector_db.add_track(
+                    recording_id, meta.artist, meta.title
+                )
+            t_vector = time.time() - t_vector_start
+            if self.perf_metrics:
+                self.perf_metrics.time_vector_indexing += t_vector
 
-        stats.created += 1
-        stats.processed += 1
+            stats.created += 1
+            stats.processed += 1
+        except Exception:
+            # Re-raise so process_file's handler can update errors/processed once.
+            # Do NOT increment created/processed here - the file creation was not fully successful.
+            raise
 
     async def _handle_file_error(
         self,
@@ -1836,8 +2039,11 @@ class FileScanner:
             if should_skip:
                 return
 
-            # path_str is used later for move detection
-            path_str = str(file_path)
+            # path_str is used later for move detection - normalize consistently
+            try:
+                path_str = file_path.resolve().as_posix()
+            except (OSError, ValueError):
+                path_str = str(file_path).replace("\\", "/")
 
             # 1. Extract and parse metadata
             result = await self._extract_and_parse_metadata(file_path, stats)

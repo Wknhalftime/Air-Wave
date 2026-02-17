@@ -35,6 +35,8 @@ async def test_process_file_new_track():
     file_path.stat.return_value.st_size = 1024
     file_path.suffix = ".mp3"
     file_path.stem = "Artist - Title"
+    # Mock path normalization methods
+    file_path.resolve.return_value.as_posix.return_value.lower.return_value = "/music/artist - title.mp3"
 
     stats = ScanStats()
 
@@ -58,11 +60,11 @@ async def test_process_file_new_track():
 
         # Mock helpers to simplify logic
         with patch.object(
-            file_scanner, "_get_or_create_artist", new_callable=AsyncMock
+            file_scanner, "_upsert_artist", new_callable=AsyncMock
         ) as mock_artist, patch.object(
-            file_scanner, "_get_or_create_work", new_callable=AsyncMock
+            file_scanner, "_upsert_work", new_callable=AsyncMock
         ) as mock_work, patch.object(
-            file_scanner, "_get_or_create_recording", new_callable=AsyncMock
+            file_scanner, "_upsert_recording", new_callable=AsyncMock
         ) as mock_rec:
             mock_artist.return_value = Artist(id=1, name="Artist")
             mock_work.return_value = Work(id=1, title="Title", artist_id=1)
@@ -81,7 +83,7 @@ async def test_process_file_new_track():
             args, _ = mock_session.add.call_args
             new_file = args[0]
             assert isinstance(new_file, LibraryFile)
-            assert new_file.path == str(file_path)
+            assert new_file.path == "/music/artist - title.mp3"
             assert new_file.recording_id == 1
 
 
@@ -203,11 +205,11 @@ async def test_process_file_with_albumartist():
         mock_session.execute.return_value = mock_result
 
         with patch.object(
-            file_scanner, "_get_or_create_artist", new_callable=AsyncMock
+            file_scanner, "_upsert_artist", new_callable=AsyncMock
         ) as mock_artist, patch.object(
-            file_scanner, "_get_or_create_work", new_callable=AsyncMock
+            file_scanner, "_upsert_work", new_callable=AsyncMock
         ) as mock_work, patch.object(
-            file_scanner, "_get_or_create_recording", new_callable=AsyncMock
+            file_scanner, "_upsert_recording", new_callable=AsyncMock
         ) as mock_rec, patch.object(
             file_scanner, "_get_or_create_album", new_callable=AsyncMock
         ) as mock_album:
@@ -228,14 +230,14 @@ async def test_process_file_with_albumartist():
             await file_scanner.process_file(file_path, stats)
 
             # Assertions
-            # 1. _get_or_create_artist should be called with "Artist A" (from albumartist)
+            # 1. _upsert_artist should be called with "Artist A" (from albumartist)
             # Actually it's called twice in my implementation: one for primary, one for album artist
             # Both should be "Artist A" in this case.
             artist_calls = [call.args[0] for call in mock_artist.call_args_list]
             assert "artist a" in artist_calls
 
-            # 2. _get_or_create_work should use the ID of the primary artist (Artist A)
-            # Implementation passes title as is to _get_or_create_work
+            # 2. _upsert_work should use the ID of the primary artist (Artist A)
+            # Implementation passes title as is to _upsert_work
             mock_work.assert_called_with("song title", artist_a.id)
 
             # 3. _get_or_create_album should use the ID of the album artist (Artist A)
@@ -282,11 +284,11 @@ async def test_process_file_compilation():
         mock_session.execute.return_value = mock_result
 
         with patch.object(
-            file_scanner, "_get_or_create_artist", new_callable=AsyncMock
+            file_scanner, "_upsert_artist", new_callable=AsyncMock
         ) as mock_artist, patch.object(
-            file_scanner, "_get_or_create_work", new_callable=AsyncMock
+            file_scanner, "_upsert_work", new_callable=AsyncMock
         ) as mock_work, patch.object(
-            file_scanner, "_get_or_create_recording", new_callable=AsyncMock
+            file_scanner, "_upsert_recording", new_callable=AsyncMock
         ) as mock_rec, patch.object(
             file_scanner, "_get_or_create_album", new_callable=AsyncMock
         ) as mock_album:
@@ -364,14 +366,16 @@ async def test_process_file_multi_artist():
         mock_session.execute.return_value = mock_result_none
 
         with patch.object(
-            file_scanner, "_get_or_create_artist", new_callable=AsyncMock
+            file_scanner, "_upsert_artist", new_callable=AsyncMock
         ) as mock_artist, patch.object(
-            file_scanner, "_get_or_create_work", new_callable=AsyncMock
+            file_scanner, "_upsert_work", new_callable=AsyncMock
         ) as mock_work, patch.object(
-            file_scanner, "_get_or_create_recording", new_callable=AsyncMock
+            file_scanner, "_upsert_recording", new_callable=AsyncMock
         ) as mock_rec, patch.object(
             file_scanner, "_get_or_create_album", new_callable=AsyncMock
-        ) as mock_album:
+        ) as mock_album, patch.object(
+            file_scanner, "_upsert_work_artist", new_callable=AsyncMock
+        ) as mock_work_artist:
             artist_a = Artist(id=1, name="artist a")
             artist_b = Artist(id=2, name="artist b")
 
@@ -396,17 +400,15 @@ async def test_process_file_multi_artist():
             await file_scanner.process_file(file_path, stats)
 
             # Assertions
-            # Check that WorkArtist bridge entries were added
-            added_objects = [
-                call.args[0] for call in mock_session.add.call_args_list
-            ]
-            wa_entries = [
-                obj for obj in added_objects if isinstance(obj, WorkArtist)
-            ]
+            # Check that _upsert_work_artist was called for both artists
+            assert mock_work_artist.call_count == 2
 
-            assert len(wa_entries) == 2
-            work_ids = {entry.work_id for entry in wa_entries}
-            artist_ids = {entry.artist_id for entry in wa_entries}
+            # Verify the work_id and artist_ids
+            work_artist_calls = [
+                (call.args[0], call.args[1]) for call in mock_work_artist.call_args_list
+            ]
+            work_ids = {call[0] for call in work_artist_calls}
+            artist_ids = {call[1] for call in work_artist_calls}
 
             assert work_ids == {10}
             assert artist_ids == {1, 2}
@@ -452,14 +454,16 @@ async def test_process_file_duplicate_artist_ids():
         mock_session.execute.return_value = mock_result_none
 
         with patch.object(
-            file_scanner, "_get_or_create_artist", new_callable=AsyncMock
+            file_scanner, "_upsert_artist", new_callable=AsyncMock
         ) as mock_artist, patch.object(
-            file_scanner, "_get_or_create_work", new_callable=AsyncMock
+            file_scanner, "_upsert_work", new_callable=AsyncMock
         ) as mock_work, patch.object(
-            file_scanner, "_get_or_create_recording", new_callable=AsyncMock
+            file_scanner, "_upsert_recording", new_callable=AsyncMock
         ) as mock_rec, patch.object(
             file_scanner, "_get_or_create_album", new_callable=AsyncMock
-        ) as mock_album:
+        ) as mock_album, patch.object(
+            file_scanner, "_upsert_work_artist", new_callable=AsyncMock
+        ) as mock_work_artist:
             # Both "P.O.D." and "P.O.D" resolve to the same Artist object
             artist_pod = Artist(id=178, name="pod")
             mock_artist.return_value = artist_pod
@@ -478,13 +482,10 @@ async def test_process_file_duplicate_artist_ids():
             await file_scanner.process_file(file_path, stats)
 
             # Assertions
-            added_objects = [
-                call.args[0] for call in mock_session.add.call_args_list
-            ]
-            wa_entries = [
-                obj for obj in added_objects if isinstance(obj, WorkArtist)
-            ]
+            # Should only call _upsert_work_artist ONCE because duplicate artist IDs are filtered
+            assert mock_work_artist.call_count == 1
 
-            # Should only be ONE entry for ID 178
-            assert len(wa_entries) == 1
-            assert wa_entries[0].artist_id == 178
+            # Verify it was called with the correct work_id and artist_id
+            work_artist_call = mock_work_artist.call_args_list[0]
+            assert work_artist_call.args[0] == 3284  # work_id
+            assert work_artist_call.args[1] == 178   # artist_id

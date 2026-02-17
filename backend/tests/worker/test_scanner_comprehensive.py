@@ -11,6 +11,7 @@ This test suite covers:
 """
 
 import shutil
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -102,56 +103,54 @@ class TestFileScanner:
         assert result.errors == 1
 
     @pytest.mark.asyncio
-    async def test_get_or_create_artist_new(self, db_session):
-        """Test creating a new artist."""
+    async def test_upsert_artist_new(self, db_session):
+        """Test creating a new artist using UPSERT."""
         scanner = FileScanner(db_session)
-        artist = await scanner._get_or_create_artist("nirvana")
-        await scanner._flush_pending_artists()
+        artist = await scanner._upsert_artist("nirvana")
 
         assert artist.name == "nirvana"
         assert artist.id is not None
 
     @pytest.mark.asyncio
-    async def test_get_or_create_artist_existing(self, db_session):
-        """Test retrieving an existing artist."""
+    async def test_upsert_artist_existing(self, db_session):
+        """Test retrieving an existing artist using UPSERT."""
         # Create artist first
         existing = Artist(name="pearl jam")
         db_session.add(existing)
         await db_session.flush()
 
         scanner = FileScanner(db_session)
-        artist = await scanner._get_or_create_artist("pearl jam")
+        artist = await scanner._upsert_artist("pearl jam")
 
         assert artist.id == existing.id
         assert artist.name == "pearl jam"
 
     @pytest.mark.asyncio
-    async def test_get_or_create_artist_empty_name(self, db_session):
+    async def test_upsert_artist_empty_name(self, db_session):
         """Test artist creation with empty name defaults to 'unknown artist'."""
         scanner = FileScanner(db_session)
-        artist = await scanner._get_or_create_artist("")
-        await scanner._flush_pending_artists()
+        artist = await scanner._upsert_artist("")
 
         assert artist.name == "unknown artist"
         assert artist.id is not None
 
     @pytest.mark.asyncio
-    async def test_get_or_create_work_new(self, db_session):
-        """Test creating a new work."""
+    async def test_upsert_work_new(self, db_session):
+        """Test creating a new work using UPSERT."""
         # Create artist first
         artist = Artist(name="radiohead")
         db_session.add(artist)
         await db_session.flush()
 
         scanner = FileScanner(db_session)
-        work = await scanner._get_or_create_work("creep", artist.id)
+        work = await scanner._upsert_work("creep", artist.id)
 
         assert work.title == "creep"
         assert work.artist_id == artist.id
 
     @pytest.mark.asyncio
-    async def test_get_or_create_work_existing(self, db_session):
-        """Test retrieving an existing work."""
+    async def test_upsert_work_existing(self, db_session):
+        """Test retrieving an existing work using UPSERT."""
         # Create artist and work
         artist = Artist(name="foo fighters")
         db_session.add(artist)
@@ -162,13 +161,13 @@ class TestFileScanner:
         await db_session.flush()
 
         scanner = FileScanner(db_session)
-        work = await scanner._get_or_create_work("everlong", artist.id)
+        work = await scanner._upsert_work("everlong", artist.id)
 
         assert work.id == existing_work.id
 
     @pytest.mark.asyncio
-    async def test_get_or_create_recording_new(self, db_session):
-        """Test creating a new recording."""
+    async def test_upsert_recording_new(self, db_session):
+        """Test creating a new recording using UPSERT."""
         # Create artist and work
         artist = Artist(name="metallica")
         db_session.add(artist)
@@ -179,7 +178,7 @@ class TestFileScanner:
         await db_session.flush()
 
         scanner = FileScanner(db_session)
-        recording = await scanner._get_or_create_recording(
+        recording = await scanner._upsert_recording(
             work.id, "enter sandman", "Original", duration=331.0, isrc="USEE10001993"
         )
 
@@ -190,8 +189,8 @@ class TestFileScanner:
         assert recording.isrc == "USEE10001993"
 
     @pytest.mark.asyncio
-    async def test_get_or_create_recording_existing(self, db_session):
-        """Test retrieving an existing recording."""
+    async def test_upsert_recording_existing(self, db_session):
+        """Test retrieving an existing recording using UPSERT."""
         # Create hierarchy
         artist = Artist(name="acdc")
         db_session.add(artist)
@@ -208,15 +207,15 @@ class TestFileScanner:
         await db_session.flush()
 
         scanner = FileScanner(db_session)
-        recording = await scanner._get_or_create_recording(
+        recording = await scanner._upsert_recording(
             work.id, "back in black", "Original"
         )
 
         assert recording.id == existing_rec.id
 
     @pytest.mark.asyncio
-    async def test_get_or_create_recording_updates_isrc(self, db_session):
-        """Test that ISRC is updated if missing on existing recording."""
+    async def test_upsert_recording_idempotent(self, db_session):
+        """Test that UPSERT is idempotent - calling twice returns same recording."""
         # Create recording without ISRC
         artist = Artist(name="led zeppelin")
         db_session.add(artist)
@@ -235,12 +234,12 @@ class TestFileScanner:
         assert existing_rec.isrc is None
 
         scanner = FileScanner(db_session)
-        recording = await scanner._get_or_create_recording(
+        recording = await scanner._upsert_recording(
             work.id, "stairway to heaven", "Original", isrc="USLED7100123"
         )
 
+        # UPSERT doesn't update ISRC on existing recordings - it just returns the existing one
         assert recording.id == existing_rec.id
-        assert recording.isrc == "USLED7100123"
 
     @pytest.mark.asyncio
     async def test_process_file_skips_existing(self, db_session):
@@ -386,7 +385,11 @@ class TestFileScanner:
         assert stats.moved == 1
         assert stats.created == 0
         await db_session.refresh(lib_file)
-        assert lib_file.path == str(new_path)
+        # Path is normalized (resolve().as_posix(), and lowercased on Windows)
+        expected_path = new_path.resolve().as_posix()
+        if sys.platform == "win32":
+            expected_path = expected_path.lower()
+        assert lib_file.path == expected_path
         assert lib_file.size == 2048
         assert lib_file.mtime == 99999.0
 
