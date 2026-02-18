@@ -3,6 +3,8 @@ import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import MainLayout from './layouts/MainLayout';
 import Dashboard from './pages/Dashboard';
 import Library from './pages/Library';
+import ArtistDetail from './pages/ArtistDetail';
+import WorkDetail from './pages/WorkDetail';
 import History from './pages/History';
 import Analytics from './pages/Analytics';
 import Admin from './pages/Admin';
@@ -24,6 +26,8 @@ function App() {
           <Route element={<MainLayout />}>
             <Route path="/" element={<Dashboard />} />
             <Route path="/library" element={<Library />} />
+            <Route path="/library/artists/:id" element={<ArtistDetail />} />
+            <Route path="/library/works/:id" element={<WorkDetail />} />
             <Route path="/stations" element={<Stations />} />
             <Route path="/stations/:id" element={<StationDetail />} />
             <Route path="/identity" element={<Identity />} />

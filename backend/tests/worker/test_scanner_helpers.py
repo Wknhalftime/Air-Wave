@@ -8,6 +8,7 @@ This test suite covers the helper methods extracted during Phase 3 refactoring:
 - _create_library_file()
 """
 
+import sys
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -447,10 +448,11 @@ class TestCreateLibraryFile:
         file_hash = "abc123def456"
         bitrate = 320000
 
-        # Mock file size
+        # Mock file size and mtime
         def mock_stat(path):
             mock_result = Mock()
             mock_result.st_size = 10485760  # 10 MB
+            mock_result.st_mtime = 1234567890.0
             return mock_result
 
         with patch('pathlib.Path.stat', mock_stat):
@@ -458,10 +460,15 @@ class TestCreateLibraryFile:
                 recording, file_path, file_hash, bitrate
             )
 
+        # Scanner normalizes path: resolve().as_posix(), lowercase on Windows
+        expected_path = file_path.resolve().as_posix()
+        if sys.platform == "win32":
+            expected_path = expected_path.lower()
+
         # Check that file was created
         assert library_file is not None
         assert library_file.recording_id == recording.id
-        assert library_file.path == str(file_path)
+        assert library_file.path == expected_path
         assert library_file.size == 10485760
         assert library_file.format == "mp3"
         assert library_file.file_hash == file_hash
@@ -487,10 +494,11 @@ class TestCreateLibraryFile:
         file_path = Path("/music/song.flac")
         file_hash = "xyz789"
 
-        # Mock file size
+        # Mock file size and mtime
         def mock_stat(path):
             mock_result = Mock()
             mock_result.st_size = 20971520  # 20 MB
+            mock_result.st_mtime = 1234567890.0
             return mock_result
 
         with patch('pathlib.Path.stat', mock_stat):
@@ -523,10 +531,11 @@ class TestCreateLibraryFile:
         file_path = Path("/music/test.mp3")
         file_hash = "hash123"
 
-        # Mock file size
+        # Mock file size and mtime
         def mock_stat(path):
             mock_result = Mock()
             mock_result.st_size = 5242880  # 5 MB
+            mock_result.st_mtime = 1234567890.0
             return mock_result
 
         with patch('pathlib.Path.stat', mock_stat):
@@ -534,8 +543,13 @@ class TestCreateLibraryFile:
                 recording, file_path, file_hash, 192000
             )
 
+        # Scanner normalizes path: resolve().as_posix(), lowercase on Windows
+        expected_path = file_path.resolve().as_posix()
+        if sys.platform == "win32":
+            expected_path = expected_path.lower()
+
         # Verify it's in the database
-        stmt = select(LibraryFile).where(LibraryFile.path == str(file_path))
+        stmt = select(LibraryFile).where(LibraryFile.path == expected_path)
         result = await db_session.execute(stmt)
         db_file = result.scalar_one_or_none()
 

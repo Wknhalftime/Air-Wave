@@ -89,7 +89,11 @@ class TaskStore:
         with self._lock:
             if task := self._tasks.get(task_id):
                 task.current = current
-                task.progress = current / task.total if task.total > 0 else 0.0
+                if task.total > 0:
+                    task.progress = current / task.total
+                else:
+                    # Sync/scan does not know total in advance; use pseudo-progress so UI bar advances
+                    task.progress = min(0.99, current / (current + 100)) if current > 0 else 0.0
                 task.message = message
 
     def update_total(

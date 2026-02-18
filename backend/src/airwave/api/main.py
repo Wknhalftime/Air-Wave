@@ -22,6 +22,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 
+from airwave.api.middleware import QueryLoggingMiddleware
 from airwave.api.routers import (
     admin,
     analytics,
@@ -33,6 +34,7 @@ from airwave.api.routers import (
     system,
     stations,
     discovery,
+    bridges,
 )
 from airwave.core.config import settings
 from airwave.core.db import AsyncSessionLocal, init_db
@@ -81,6 +83,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Middleware - Query Logging (must be added before CORS)
+app.add_middleware(QueryLoggingMiddleware, slow_query_threshold=1.0)
+
 # CORS - Allow Vite Frontend
 origins = [
     "http://localhost:5173",
@@ -113,6 +118,9 @@ app.include_router(
 app.include_router(export.router, prefix="/api/v1/export", tags=["Export"])
 app.include_router(
     discovery.router, prefix="/api/v1/discovery", tags=["Discovery"]
+)
+app.include_router(
+    bridges.router, prefix="/api/v1/bridges", tags=["Bridges"]
 )
 
 

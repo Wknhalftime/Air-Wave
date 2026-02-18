@@ -1,5 +1,7 @@
+import { useState, useEffect } from 'react';
 import { useTaskProgress } from '../hooks/useTaskProgress';
-import { Loader, CheckCircle, XCircle, Activity } from 'lucide-react';
+import { Loader, CheckCircle, XCircle, Activity, StopCircle } from 'lucide-react';
+import { fetcher } from '../lib/api';
 
 interface TaskProgressProps {
     taskId: string | null;
@@ -8,6 +10,14 @@ interface TaskProgressProps {
 
 export function TaskProgress({ taskId, onComplete }: TaskProgressProps) {
     const { status, isConnected, error } = useTaskProgress(taskId);
+    const [isCancelling, setIsCancelling] = useState(false);
+
+    // Clear "Cancelling..." when backend reports task is cancelled (stops stuck UI)
+    useEffect(() => {
+        if (status?.status === 'cancelled') {
+            setIsCancelling(false);
+        }
+    }, [status?.status]);
 
     // Call onComplete callback when task finishes
     if (status?.status === 'completed' && onComplete) {
@@ -49,6 +59,21 @@ export function TaskProgress({ taskId, onComplete }: TaskProgressProps) {
     const progressPercentage = Math.round(status.progress * 100);
     const isComplete = status.status === 'completed';
     const isFailed = status.status === 'failed';
+    const isCancelled = status.status === 'cancelled';
+    const isRunning = status.status === 'running';
+
+    // Handle cancel button click
+    const handleCancel = async () => {
+        if (!taskId || !isRunning) return;
+
+        setIsCancelling(true);
+        try {
+            await fetcher(`/admin/tasks/${taskId}/cancel`, { method: 'POST' });
+        } catch (err) {
+            console.error('Failed to cancel task:', err);
+            setIsCancelling(false);
+        }
+    };
 
     return (
         <div className="mt-3 p-4 bg-white border border-gray-200 rounded-lg shadow-sm">
@@ -59,27 +84,46 @@ export function TaskProgress({ taskId, onComplete }: TaskProgressProps) {
                         <CheckCircle className="w-5 h-5 text-green-600" />
                     ) : isFailed ? (
                         <XCircle className="w-5 h-5 text-red-600" />
+                    ) : isCancelled ? (
+                        <StopCircle className="w-5 h-5 text-orange-600" />
                     ) : (
                         <Activity className="w-5 h-5 text-indigo-600 animate-pulse" />
                     )}
                     <span className="text-sm font-medium text-gray-900">
-                        {isComplete ? 'Completed' : isFailed ? 'Failed' : 'Processing'}
+                        {isComplete ? 'Completed' : isFailed ? 'Failed' : isCancelled ? 'Cancelled' : 'Processing'}
                     </span>
                 </div>
-                <span className="text-sm font-semibold text-gray-700">
-                    {progressPercentage}%
-                </span>
+                <div className="flex items-center gap-2">
+                    <span className="text-sm font-semibold text-gray-700">
+                        {progressPercentage}%
+                    </span>
+                    {isRunning && !isCancelling && (
+                        <button
+                            onClick={handleCancel}
+                            className="px-2 py-1 text-xs bg-red-100 text-red-700 rounded hover:bg-red-200 transition-colors"
+                            title="Cancel task"
+                        >
+                            Cancel
+                        </button>
+                    )}
+                    {isCancelling && (
+                        <span className="text-xs text-orange-600 font-medium">Cancelling...</span>
+                    )}
+                </div>
             </div>
 
             {/* Progress Bar */}
             <div className="w-full bg-gray-200 rounded-full h-2 mb-2 overflow-hidden">
                 <div
-                    className={`h-2 rounded-full transition-all duration-300 ${isComplete
-                        ? 'bg-green-600'
-                        : isFailed
-                            ? 'bg-red-600'
-                            : 'bg-indigo-600'
-                        }`}
+                    className={`h-2 rounded-full transition-all duration-300 ${
+                        isComplete
+                            ? 'bg-green-600'
+                            : isFailed
+                                ? 'bg-red-600'
+                                : isCancelled
+                                    ? 'bg-orange-600'
+                                    : 'bg-indigo-600'
+                    }`}
                     style={{ width: `${progressPercentage}%` }}
                 />
             </div>

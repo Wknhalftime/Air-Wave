@@ -21,6 +21,7 @@ sentence-transformers = "^5.2.0"
 mutagen = "^1.47.0"
 pyacoustid = "^1.3.0"
 python-multipart = "^0.0.22"
+blake3 = "^1.0.8"
 alembic = "^1.18.1"
 duckdb = "^1.4.4"
 
@@ -39,6 +40,31 @@ build-backend = "poetry.core.masonry.api"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["src"]
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/worker/main.py",  # Celery entrypoint (low coverage expected)
+    "*/scripts/*.py",    # CLI scripts (not part of library coverage)
+]
+
+[tool.coverage.report]
+# Exclude lines that are hard to test or not critical
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
+# Fail if coverage drops below this threshold (can be increased as coverage improves)
+fail_under = 70
+precision = 2
+show_missing = true
+skip_covered = false
+skip_empty = true
 
 [tool.mypy]
 python_version = "3.12"

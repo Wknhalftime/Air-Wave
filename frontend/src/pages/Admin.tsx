@@ -156,6 +156,36 @@ export default function Admin() {
     const { status: syncStatus } = useTaskProgress(syncTaskId);
     const { status: discoveryStatus } = useTaskProgress(discoveryTaskId);
 
+    // Clear task IDs when tasks complete
+    useEffect(() => {
+        if (scanStatus?.status && ['completed', 'failed', 'cancelled'].includes(scanStatus.status)) {
+            // Delay clearing to allow user to see final status
+            const timer = setTimeout(() => setScanTaskId(null), 3000);
+            return () => clearTimeout(timer);
+        }
+    }, [scanStatus?.status]);
+
+    useEffect(() => {
+        if (syncStatus?.status && ['completed', 'failed', 'cancelled'].includes(syncStatus.status)) {
+            const timer = setTimeout(() => setSyncTaskId(null), 3000);
+            return () => clearTimeout(timer);
+        }
+    }, [syncStatus?.status]);
+
+    useEffect(() => {
+        if (importStatus?.status && ['completed', 'failed', 'cancelled'].includes(importStatus.status)) {
+            const timer = setTimeout(() => setImportTaskId(null), 3000);
+            return () => clearTimeout(timer);
+        }
+    }, [importStatus?.status]);
+
+    useEffect(() => {
+        if (discoveryStatus?.status && ['completed', 'failed', 'cancelled'].includes(discoveryStatus.status)) {
+            const timer = setTimeout(() => setDiscoveryTaskId(null), 3000);
+            return () => clearTimeout(timer);
+        }
+    }, [discoveryStatus?.status]);
+
     // --- Settings Tab ---
     const { data: settings, isLoading } = useQuery<SystemSetting[]>({
         queryKey: ['admin', 'settings'],

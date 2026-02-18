@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 from airwave.api.deps import get_db
 from airwave.api.main import app
+from airwave.core.cache import cache
 from airwave.core.db import Base
 # Import all models to ensure Base.metadata is populated
 from airwave.core import models  # noqa
@@ -24,14 +25,20 @@ from sqlalchemy.ext.asyncio import (
 # ============================================================================
 
 # Get test database path
-TEST_DB_PATH = Path(__file__).parent.parent / "data" / "airwave_test.db"
-TEST_DB_URL = f"sqlite+aiosqlite:///{TEST_DB_PATH}"
+from sqlalchemy.pool import StaticPool
+
+# Get test database path
+# TEST_DB_PATH = Path(__file__).parent.parent / "data" / "airwave_test.db"
+# TEST_DB_URL = f"sqlite+aiosqlite:///{TEST_DB_PATH}"
+# Use in-memory DB for better isolation and speed
+TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
 # Create test-specific engine (NEVER use production engine in tests!)
 test_engine = create_async_engine(
     TEST_DB_URL,
     echo=False,
-    connect_args={"check_same_thread": False, "timeout": 30},
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
 )
 
 # Create test-specific session factory
@@ -46,6 +53,9 @@ TestSessionLocal = async_sessionmaker(
 @pytest.fixture(scope="function")
 async def db_engine():
     """Create test database tables before each test, drop after."""
+    # Clear cache before each test to prevent cross-test contamination
+    cache.clear()
+
     # Drop all tables first to ensure clean state
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)

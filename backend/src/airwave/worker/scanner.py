@@ -868,32 +868,8 @@ class FileScanner:
         logger.info(f"Starting scan of {root_path}... (parallel processing with max {self.config.max_concurrent_files} concurrent files)")
 
         # Load path index (id, path, size, mtime) for stat-first skip without per-file DB hit
-        # Normalize paths consistently: resolve and use forward slashes
-        # On Windows, also normalize to lowercase for case-insensitive matching
-        stmt = select(LibraryFile.id, LibraryFile.path, LibraryFile.size, LibraryFile.mtime)
-        result = await self.session.execute(stmt)
-        path_index: Dict[str, Dict[str, Any]] = {}
-        for row in result.all():
-            # Normalize path consistently: resolve to absolute, use forward slashes
-            # On Windows, also normalize to lowercase for case-insensitive matching
-            # This MUST match the normalization used when storing (line ~1423) and checking (line ~1502)
-            try:
-                # Resolve to absolute path (same as when storing/checking)
-                # This handles symlinks, relative paths, and ensures consistent format
-                resolved = Path(row.path).resolve().as_posix()
-            except (OSError, ValueError):
-                # If path doesn't exist or can't be resolved, normalize as-is
-                # This handles legacy paths or deleted files gracefully
-                resolved = row.path.replace("\\", "/")
-            
-            # On Windows, normalize to lowercase for case-insensitive matching
-            # This ensures paths match regardless of filesystem-reported casing
-            if sys.platform == "win32":
-                normalized_path = resolved.lower()
-            else:
-                normalized_path = resolved
-                
-            path_index[normalized_path] = {"id": row.id, "size": row.size, "mtime": row.mtime}
+        # Uses chunked loading to reduce memory pressure for large libraries
+        path_index = await self._load_path_index_chunked()
         self._path_index = path_index
         self._path_index_seen: set = set()
         self._touch_ids: set = set()
@@ -985,6 +961,67 @@ class FileScanner:
             logger.success(f"Task {task_id} completed: {stats}")
 
         return stats
+
+    async def _load_path_index_chunked(self, chunk_size: int = 10000) -> Dict[str, Dict[str, Any]]:
+        """Load path index in chunks to reduce memory pressure for large libraries.
+        
+        Args:
+            chunk_size: Number of rows to load per chunk (default: 10000)
+            
+        Returns:
+            Dictionary mapping normalized paths to file metadata.
+        """
+        path_index: Dict[str, Dict[str, Any]] = {}
+        offset = 0
+        total_loaded = 0
+        
+        logger.debug(f"Loading path index in chunks of {chunk_size}...")
+        
+        while True:
+            stmt = (
+                select(LibraryFile.id, LibraryFile.path, LibraryFile.size, LibraryFile.mtime)
+                .offset(offset)
+                .limit(chunk_size)
+            )
+            result = await self.session.execute(stmt)
+            rows = result.all()
+            
+            if not rows:
+                break
+            
+            # Process chunk
+            for row in rows:
+                # Normalize path consistently: resolve to absolute, use forward slashes
+                # On Windows, also normalize to lowercase for case-insensitive matching
+                # This MUST match the normalization used when storing (line ~1423) and checking (line ~1502)
+                try:
+                    # Resolve to absolute path (same as when storing/checking)
+                    # This handles symlinks, relative paths, and ensures consistent format
+                    resolved = Path(row.path).resolve().as_posix()
+                except (OSError, ValueError):
+                    # If path doesn't exist or can't be resolved, normalize as-is
+                    # This handles legacy paths or deleted files gracefully
+                    resolved = row.path.replace("\\", "/")
+                
+                # On Windows, normalize to lowercase for case-insensitive matching
+                # This ensures paths match regardless of filesystem-reported casing
+                if sys.platform == "win32":
+                    normalized_path = resolved.lower()
+                else:
+                    normalized_path = resolved
+                    
+                path_index[normalized_path] = {"id": row.id, "size": row.size, "mtime": row.mtime}
+            
+            total_loaded += len(rows)
+            offset += chunk_size
+            
+            # Yield control periodically to allow other operations
+            if offset % (chunk_size * 5) == 0:
+                await asyncio.sleep(0)
+                logger.debug(f"Loaded {total_loaded} files into path index...")
+        
+        logger.info(f"Loaded path index: {total_loaded} files in {offset // chunk_size + 1} chunks")
+        return path_index
 
     def _folder_cache_path(self, root_path: str) -> Path:
         """Path to folder mtime cache file, scoped per library root."""

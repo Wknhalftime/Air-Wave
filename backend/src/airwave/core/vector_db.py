@@ -11,6 +11,7 @@ Typical usage example:
 """
 
 import os
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
@@ -89,6 +90,8 @@ class VectorDB:
             embedding_function=self.ef,
             metadata={"hnsw:space": "cosine"},  # Semantic distance metric
         )
+        # Serialize ChromaDB writes to avoid "Database is locked" under parallel load
+        self._write_lock = threading.Lock()
 
     def add_track(self, track_id: int, artist: str, title: str) -> None:
         """Adds a single track to the vector index.
@@ -127,13 +130,21 @@ class VectorDB:
         if not tracks:
             return
 
+        # Deduplicate by recording_id (ChromaDB requires unique IDs per batch).
+        # Keep last occurrence so most recent metadata wins.
+        seen: Dict[int, Tuple[int, str, str]] = {}
+        for t in tracks:
+            seen[t[0]] = t
+        tracks = list(seen.values())
+
         ids = [str(t[0]) for t in tracks]
         documents = [f"{t[1]} - {t[2]}" for t in tracks]
         metadatas = [{"artist": t[1], "title": t[2]} for t in tracks]
 
-        self.collection.upsert(
-            ids=ids, documents=documents, metadatas=metadatas
-        )
+        with self._write_lock:
+            self.collection.upsert(
+                ids=ids, documents=documents, metadatas=metadatas
+            )
 
     def search(
         self,

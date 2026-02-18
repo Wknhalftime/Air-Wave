@@ -15,9 +15,10 @@ from sqlalchemy.ext.asyncio import (
 # Create Async Engine
 # check_same_thread=False is needed for SQLite, though less critical for asyncio
 # busy_timeout (ms) allows SQLite to wait instead of failing immediately with "database is locked"
+# echo=True enables SQLAlchemy query logging for debugging (controlled by DB_ECHO setting)
 engine = create_async_engine(
     settings.DB_URL,
-    echo=False,
+    echo=settings.DB_ECHO,
     connect_args={"check_same_thread": False, "timeout": 30},
 )
 
@@ -100,3 +101,4 @@ async def init_db(force: bool = False) -> None:
             # Only drop if explicitly forced
             await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database tables ready.")

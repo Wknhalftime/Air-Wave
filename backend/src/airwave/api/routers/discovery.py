@@ -1,20 +1,20 @@
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import delete, select, func, update
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from pydantic import BaseModel, ConfigDict
 
 from airwave.api.deps import get_db
 from airwave.core.models import (
+    Artist,
     BroadcastLog,
     DiscoveryQueue,
     IdentityBridge,
     Recording,
+    VerificationAudit,
     Work,
-    Artist,
-    VerificationAudit
 )
 from airwave.core.normalization import Normalizer
 
@@ -41,8 +41,8 @@ class PromoteRequest(BaseModel):
 
 @router.get("/queue", response_model=List[DiscoveryQueueItem])
 async def get_queue(
-    limit: int = 100, 
-    offset: int = 0, 
+    limit: int = 100,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db)
 ):
     """List unmatched discovery items, sorted by count (highest impact first)."""
@@ -63,7 +63,7 @@ async def get_queue(
 
 @router.post("/link")
 async def link_discovery_item(
-    req: LinkRequest, 
+    req: LinkRequest,
     db: AsyncSession = Depends(get_db)
 ):
     """Link a discovery signature to an existing recording."""
@@ -71,7 +71,7 @@ async def link_discovery_item(
     stmt = select(DiscoveryQueue).where(DiscoveryQueue.signature == req.signature)
     res = await db.execute(stmt)
     queue_item = res.scalar_one_or_none()
-    
+
     if not queue_item:
         raise HTTPException(status_code=404, detail="Queue item not found")
 
@@ -143,7 +143,7 @@ async def link_discovery_item(
             reference_title=queue_item.raw_title
         )
         db.add(bridge)
-    
+
     await db.flush()  # Ensure bridge ID is available
 
     # 5. Update BroadcastLogs (AC 2: Update logs even if bridge existed)
@@ -176,30 +176,30 @@ async def link_discovery_item(
 
     # 7. Delete from Queue
     await db.delete(queue_item)
-    
+
     await db.commit()
     return {"status": "linked", "signature": req.signature, "audit_id": audit.id}
 
 
 @router.post("/promote")
 async def promote_discovery_item(
-    req: PromoteRequest, 
+    req: PromoteRequest,
     db: AsyncSession = Depends(get_db)
 ):
     """Promote a discovery item to a new Silver recording."""
     stmt = select(DiscoveryQueue).where(DiscoveryQueue.signature == req.signature)
     res = await db.execute(stmt)
     queue_item = res.scalar_one_or_none()
-    
+
     if not queue_item:
         raise HTTPException(status_code=404, detail="Queue item not found")
 
     # Create Artist/Work/Recording hierarchy logic (copied/refactored from matcher?)
     # For MVP, simple creation:
-    
+
     clean_artist = Normalizer.clean_artist(queue_item.raw_artist)
     clean_title = Normalizer.clean(queue_item.raw_title)
-    
+
     # 1. Get/Create Artist
     stmt_a = select(Artist).where(Artist.name == clean_artist)
     artist = (await db.execute(stmt_a)).scalar_one_or_none()
@@ -207,7 +207,7 @@ async def promote_discovery_item(
         artist = Artist(name=clean_artist)
         db.add(artist)
         await db.flush()
-        
+
     # 2. Get/Create Work
     stmt_w = select(Work).where(
         Work.title == clean_title, Work.artist_id == artist.id
@@ -217,14 +217,14 @@ async def promote_discovery_item(
         work = Work(title=clean_title, artist_id=artist.id)
         db.add(work)
         await db.flush()
-        
+
     # 3. Create Recording (Silver)
     # Check if exists first to avoid dupes?
     stmt_r = select(Recording).where(
         Recording.work_id == work.id, Recording.title == clean_title
     )
     rec = (await db.execute(stmt_r)).scalar_one_or_none()
-    
+
     if not rec:
         rec = Recording(
             work_id=work.id,
@@ -239,7 +239,7 @@ async def promote_discovery_item(
         # If it exists, we are essentially Linking to it + setting verified?
         if not rec.is_verified:
              rec.is_verified = True
-    
+
     # 3b. Verify Signature Integrity (AC 3)
     expected_sig = Normalizer.generate_signature(
         queue_item.raw_artist, queue_item.raw_title
@@ -297,7 +297,7 @@ async def promote_discovery_item(
             reference_title=queue_item.raw_title
         )
         db.add(bridge)
-    
+
     await db.flush()
 
     # 5. Update BroadcastLogs
@@ -328,12 +328,12 @@ async def promote_discovery_item(
 
     # 7. Delete from Queue
     await db.delete(queue_item)
-    
+
     await db.commit()
     return {
-        "status": "promoted", 
-        "recording_id": rec.id, 
-        "artist": clean_artist, 
+        "status": "promoted",
+        "recording_id": rec.id,
+        "artist": clean_artist,
         "title": clean_title,
         "audit_id": audit.id
     }
@@ -344,10 +344,10 @@ async def dismiss_discovery_item(signature: str, db: AsyncSession = Depends(get_
     stmt = select(DiscoveryQueue).where(DiscoveryQueue.signature == signature)
     res = await db.execute(stmt)
     queue_item = res.scalar_one_or_none()
-    
+
     if not queue_item:
         raise HTTPException(status_code=404, detail="Queue item not found")
-        
+
     await db.delete(queue_item)
     await db.commit()
     return {"status": "dismissed"}

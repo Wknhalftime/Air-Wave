@@ -16,16 +16,17 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from airwave.api.deps import get_db
-from airwave.core.models import SystemSetting
+from airwave.core.models import Album, Artist, SystemSetting, Work, WorkArtist
 from airwave.core.task_store import TaskStore
 from airwave.worker.main import (
     run_bulk_import,
     run_discovery_task,
     run_import,
+    run_reindex,
     run_scan,
     run_sync_files,
 )
@@ -42,6 +43,15 @@ class Setting(BaseModel):
 
 class ScanRequest(BaseModel):
     path: Optional[str] = None
+
+
+class SetMusicBrainzIdRequest(BaseModel):
+    musicbrainz_id: Optional[str] = None  # UUID string or null to clear
+
+
+class MergeArtistsRequest(BaseModel):
+    source_artist_id: int  # Artist to merge from (will be removed)
+    target_artist_id: int  # Artist to merge into (kept)
 
 
 @router.get("/pipeline-stats")
@@ -448,7 +458,7 @@ async def stream_task_progress(task_id: str):
                 yield f"data: {json.dumps(task_dict)}\n\n"
 
                 # Stop if task is complete
-                if task.status in ["completed", "failed"]:
+                if task.status in ["completed", "failed", "cancelled"]:
                     break
 
                 # Wait before next update
@@ -470,3 +480,114 @@ async def stream_task_progress(task_id: str):
             "X-Accel-Buffering": "no",  # Disable nginx buffering
         },
     )
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    """Cancel a running task.
+
+    Args:
+        task_id: The ID of the task to cancel
+
+    Returns:
+        Status of the cancellation request
+    """
+    success = TaskStore.cancel_task(task_id)
+
+    if success:
+        logger.info(f"Cancellation requested for task {task_id}")
+        return {"status": "cancellation_requested", "task_id": task_id}
+    else:
+        task = TaskStore.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        else:
+            return {
+                "status": "already_completed",
+                "task_id": task_id,
+                "task_status": task.status
+            }
+
+
+@router.patch("/artists/{artist_id}/musicbrainz-id")
+async def set_artist_musicbrainz_id(
+    artist_id: int,
+    body: SetMusicBrainzIdRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Set or clear the MusicBrainz Artist ID for an artist."""
+    res = await db.execute(select(Artist).where(Artist.id == artist_id))
+    artist = res.scalar_one_or_none()
+    if not artist:
+        raise HTTPException(status_code=404, detail="Artist not found")
+    if body.musicbrainz_id is not None and body.musicbrainz_id.strip() == "":
+        body.musicbrainz_id = None
+    if body.musicbrainz_id is not None:
+        existing_res = await db.execute(
+            select(Artist).where(
+                Artist.musicbrainz_id == body.musicbrainz_id,
+                Artist.id != artist_id,
+            )
+        )
+        if existing_res.scalars().first():
+            raise HTTPException(
+                status_code=409,
+                detail="Another artist already has this MusicBrainz ID",
+            )
+    artist.musicbrainz_id = body.musicbrainz_id
+    await db.commit()
+    await db.refresh(artist)
+    return {"artist_id": artist_id, "musicbrainz_id": artist.musicbrainz_id}
+
+
+@router.post("/artists/merge")
+async def merge_artists(
+    body: MergeArtistsRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Merge source artist into target artist (repoint FKs, then delete source)."""
+    if body.source_artist_id == body.target_artist_id:
+        raise HTTPException(
+            status_code=400, detail="Source and target artist must differ"
+        )
+    res = await db.execute(
+        select(Artist).where(Artist.id.in_([body.source_artist_id, body.target_artist_id]))
+    )
+    artists = {a.id: a for a in res.scalars().all()}
+    source = artists.get(body.source_artist_id)
+    target = artists.get(body.target_artist_id)
+    if not source or not target:
+        raise HTTPException(status_code=404, detail="Artist not found")
+
+    # Repoint Work.artist_id
+    await db.execute(
+        update(Work).where(Work.artist_id == body.source_artist_id).values(artist_id=body.target_artist_id)
+    )
+    # Repoint Album.artist_id
+    await db.execute(
+        update(Album).where(Album.artist_id == body.source_artist_id).values(artist_id=body.target_artist_id)
+    )
+    # WorkArtist: for each (work_id, source_id), either update to target or delete if (work_id, target_id) exists
+    res_wa = await db.execute(
+        select(WorkArtist).where(WorkArtist.artist_id == body.source_artist_id)
+    )
+    for wa in res_wa.scalars().all():
+        exists = await db.execute(
+            select(WorkArtist).where(
+                WorkArtist.work_id == wa.work_id,
+                WorkArtist.artist_id == body.target_artist_id,
+            )
+        )
+        if exists.scalar_one_or_none():
+            await db.delete(wa)
+        else:
+            wa.artist_id = body.target_artist_id
+    # Delete source artist
+    await db.delete(source)
+    await db.commit()
+    logger.info(f"Merged artist {body.source_artist_id} into {body.target_artist_id}")
+    return {
+        "status": "merged",
+        "source_artist_id": body.source_artist_id,
+        "target_artist_id": body.target_artist_id,
+    }

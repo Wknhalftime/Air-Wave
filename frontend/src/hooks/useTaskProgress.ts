@@ -3,7 +3,7 @@ import { useState, useEffect, useRef } from 'react';
 export interface TaskStatus {
     task_id: string;
     task_type: string;
-    status: 'running' | 'completed' | 'failed';
+    status: 'running' | 'completed' | 'failed' | 'cancelled';
     progress: number;
     current: number;
     total: number;
@@ -63,8 +63,8 @@ export function useTaskProgress(taskId: string | null) {
                     console.log('[TaskProgress] Task status update:', data);
                     setStatus(data as TaskStatus);
 
-                    // Close connection when task completes
-                    if (data.status === 'completed' || data.status === 'failed') {
+                    // Close connection when task completes or is cancelled
+                    if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
                         console.log('[TaskProgress] Task finished, closing connection');
                         setIsConnected(false);
                         eventSource.close();

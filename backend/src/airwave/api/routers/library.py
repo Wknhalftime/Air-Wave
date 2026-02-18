@@ -6,17 +6,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from airwave.api.deps import get_db
+from airwave.core.cache import cached
 from airwave.core.models import (
     Artist,
     BroadcastLog,
     IdentityBridge,
+    LibraryFile,
     Recording,
     Station,
     Work,
+    WorkArtist,
 )
 from airwave.core.normalization import Normalizer
 
-from airwave.api.schemas import ArtistStats
+from airwave.api.schemas import (
+    ArtistDetail,
+    ArtistStats,
+    RecordingListItem,
+    WorkDetail,
+    WorkListItem,
+)
 
 router = APIRouter()
 
@@ -55,6 +64,258 @@ async def list_artists(
             work_count=row.work_count,
             recording_count=row.rec_count,
             avatar_url=None,
+        )
+        for row in rows
+    ]
+
+
+@router.get("/artists/{artist_id}", response_model=ArtistDetail)
+@cached(ttl=300, key_prefix="artist_detail")
+async def get_artist(
+    artist_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get single artist with aggregated stats.
+
+    Cached for 5 minutes to reduce database load for frequently accessed artists.
+    """
+    # Query artist with stats
+    stmt = (
+        select(
+            Artist,
+            func.count(func.distinct(Work.id)).label("work_count"),
+            func.count(func.distinct(Recording.id)).label("rec_count"),
+        )
+        .outerjoin(Artist.primary_works)
+        .outerjoin(Work.recordings)
+        .where(Artist.id == artist_id)
+        .group_by(Artist.id)
+    )
+
+    result = await db.execute(stmt)
+    row = result.one_or_none()
+
+    if not row:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Artist not found")
+
+    return ArtistDetail(
+        id=row.Artist.id,
+        name=row.Artist.name,
+        musicbrainz_id=row.Artist.musicbrainz_id,
+        work_count=row.work_count,
+        recording_count=row.rec_count,
+    )
+
+
+@router.get("/artists/{artist_id}/works", response_model=list[WorkListItem])
+@cached(ttl=180, key_prefix="artist_works")
+async def list_artist_works(
+    artist_id: int,
+    skip: int = 0,
+    limit: int = 24,
+    db: AsyncSession = Depends(get_db),
+):
+    """List works for an artist (via work_artists table for multi-artist support).
+
+    Cached for 3 minutes with pagination parameters in cache key.
+    """
+    # Verify artist exists
+    artist_stmt = select(Artist).where(Artist.id == artist_id)
+    artist_result = await db.execute(artist_stmt)
+    artist = artist_result.scalar_one_or_none()
+
+    if not artist:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Artist not found")
+
+    # Subquery to get all artist names for each work
+    # This is correlated to Work.id and gets ALL artists, not just the filtered one
+    all_artists_subquery = (
+        select(func.group_concat(Artist.name, ', '))
+        .select_from(WorkArtist)
+        .join(Artist, WorkArtist.artist_id == Artist.id)
+        .where(WorkArtist.work_id == Work.id)
+        .correlate(Work)
+        .scalar_subquery()
+    )
+
+    # Query works via work_artists table to include collaborations
+    stmt = (
+        select(
+            Work.id,
+            Work.title,
+            all_artists_subquery.label("artist_names"),
+            func.count(func.distinct(Recording.id)).label("recording_count"),
+            func.sum(Recording.duration).label("duration_total"),
+        )
+        .join(WorkArtist, Work.id == WorkArtist.work_id)
+        .outerjoin(Recording, Work.id == Recording.work_id)
+        .where(WorkArtist.artist_id == artist_id)
+        .group_by(Work.id, Work.title)
+        .order_by(Work.title)
+        .offset(skip)
+        .limit(limit)
+    )
+
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    return [
+        WorkListItem(
+            id=row.id,
+            title=row.title,
+            artist_names=row.artist_names or artist.name,  # Fallback to artist name
+            recording_count=row.recording_count,
+            duration_total=row.duration_total,
+            year=None,  # TODO: Add year from first recording if needed
+        )
+        for row in rows
+    ]
+
+
+@router.get("/works/{work_id}", response_model=WorkDetail)
+@cached(ttl=300, key_prefix="work_detail")
+async def get_work(
+    work_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get single work with artist details.
+
+    Cached for 5 minutes to reduce database load for frequently accessed works.
+    """
+    # First, get the work with primary artist
+    work_stmt = (
+        select(Work, Artist.name.label("primary_artist_name"))
+        .outerjoin(Artist, Work.artist_id == Artist.id)
+        .where(Work.id == work_id)
+    )
+
+    work_result = await db.execute(work_stmt)
+    work_row = work_result.one_or_none()
+
+    if not work_row:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Work not found")
+
+    work = work_row.Work
+    primary_artist_name = work_row.primary_artist_name
+
+    # Get all artist names via work_artists
+    artists_stmt = (
+        select(func.group_concat(Artist.name, ', ').label("all_artist_names"))
+        .select_from(WorkArtist)
+        .join(Artist, WorkArtist.artist_id == Artist.id)
+        .where(WorkArtist.work_id == work_id)
+    )
+
+    artists_result = await db.execute(artists_stmt)
+    all_artist_names = artists_result.scalar() or primary_artist_name or "Unknown"
+
+    # Get recording count
+    rec_count_stmt = (
+        select(func.count(Recording.id))
+        .where(Recording.work_id == work_id)
+    )
+    rec_count_result = await db.execute(rec_count_stmt)
+    recording_count = rec_count_result.scalar() or 0
+
+    return WorkDetail(
+        id=work.id,
+        title=work.title,
+        artist_id=work.artist_id,
+        artist_name=primary_artist_name,
+        artist_names=all_artist_names,
+        is_instrumental=work.is_instrumental,
+        recording_count=recording_count,
+    )
+
+
+@router.get("/works/{work_id}/recordings", response_model=list[RecordingListItem])
+@cached(ttl=120, key_prefix="work_recordings")
+async def list_work_recordings(
+    work_id: int,
+    skip: int = 0,
+    limit: int = 100,
+    status: Optional[str] = None,  # "all", "matched", "unmatched"
+    source: Optional[str] = None,  # "all", "library", "metadata"
+    db: AsyncSession = Depends(get_db),
+):
+    """List recordings for a work with optional filters.
+
+    Cached for 2 minutes with pagination and filter parameters in cache key.
+    """
+    # Verify work exists
+    work_stmt = select(Work).where(Work.id == work_id)
+    work_result = await db.execute(work_stmt)
+    work = work_result.scalar_one_or_none()
+
+    if not work:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Work not found")
+
+    # Query recordings with artist names and file status
+    # Use subquery to check if recording has files
+    has_file_subquery = (
+        select(func.count(LibraryFile.id))
+        .where(LibraryFile.recording_id == Recording.id)
+        .correlate(Recording)
+        .scalar_subquery()
+    )
+
+    stmt = (
+        select(
+            Recording.id,
+            Recording.title,
+            Recording.duration,
+            Recording.version_type,
+            Recording.is_verified,
+            Work.title.label("work_title"),
+            func.group_concat(Artist.name, ', ').label("artist_names"),
+            (has_file_subquery > 0).label("has_file"),
+        )
+        .join(Work, Recording.work_id == Work.id)
+        .outerjoin(WorkArtist, Work.id == WorkArtist.work_id)
+        .outerjoin(Artist, WorkArtist.artist_id == Artist.id)
+        .where(Recording.work_id == work_id)
+        .group_by(
+            Recording.id,
+            Recording.title,
+            Recording.duration,
+            Recording.version_type,
+            Recording.is_verified,
+            Work.title,
+        )
+    )
+
+    # Apply filters
+    if status == "matched":
+        stmt = stmt.where(Recording.is_verified == True)
+    elif status == "unmatched":
+        stmt = stmt.where(Recording.is_verified == False)
+
+    if source == "library":
+        # Only recordings with files
+        stmt = stmt.where(has_file_subquery > 0)
+    elif source == "metadata":
+        # Only recordings without files
+        stmt = stmt.where(has_file_subquery == 0)
+
+    stmt = stmt.order_by(Recording.title).offset(skip).limit(limit)
+
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    return [
+        RecordingListItem(
+            id=row.id,
+            title=row.title,
+            artist_display=row.artist_names or "Unknown",
+            duration=row.duration,
+            version_type=row.version_type,
+            work_title=row.work_title,
+            is_verified=row.is_verified,
+            has_file=row.has_file,
         )
         for row in rows
     ]

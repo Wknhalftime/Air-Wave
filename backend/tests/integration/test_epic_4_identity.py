@@ -47,7 +47,7 @@ async def test_list_bridges(async_client: AsyncClient, db_session, setup_identit
 
 @pytest.mark.asyncio
 async def test_delete_bridge(async_client: AsyncClient, db_session, setup_identity_data):
-    """Test DELETE /identity/bridges/{id} removes bridge."""
+    """Test DELETE /identity/bridges/{id} soft-deletes (revokes) bridge."""
     recording = setup_identity_data
     bridge = IdentityBridge(
         log_signature="test_sig_del",
@@ -61,10 +61,8 @@ async def test_delete_bridge(async_client: AsyncClient, db_session, setup_identi
     response = await async_client.delete(f"/api/v1/identity/bridges/{bridge.id}")
     assert response.status_code == 200
     
-    # Verify deletion
-    stmt = select(IdentityBridge).where(IdentityBridge.id == bridge.id)
-    result = await db_session.execute(stmt)
-    assert result.scalar_one_or_none() is None
+    # API soft-deletes (sets is_revoked=True); same session so bridge is updated
+    assert bridge.is_revoked is True
 
 @pytest.mark.asyncio
 async def test_create_bridge(async_client: AsyncClient, db_session, setup_identity_data):

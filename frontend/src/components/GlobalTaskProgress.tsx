@@ -1,21 +1,22 @@
 import { useState, useEffect } from 'react';
 import { useTaskProgress } from '../hooks/useTaskProgress';
-// import type { TaskStatus } from '../hooks/useTaskProgress';
-import { Upload, FolderSync, Activity, X, CheckCircle, XCircle, Loader } from 'lucide-react';
+import { fetcher } from '../lib/api';
+import { Upload, FolderSync, Activity, X, CheckCircle, XCircle, Loader, StopCircle } from 'lucide-react';
 
 interface ActiveTask {
     key: string;
     taskId: string;
-    type: 'import' | 'sync' | 'scan';
+    type: 'import' | 'sync' | 'scan' | 'discovery';
 }
 
 const TASK_KEYS = [
     { key: 'airwave_import_task_id', type: 'import' as const },
     { key: 'airwave_sync_task_id', type: 'sync' as const },
     { key: 'airwave_scan_task_id', type: 'scan' as const },
+    { key: 'airwave_discovery_task_id', type: 'discovery' as const },
 ];
 
-const TASK_CONFIG = {
+const TASK_CONFIG: Record<'import' | 'sync' | 'scan' | 'discovery', { icon: typeof Activity; label: string; color: string }> = {
     import: {
         icon: Upload,
         label: 'Import',
@@ -31,29 +32,52 @@ const TASK_CONFIG = {
         label: 'Scan',
         color: 'purple',
     },
+    discovery: {
+        icon: Activity,
+        label: 'Discovery',
+        color: 'indigo',
+    },
 };
 
 function TaskProgressBar({ taskKey, taskId, type, onDismiss }: {
     taskKey: string;
     taskId: string;
-    type: 'import' | 'sync' | 'scan';
+    type: 'import' | 'sync' | 'scan' | 'discovery';
     onDismiss: () => void;
 }) {
     const { status, error } = useTaskProgress(taskId);
+    const [isCancelling, setIsCancelling] = useState(false);
     const config = TASK_CONFIG[type];
     const Icon = config.icon;
 
-    // Auto-dismiss after 5 seconds on completion
+    // Clear "Cancelling..." when backend reports cancelled
     useEffect(() => {
-        if (status?.status === 'completed' || status?.status === 'failed') {
+        if (status?.status === 'cancelled') {
+            setIsCancelling(false);
+        }
+    }, [status?.status]);
+
+    // Auto-dismiss after 5 seconds on completion or cancellation
+    useEffect(() => {
+        if (status?.status === 'completed' || status?.status === 'failed' || status?.status === 'cancelled') {
             const timer = setTimeout(() => {
-                // Remove from localStorage and dismiss
                 localStorage.removeItem(taskKey);
                 onDismiss();
             }, 5000);
             return () => clearTimeout(timer);
         }
     }, [status?.status, taskKey, onDismiss]);
+
+    const handleCancel = async () => {
+        if (!taskId || status?.status !== 'running') return;
+        setIsCancelling(true);
+        try {
+            await fetcher(`/admin/tasks/${taskId}/cancel`, { method: 'POST' });
+        } catch (err) {
+            console.error('Failed to cancel task:', err);
+            setIsCancelling(false);
+        }
+    };
 
     if (error) {
         return (
@@ -88,8 +112,10 @@ function TaskProgressBar({ taskKey, taskId, type, onDismiss }: {
     const progressPercentage = Math.round(status.progress * 100);
     const isComplete = status.status === 'completed';
     const isFailed = status.status === 'failed';
+    const isCancelled = status.status === 'cancelled';
+    const isRunning = status.status === 'running';
 
-    const colorClasses = {
+    const colorClasses: Record<string, { bg: string; text: string; icon: string }> = {
         blue: {
             bg: 'bg-blue-600',
             text: 'text-blue-700',
@@ -105,9 +131,14 @@ function TaskProgressBar({ taskKey, taskId, type, onDismiss }: {
             text: 'text-purple-700',
             icon: 'text-purple-600',
         },
+        indigo: {
+            bg: 'bg-indigo-600',
+            text: 'text-indigo-700',
+            icon: 'text-indigo-600',
+        },
     };
 
-    const colors = (colorClasses as any)[config.color];
+    const colors = colorClasses[config.color] ?? colorClasses.blue;
 
     return (
         <div className="p-2 bg-white border border-gray-200 rounded-lg shadow-sm">
@@ -117,10 +148,12 @@ function TaskProgressBar({ taskKey, taskId, type, onDismiss }: {
                         <CheckCircle className="w-4 h-4 text-green-600 flex-shrink-0" />
                     ) : isFailed ? (
                         <XCircle className="w-4 h-4 text-red-600 flex-shrink-0" />
+                    ) : isCancelled ? (
+                        <StopCircle className="w-4 h-4 text-orange-600 flex-shrink-0" />
                     ) : (
                         <Icon className={`w-4 h-4 ${colors.icon} flex-shrink-0`} />
                     )}
-                    <span className={`text-xs font-medium ${colors.text} truncate`}>
+                    <span className={`text-xs font-medium ${isCancelled ? 'text-orange-700' : colors.text} truncate`}>
                         {config.label}
                     </span>
                 </div>
@@ -128,9 +161,22 @@ function TaskProgressBar({ taskKey, taskId, type, onDismiss }: {
                     <span className="text-xs font-semibold text-gray-700">
                         {progressPercentage}%
                     </span>
+                    {isRunning && !isCancelling && (
+                        <button
+                            onClick={handleCancel}
+                            className="text-xs text-red-600 hover:text-red-800 font-medium"
+                            title="Cancel task"
+                        >
+                            Cancel
+                        </button>
+                    )}
+                    {isCancelling && (
+                        <span className="text-xs text-orange-600 font-medium">Cancelling...</span>
+                    )}
                     <button
                         onClick={onDismiss}
                         className="text-gray-400 hover:text-gray-600"
+                        title="Dismiss"
                     >
                         <X className="w-3 h-3" />
                     </button>
@@ -140,8 +186,9 @@ function TaskProgressBar({ taskKey, taskId, type, onDismiss }: {
             {/* Progress Bar */}
             <div className="w-full bg-gray-200 rounded-full h-1.5 mb-1 overflow-hidden">
                 <div
-                    className={`h-1.5 rounded-full transition-all duration-300 ${isComplete ? 'bg-green-600' : isFailed ? 'bg-red-600' : colors.bg
-                        }`}
+                    className={`h-1.5 rounded-full transition-all duration-300 ${
+                        isComplete ? 'bg-green-600' : isFailed ? 'bg-red-600' : isCancelled ? 'bg-orange-600' : colors.bg
+                    }`}
                     style={{ width: `${progressPercentage}%` }}
                 />
             </div>

@@ -120,7 +120,7 @@ async def run_scan(task_id: Optional[str] = None) -> None:
             # For now, we trust the Queue Rebuild to be the primary 'Scan' action.
             
             if task_id:
-                TaskStore.complete_task(task_id, success=True, message=f"Scan complete. {total_items} items in Discovery Queue.")
+                TaskStore.complete_task(task_id, success=True)
 
     except Exception as e:
         logger.exception("Scan failed")
@@ -275,8 +275,7 @@ async def run_sync_files(path: str, task_id: Optional[str] = None) -> None:
         stats = await scanner.scan_directory(path, task_id)
 
     logger.info("Sync Complete.")
-    logger.info(f"Processed: {stats.processed}")
-    logger.info(f"Skipped: {stats.skipped}")
+    logger.info(f"Processed: {stats.processed}, Skipped: {stats.skipped}, Created: {stats.created}, Moved: {stats.moved}")
 
 
 async def run_bulk_import(root_dir: str, task_id: str = None):
@@ -388,11 +387,7 @@ async def run_discovery_task(task_id: Optional[str] = None) -> None:
             logger.success(f"Discovery complete. Queue size: {total_items}")
 
             if task_id:
-                TaskStore.complete_task(
-                    task_id,
-                    success=True,
-                    message=f"Discovery complete. {total_items} items in queue."
-                )
+                TaskStore.complete_task(task_id, success=True)
     except Exception as e:
         logger.exception("Discovery failed")
         if task_id:

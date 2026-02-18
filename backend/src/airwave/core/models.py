@@ -31,6 +31,9 @@ class Artist(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String, unique=True, index=True)
+    musicbrainz_id: Mapped[Optional[str]] = mapped_column(
+        String(36), unique=True, index=True, nullable=True
+    )
 
     # Relationships
     works: Mapped[List["Work"]] = relationship(
@@ -48,6 +51,9 @@ class Work(Base, TimestampMixin):
     """
 
     __tablename__ = "works"
+    __table_args__ = (
+        Index("idx_work_title_artist", "title", "artist_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String, index=True)
@@ -89,6 +95,9 @@ class Album(Base, TimestampMixin):
     """A curated collection of Recordings."""
 
     __tablename__ = "albums"
+    __table_args__ = (
+        Index("idx_album_title_artist", "title", "artist_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String, index=True)
@@ -112,6 +121,9 @@ class Recording(Base, TimestampMixin):
     """
 
     __tablename__ = "recordings"
+    __table_args__ = (
+        Index("idx_recording_work_title", "work_id", "title"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     work_id: Mapped[int] = mapped_column(ForeignKey("works.id"))
@@ -145,6 +157,7 @@ class LibraryFile(Base, TimestampMixin):
     path: Mapped[str] = mapped_column(String, unique=True, index=True)
     file_hash: Mapped[Optional[str]] = mapped_column(String, index=True)
     size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    mtime: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     format: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     bitrate: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 

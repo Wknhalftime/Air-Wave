@@ -36,10 +36,17 @@ class Normalizer:
 
     # Regex for common version/mix descriptors in parentheses or brackets
     # Note: Longer matches (e.g., "remastered") must come before shorter ones (e.g., "remaster")
+    # Includes format variants, edition types, years, and part numbers
     VERSION_REGEX = re.compile(
-        r"[\(\[]\s*(remastered|instrumental|unplugged|acoustic|explicit|"
+        r"[\(\[]\s*("
+        r"remastered?|instrumental|unplugged|acoustic|explicit|"
         r"lyrical|live|remix|mix|edit|version|demo|radio|clean|"
-        r"cover|remaster|track|fade|lyrics|dub|telethon|lv|original|alt).*?[\)\]]",
+        r"cover|track|fade|lyrics|dub|telethon|lv|original|alt|"
+        r"single|album|extended|short|mono|stereo|"
+        r"deluxe|bonus|anniversary|special|limited|"
+        r"\d{4}|"
+        r"pt\.?\s*\d+|part\s*\d+"
+        r").*?[\)\]]",
         re.IGNORECASE,
     )
 
@@ -88,50 +95,131 @@ class Normalizer:
             >>> Normalizer.remove_remaster_tags("Artist - Remaster 2020")
             'Artist '
         """
+        if not text:
+            return ""
         text = re.sub(r"\(.*remaster.*\)", "", text)
         text = re.sub(r" - remaster\s?\d*", "", text)
         return text
 
     @staticmethod
-    def clean(text: str) -> str:
-        """Basic text cleaning for titles and general text.
+    def remove_year_brackets(text: str) -> str:
+        """Remove year indicators in brackets/parentheses.
 
-        Performs unicode normalization, accent stripping, and punctuation
-        removal. This is the standard cleaning method for track titles.
+        Removes patterns like (2018), [1999], (2023 Remaster), etc.
 
         Args:
-            text: Raw text string to normalize.
+            text: Text potentially containing year brackets.
 
         Returns:
-            Normalized lowercase string with accents and punctuation removed.
-            Empty string if input is None or empty.
+            Text with year brackets removed.
 
         Example:
-            >>> Normalizer.clean("Café (Remastered 2023)")
-            'cafe'
+            >>> Normalizer.remove_year_brackets("Song Title (2018)")
+            'Song Title'
+            >>> Normalizer.remove_year_brackets("Song [1999 Remaster]")
+            'Song'
+        """
+        if not text:
+            return ""
+        # Standalone years: (2018), [1999]
+        text = re.sub(r"\s*[\(\[]\s*\d{4}\s*[\)\]]", "", text)
+        # Years with additional text: (2023 Remaster), [1999 Deluxe]
+        text = re.sub(r"\s*[\(\[]\s*\d{4}[^\)\]]*[\)\]]", "", text)
+        return text.strip()
+
+    @staticmethod
+    def remove_truncation_markers(text: str) -> str:
+        """Remove truncation indicators like (...) or [...].
+
+        Radio stations often truncate long titles with ellipsis markers.
+
+        Args:
+            text: Text potentially containing truncation markers.
+
+        Returns:
+            Text with truncation markers removed.
+
+        Example:
+            >>> Normalizer.remove_truncation_markers("Long Song Title (...)")
+            'Long Song Title'
+            >>> Normalizer.remove_truncation_markers("Artist Name [...]")
+            'Artist Name'
+        """
+        if not text:
+            return ""
+        # Bracketed ellipsis: (...), [...]
+        text = re.sub(r"\s*[\(\[]\s*\.{3,}\s*[\)\]]", "", text)
+        # Unicode ellipsis
+        text = text.replace("\u2026", "")
+        # Standalone ellipsis
+        text = re.sub(r"\s*\.{3,}\s*", " ", text)
+        return text.strip()
+
+    @staticmethod
+    def clean(text: str) -> str:
+        """Enhanced text cleaning for titles with comprehensive normalization.
+
+        Normalization steps:
+        1. Smart quote normalization (', ", ", ' → straight quotes)
+        2. Unicode NFKD normalization + accent stripping
+        3. Lowercase + trim
+        4. Remove remaster tags
+        5. Remove year brackets (2018), [1999]
+        6. Remove truncation markers (...), [...]
+        7. Remove feat. suffix (feat., ft., featuring, with)
+        8. Normalize special characters (&→and, +→and, /→space)
+        9. Remove all punctuation
+        10. Normalize whitespace
+
+        Args:
+            text: Raw text to normalize.
+
+        Returns:
+            Normalized text suitable for matching.
+
+        Example:
+            >>> Normalizer.clean("Song's Title (2018) feat. Artist")
+            'songs title'
             >>> Normalizer.clean("Rock & Roll!")
             'rock and roll'
-            >>> Normalizer.clean("AC/DC")
-            'ac dc'
         """
         if not text:
             return ""
 
-        # 1. Strip accents
+        # 1. Smart quote normalization (before accent stripping)
+        text = text.replace("\u2018", "'").replace("\u2019", "'")  # Smart single
+        text = text.replace("\u201c", '"').replace("\u201d", '"')  # Smart double
+
+        # 2. Strip accents
         text = Normalizer.strip_accents(text)
         text = text.lower().strip()
 
-        # 2. Remove remaster tags
+        # 3. Remove remaster tags
         text = Normalizer.remove_remaster_tags(text)
 
-        # 3. Normalize special characters
+        # 4. Remove year brackets
+        text = Normalizer.remove_year_brackets(text)
+
+        # 5. Remove truncation markers
+        text = Normalizer.remove_truncation_markers(text)
+
+        # 6. Remove feat. suffix from titles (optional space after keyword: "ft. X" or "ft.X")
+        text = re.sub(
+            r"\s+(feat\.?|ft\.?|f\.?|featuring|with)\s*.*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        # 7. Normalize special characters
         text = text.replace("&", "and")
         text = text.replace("+", "and")
         text = text.replace("/", " ")
 
-        # 4. Strip all non-word characters (except spaces)
+        # 8. Strip all non-word characters (except spaces)
         text = re.sub(r"[^\w\s]", "", text)
 
+        # 9. Normalize whitespace
         return re.sub(r"\s+", " ", text).strip()
 
     @staticmethod
@@ -193,20 +281,24 @@ class Normalizer:
         # 2. Remove remaster tags
         text = Normalizer.remove_remaster_tags(text)
 
-        # 3. Remove leading articles (The, A, An)
+        # 3. Remove year brackets and truncation (AC2: same as clean())
+        text = Normalizer.remove_year_brackets(text)
+        text = Normalizer.remove_truncation_markers(text)
+
+        # 4. Remove leading articles (The, A, An)
         text = re.sub(r"^(the|a|an)\s+", "", text)
 
-        # 4. Normalize special characters
+        # 5. Normalize special characters
         text = text.replace("&", "and")
         text = text.replace("+", "and")
         text = text.replace("/", " ")
-        # Note: Commas are removed in step 5 (punctuation removal)
+        # Note: Commas are removed in step 6 (punctuation removal)
         # This preserves numbers like "10,000" → "10000"
 
-        # 5. Remove all punctuation/symbols (but keep spaces)
+        # 6. Remove all punctuation/symbols (but keep spaces)
         text = re.sub(r"[^\w\s]", "", text)
 
-        # 6. Normalize spacing
+        # 7. Normalize spacing
         return re.sub(r"\s+", " ", text).strip()
 
     @staticmethod

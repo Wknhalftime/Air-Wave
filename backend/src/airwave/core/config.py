@@ -24,12 +24,17 @@ class Settings(BaseSettings):
 
     @property
     def DB_URL(self) -> str:
-        return f"sqlite+aiosqlite:///{self.DB_PATH}"
+        # Use forward slashes so Windows paths work in the URL (no backslash escapes)
+        path = self.DB_PATH.resolve().as_posix()
+        return f"sqlite+aiosqlite:///{path}"
 
     # Logging
     LOG_LEVEL: str = "INFO"
     LOG_RETENTION: str = "10 days"
     LOG_ROTATION: str = "10 MB"
+
+    # Performance & Debugging
+    DB_ECHO: bool = False  # Enable SQLAlchemy query logging (set to True for debugging)
 
     # Matching Thresholds
     MATCH_VARIANT_ARTIST_SCORE: float = 0.85

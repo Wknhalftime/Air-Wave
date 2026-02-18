@@ -98,3 +98,26 @@ async def test_get_station_health(async_client: AsyncClient, db_session: AsyncSe
     assert len(data["unmatched_tracks"]) == 1
     assert data["unmatched_tracks"][0]["artist"] == "Unmatched Artist"
     assert data["unmatched_tracks"][0]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_station_health_not_found(async_client: AsyncClient, db_session: AsyncSession):
+    """Station health for invalid id returns 404."""
+    response = await async_client.get("/api/v1/stations/99999/health")
+    assert response.status_code == 404
+    assert "Station not found" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_list_stations_empty_logs(async_client: AsyncClient, db_session: AsyncSession):
+    """Station with no logs has match_rate 0."""
+    station = Station(callsign="NOLOGS", frequency="88.0", city="Nowhere")
+    db_session.add(station)
+    await db_session.commit()
+    response = await async_client.get("/api/v1/stations/")
+    assert response.status_code == 200
+    data = response.json()
+    nologs = next(s for s in data if s["callsign"] == "NOLOGS")
+    assert nologs["total_logs"] == 0
+    assert nologs["matched_logs"] == 0
+    assert nologs["match_rate"] == 0.0

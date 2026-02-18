@@ -21,13 +21,14 @@ class ScanStats:
         skipped: Number of files skipped (already exist or invalid).
         errors: Number of files that failed to process.
         linked: Number of files linked to existing recordings (currently unused).
+        moved: Number of files detected as moved (path update, same content).
 
     Example:
         >>> stats = ScanStats()
         >>> stats.processed += 1
         >>> stats.created += 1
         >>> print(stats.to_dict())
-        {'processed': 1, 'created': 1, 'skipped': 0, 'errors': 0, 'linked': 0}
+        {'processed': 1, 'created': 1, 'skipped': 0, 'errors': 0, 'linked': 0, 'moved': 0}
     """
 
     processed: int = 0
@@ -35,6 +36,8 @@ class ScanStats:
     skipped: int = 0
     errors: int = 0
     linked: int = 0
+    moved: int = 0
+    cancelled: bool = False  # Set when user requests cancel; scanner exits after current batch
 
     def to_dict(self) -> dict:
         """Convert stats to dictionary for API responses.
@@ -48,6 +51,7 @@ class ScanStats:
             "skipped": self.skipped,
             "errors": self.errors,
             "linked": self.linked,
+            "moved": self.moved,
         }
 
     def __str__(self) -> str:
@@ -58,6 +62,6 @@ class ScanStats:
         """
         return (
             f"ScanStats(processed={self.processed}, created={self.created}, "
-            f"skipped={self.skipped}, errors={self.errors})"
+            f"skipped={self.skipped}, errors={self.errors}, moved={self.moved})"
         )
 
