@@ -28,8 +28,18 @@ try:
     from rich.table import Table
     from rich.progress import Progress, SpinnerColumn, TextColumn
 except ImportError:
-    print("Please install required packages: pip install aiohttp rich")
-    exit(1)
+    # Don't exit during pytest collection - this is a standalone script
+    import sys
+    if "pytest" not in sys.modules:
+        print("Please install required packages: pip install aiohttp rich")
+        sys.exit(1)
+    # During pytest collection, set these to None so the module can be imported
+    aiohttp = None
+    Console = None
+    Table = None
+    Progress = None
+    SpinnerColumn = None
+    TextColumn = None
 
 
 @dataclass
