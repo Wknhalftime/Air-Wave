@@ -165,9 +165,10 @@ class LibraryMetadata:
         # Immediate normalization for matching
         self.artist = Normalizer.clean_artist(raw_artist or "Unknown Artist")
 
-        # Version parsing extracts tags like "(Live)" or "[Remix]"
-        clean_title, version_type = Normalizer.extract_version_type(
-            raw_title or "Untitled"
+        # Enhanced version parsing extracts ALL tags and handles edge cases
+        clean_title, version_type = Normalizer.extract_version_type_enhanced(
+            raw_title or "Untitled",
+            album_title=album  # Pass album context for live detection
         )
 
         self.title = Normalizer.clean(clean_title)
@@ -408,12 +409,104 @@ class FileScanner:
 
         return artist
 
+    async def _find_similar_work(
+        self,
+        title: str,
+        artist_id: int,
+        similarity_threshold: float | None = None,
+    ) -> Work | None:
+        """Find existing work with similar title using fuzzy matching.
+
+        This is a safety net for cases where version extraction fails
+        and creates slightly different work titles.
+
+        Args:
+            title: Cleaned work title
+            artist_id: Primary artist ID
+            similarity_threshold: Minimum similarity ratio (default from config: 0.85)
+
+        Returns:
+            Existing work if found, None otherwise
+
+        Example:
+            # These would match (similarity > 0.85):
+            "song title" vs "song title " (extra space)
+            "song title" vs "song title the" (>85% similar)
+
+            # These would NOT match (similarity < 0.85):
+            "song title" vs "song title the ballad of love"
+            "song title" vs "different song"
+        """
+        import difflib
+        from sqlalchemy import func
+
+        from airwave.core.config import settings
+
+        # Use config default if not specified
+        if similarity_threshold is None:
+            similarity_threshold = getattr(
+                settings, "WORK_FUZZY_MATCH_THRESHOLD", 0.85
+            )
+
+        max_works = getattr(settings, "WORK_FUZZY_MATCH_MAX_WORKS", 500)
+
+        # PERFORMANCE SAFEGUARD: Check work count first
+        work_count_stmt = (
+            select(func.count()).select_from(Work).where(Work.artist_id == artist_id)
+        )
+        work_count_result = await self.session.execute(work_count_stmt)
+        work_count = work_count_result.scalar()
+
+        if work_count > max_works:
+            logger.debug(
+                f"Skipping fuzzy matching for artist_id={artist_id} "
+                f"(has {work_count} works, limit={max_works})"
+            )
+            return None
+
+        # OPTIMIZATION: Select only id and title columns (not full Work objects)
+        stmt = select(Work.id, Work.title).where(Work.artist_id == artist_id)
+        result = await self.session.execute(stmt)
+        work_tuples = result.all()
+
+        # Find best match using fuzzy string matching
+        best_match_id = None
+        best_ratio = 0.0
+
+        for work_id, work_title in work_tuples:
+            ratio = difflib.SequenceMatcher(None, title, work_title).ratio()
+
+            # OPTIMIZATION: Early termination on very high match
+            if ratio > 0.95:
+                logger.debug(
+                    f"Early termination: '{title}' → '{work_title}' (ratio={ratio:.3f})"
+                )
+                return await self.session.get(Work, work_id)
+
+            if ratio > best_ratio and ratio >= similarity_threshold:
+                best_ratio = ratio
+                best_match_id = work_id
+
+        if best_match_id:
+            best_match = await self.session.get(Work, best_match_id)
+            # ENHANCED LOGGING with structured data
+            logger.info(
+                f"Fuzzy matched work: '{title}' → '{best_match.title}' "
+                f"(similarity={best_ratio:.3f}, artist_id={artist_id}, "
+                f"works_compared={len(work_tuples)})"
+            )
+            return best_match
+
+        return None
+
     async def _upsert_work(self, title: str, artist_id: int) -> Work:
         """Atomically insert or get existing work using database UPSERT.
 
         Uses query-first-then-insert pattern with IntegrityError handling since Works
         don't have a unique constraint on (title, artist_id). This replaces the old
         _get_or_create_work() method which used batched inserts with manual caching.
+
+        Now includes fuzzy matching as a fallback to group similar work titles.
 
         Args:
             title: Work title (should be pre-cleaned)
@@ -422,16 +515,18 @@ class FileScanner:
         Returns:
             Work object with ID populated
         """
-        # Query first since there's no unique constraint on (title, artist_id)
-        stmt = select(Work).where(
-            Work.title == title,
-            Work.artist_id == artist_id
-        )
+        # FAST PATH: Try exact match first
+        stmt = select(Work).where(Work.title == title, Work.artist_id == artist_id)
         result = await self.session.execute(stmt)
         existing = result.scalar_one_or_none()
 
         if existing:
             return existing
+
+        # FUZZY MATCHING: Try to find similar work
+        similar_work = await self._find_similar_work(title, artist_id)
+        if similar_work:
+            return similar_work
 
         # Insert new work
         stmt = sqlite_insert(Work).values(
@@ -980,6 +1075,7 @@ class FileScanner:
         while True:
             stmt = (
                 select(LibraryFile.id, LibraryFile.path, LibraryFile.size, LibraryFile.mtime)
+                .order_by(LibraryFile.id)  # Ensure consistent ordering
                 .offset(offset)
                 .limit(chunk_size)
             )
@@ -1577,79 +1673,10 @@ class FileScanner:
 
         # Check if file is in path index
         if path_str not in self._path_index:
-            # Debug logging for path mismatches (can be removed after fixing)
-            if len(self._path_index) > 0:
-                # Check if a similar path exists (case-insensitive on Windows)
-                if sys.platform == "win32":
-                    similar_paths = [
-                        p for p in self._path_index.keys()
-                        if p.lower() == path_str.lower()
-                    ]
-                else:
-                    similar_paths = [
-                        p for p in self._path_index.keys()
-                        if p == path_str
-                    ]
-                if similar_paths:
-                    logger.warning(
-                        f"Path mismatch detected (case?): checking '{path_str}', "
-                        f"found similar '{similar_paths[0]}' in index"
-                    )
-            
-            # CRITICAL DEBUG: Check if file actually exists in database
-            # This helps identify if files are missing from path_index but exist in DB
-            # Limit to first 20 checks to avoid performance impact
-            if not hasattr(self, "_db_check_count"):
-                self._db_check_count = 0
-            
-            if self._db_check_count < 20:
-                self._db_check_count += 1
-                # We need to normalize database paths the same way as path_index loading
-                async with self._session_lock:
-                    # Query all files and normalize their paths to match path_str
-                    stmt = select(LibraryFile.id, LibraryFile.path, LibraryFile.size, LibraryFile.mtime)
-                    res = await self.session.execute(stmt)
-                    found_match = False
-                    for row in res.all():
-                        # Normalize database path the same way as path_index loading
-                        try:
-                            db_resolved = Path(row.path).resolve().as_posix()
-                        except (OSError, ValueError):
-                            db_resolved = row.path.replace("\\", "/")
-                        
-                        if sys.platform == "win32":
-                            db_normalized = db_resolved.lower()
-                        else:
-                            db_normalized = db_resolved
-                        
-                        # If normalized paths match, file exists in DB but wasn't in path_index
-                        if db_normalized == path_str:
-                            logger.warning(
-                                f"BUG: File exists in database but not in path_index! "
-                                f"Path: {path_str}, DB ID: {row.id}, "
-                                f"DB Path (raw): {row.path}, "
-                                f"Size: {row.size}, Mtime: {row.mtime}"
-                            )
-                            # Add to path_index immediately to prevent duplicate creation
-                            self._path_index[path_str] = {
-                                "id": row.id,
-                                "size": row.size,
-                                "mtime": row.mtime,
-                            }
-                            # File exists, skip processing
-                            async with self._processing_lock:
-                                stats.skipped += 1
-                                stats.processed += 1
-                            await self._add_touch_id(row.id)
-                            found_match = True
-                            return (True, stat)  # Skip file
-                    
-                    if not found_match:
-                        logger.debug(
-                            f"File not in path_index and not found in database (check #{self._db_check_count}): {path_str}"
-                        )
-            
-            # Debug: Log which files are detected as new
+            # File not in path_index - it's a new file that needs processing
+            # Note: During parallel processing, files created by other tasks might not be
+            # in _path_index yet, but they will be handled by IntegrityError handling
+            # in _create_library_file, so we don't need to query the database here.
             logger.debug(
                 f"File not in path_index (will be created): {path_str} "
                 f"(path_index size: {len(self._path_index)})"

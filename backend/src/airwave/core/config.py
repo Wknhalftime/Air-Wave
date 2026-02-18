@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # Matching Thresholds
     MATCH_VARIANT_ARTIST_SCORE: float = 0.85
     MATCH_VARIANT_TITLE_SCORE: float = 0.80
-    
+
     MATCH_ALIAS_ARTIST_SCORE: float = 0.70    # For Review
     MATCH_ALIAS_TITLE_SCORE: float = 0.70     # For Review
 
@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     MATCH_TITLE_VECTOR_TITLE: float = 0.9
     MATCH_TITLE_VECTOR_DIST: float = 0.3
     MATCH_VECTOR_TITLE_GUARD: float = 0.5
+
+    # Work-Recording Grouping Configuration
+    WORK_FUZZY_MATCH_THRESHOLD: float = 0.85  # Aligned with artist matching
+    WORK_FUZZY_MATCH_MAX_WORKS: int = 500     # Skip fuzzy matching for large catalogs
 
     # External APIs
     ACOUSTID_API_KEY: str = ""

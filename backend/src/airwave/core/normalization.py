@@ -399,3 +399,124 @@ class Normalizer:
             return clean_title, version_type
 
         return title, "Original"
+
+    @staticmethod
+    def extract_version_type_enhanced(
+        title: str, album_title: str | None = None
+    ) -> tuple[str, str]:
+        """Enhanced version extraction with multiple strategies and negative patterns.
+
+        Improvements over extract_version_type():
+        - Extracts ALL version tags, not just first
+        - Handles dash-separated versions ("Song - Live Version")
+        - Uses album context for live detection (conservative)
+        - Classifies ambiguous parentheses using heuristics
+        - Negative patterns for part numbers and subtitles
+
+        Args:
+            title: Raw track title potentially containing version tags
+            album_title: Optional album title for context-based detection
+
+        Returns:
+            Tuple of (clean_title, version_type).
+            version_type can be combined (e.g., "Live / Radio Edit")
+
+        Examples:
+            >>> Normalizer.extract_version_type_enhanced("Song (Live) (Radio Edit)")
+            ('Song', 'Live / Radio')
+
+            >>> Normalizer.extract_version_type_enhanced("Song - Live Version")
+            ('Song', 'Live')
+
+            >>> Normalizer.extract_version_type_enhanced("Song (Part 1)")
+            ('Song (Part 1)', 'Original')  # Part numbers NOT extracted
+
+            >>> Normalizer.extract_version_type_enhanced("Song (The Ballad)")
+            ('Song (The Ballad)', 'Original')  # Subtitles NOT extracted
+
+            >>> Normalizer.extract_version_type_enhanced("Song", album_title="Live at Wembley")
+            ('Song', 'Live')  # Album context used
+        """
+        if not title:
+            return "", "Original"
+
+        version_parts = []
+        clean_title = title
+
+        # Strategy 1: Extract parentheses/brackets with version keywords
+        # BUT check negative patterns first to avoid extracting part numbers/subtitles
+        matches = list(Normalizer.VERSION_REGEX.finditer(title))
+        for match in matches:
+            paren_content = match.group(1)
+            paren_lower = paren_content.lower()
+            words = paren_content.split()
+
+            # NEGATIVE PATTERN 1: Skip part numbers (different works, not versions)
+            if re.search(r"\b(part|pt\.?)\s*\d+\b", paren_lower):
+                continue
+
+            # NEGATIVE PATTERN 2: Skip subtitles starting with "The"
+            if paren_lower.startswith("the ") and len(words) > 2:
+                continue
+
+            # Extract this version tag
+            version_parts.append(paren_content.title())
+            clean_title = clean_title.replace(match.group(0), "")
+
+        # Strategy 2: Check for dash-separated versions
+        # "Song Title - Live Version" or "Song Title - Radio Edit"
+        dash_pattern = r"\s+-\s+(live|remix|mix|edit|version|demo|radio|acoustic|unplugged)\b.*$"
+        dash_match = re.search(dash_pattern, clean_title, re.IGNORECASE)
+        if dash_match:
+            version_parts.append(dash_match.group(1).title())
+            clean_title = re.sub(dash_pattern, "", clean_title, flags=re.IGNORECASE)
+
+        # Strategy 3: Album context heuristics (conservative)
+        # Only apply if no version info already extracted
+        if album_title and not version_parts:
+            album_lower = album_title.lower()
+            live_keywords = ["live", "concert", "unplugged", "acoustic session"]
+            if any(keyword in album_lower for keyword in live_keywords):
+                version_parts.append("Live")
+
+        # Strategy 4: Handle remaining parentheses with negative patterns
+        remaining_parens = re.findall(r"[\(\[]([^\)\]]+)[\)\]]", clean_title)
+        for paren_content in remaining_parens:
+            words = paren_content.split()
+            paren_lower = paren_content.lower()
+
+            # NEGATIVE PATTERN 1: Skip part numbers (different works, not versions)
+            if re.search(r"\b(part|pt\.?)\s*\d+\b", paren_lower):
+                continue
+
+            # NEGATIVE PATTERN 2: Skip subtitles starting with "The"
+            if paren_lower.startswith("the ") and len(words) > 2:
+                continue
+
+            # Extract if short and contains version keywords
+            if len(words) <= 3 and any(
+                word in paren_lower
+                for word in ["edit", "mix", "version", "cut", "take", "session"]
+            ):
+                version_parts.append(paren_content.title())
+                clean_title = clean_title.replace(f"({paren_content})", "")
+                clean_title = clean_title.replace(f"[{paren_content}]", "")
+
+        # Clean up the title
+        clean_title = re.sub(r"\s*[\(\[]\s*[\)\]]", "", clean_title)  # Empty brackets
+        clean_title = re.sub(r"\s+", " ", clean_title).strip()
+
+        # Combine version parts
+        if version_parts:
+            # Deduplicate while preserving order
+            seen = set()
+            unique_parts = []
+            for part in version_parts:
+                if part.lower() not in seen:
+                    unique_parts.append(part)
+                    seen.add(part.lower())
+            version_type = " / ".join(unique_parts)
+        else:
+            version_type = "Original"
+
+        return clean_title, version_type

@@ -130,3 +130,92 @@ def test_extract_version_type_enhanced():
     # Backward compatibility
     assert Normalizer.extract_version_type("Song Title (Live)") == ("Song Title", "Live")
     assert Normalizer.extract_version_type("Song Title [Remix]") == ("Song Title", "Remix")
+
+
+# --- Tests for extract_version_type_enhanced() ---
+
+
+def test_extract_version_type_enhanced_multiple_tags():
+    """Test extraction of multiple version tags."""
+    clean, version = Normalizer.extract_version_type_enhanced("Song (Live) (Radio Edit)")
+    assert clean == "Song"
+    assert "Live" in version
+    assert "Radio" in version or "Edit" in version
+
+
+def test_extract_version_type_enhanced_dash_separated():
+    """Test extraction of dash-separated versions."""
+    assert Normalizer.extract_version_type_enhanced("Song - Live Version") == ("Song", "Live")
+    assert Normalizer.extract_version_type_enhanced("Song - Radio Edit") == ("Song", "Radio")
+    assert Normalizer.extract_version_type_enhanced("Song - Acoustic Mix") == ("Song", "Acoustic")
+
+
+def test_extract_version_type_enhanced_part_numbers_not_extracted():
+    """Test that part numbers are NOT extracted as versions (negative pattern)."""
+    # Part numbers should remain in title
+    clean, version = Normalizer.extract_version_type_enhanced("Song (Part 1)")
+    assert "Part 1" in clean or "part 1" in clean.lower()
+    assert version == "Original"
+
+    clean, version = Normalizer.extract_version_type_enhanced("Symphony (Pt. 2)")
+    assert "Pt. 2" in clean or "pt. 2" in clean.lower()
+    assert version == "Original"
+
+
+def test_extract_version_type_enhanced_subtitles_not_extracted():
+    """Test that subtitles starting with 'The' are NOT extracted (negative pattern)."""
+    # Subtitles should remain in title
+    clean, version = Normalizer.extract_version_type_enhanced("Song (The Ballad)")
+    assert "The Ballad" in clean or "the ballad" in clean.lower()
+    assert version == "Original"
+
+    clean, version = Normalizer.extract_version_type_enhanced("Song (The Final Chapter)")
+    assert "The Final Chapter" in clean or "the final chapter" in clean.lower()
+    assert version == "Original"
+
+
+def test_extract_version_type_enhanced_album_context():
+    """Test album context for live detection."""
+    # With live album context
+    clean, version = Normalizer.extract_version_type_enhanced(
+        "Song Title", album_title="Live at Wembley"
+    )
+    assert clean == "Song Title"
+    assert version == "Live"
+
+    # Album context only used if no version already extracted
+    clean, version = Normalizer.extract_version_type_enhanced(
+        "Song (Remix)", album_title="Live at Wembley"
+    )
+    assert clean == "Song"
+    assert version == "Remix"  # Should NOT add "Live"
+
+
+def test_extract_version_type_enhanced_ambiguous_parentheses():
+    """Test handling of ambiguous parentheses with version keywords."""
+    # Short phrases with version keywords should be extracted
+    clean, version = Normalizer.extract_version_type_enhanced("Song (Radio Edit)")
+    assert clean == "Song"
+    assert "Radio" in version or "Edit" in version
+
+    # Longer phrases without version keywords should remain
+    clean, version = Normalizer.extract_version_type_enhanced("Song (From the Album)")
+    assert "From the Album" in clean or "from the album" in clean.lower()
+    assert version == "Original"
+
+
+def test_extract_version_type_enhanced_deduplication():
+    """Test that duplicate version tags are deduplicated."""
+    clean, version = Normalizer.extract_version_type_enhanced("Song (Live) - Live Version")
+    assert clean == "Song"
+    # Should only have "Live" once
+    assert version.lower().count("live") == 1
+
+
+def test_extract_version_type_enhanced_backward_compatibility():
+    """Test backward compatibility with original extract_version_type()."""
+    # Basic cases should work the same
+    assert Normalizer.extract_version_type_enhanced("Song (Live)") == ("Song", "Live")
+    assert Normalizer.extract_version_type_enhanced("Song [Remix]") == ("Song", "Remix")
+    assert Normalizer.extract_version_type_enhanced("Song Title") == ("Song Title", "Original")
+    assert Normalizer.extract_version_type_enhanced("") == ("", "Original")
