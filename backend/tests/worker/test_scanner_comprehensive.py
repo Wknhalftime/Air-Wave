@@ -110,6 +110,8 @@ class TestFileScanner:
 
         assert artist.name == "nirvana"
         assert artist.id is not None
+        # display_name fallback: set to name during creation (see artist-display-names.md)
+        assert artist.display_name == "nirvana"
 
     @pytest.mark.asyncio
     async def test_upsert_artist_existing(self, db_session):
@@ -189,8 +191,8 @@ class TestFileScanner:
         assert recording.isrc == "USEE10001993"
 
     @pytest.mark.asyncio
-    async def test_upsert_recording_existing(self, db_session):
-        """Test retrieving an existing recording using UPSERT."""
+    async def test_upsert_recording_always_creates_new(self, db_session):
+        """Test that _upsert_recording always creates new recording (no deduplication)."""
         # Create hierarchy
         artist = Artist(name="acdc")
         db_session.add(artist)
@@ -211,12 +213,15 @@ class TestFileScanner:
             work.id, "back in black", "Original"
         )
 
-        assert recording.id == existing_rec.id
+        # Should create NEW recording (not return existing one)
+        assert recording.id != existing_rec.id
+        assert recording.work_id == work.id
+        assert recording.title == "back in black"
 
     @pytest.mark.asyncio
-    async def test_upsert_recording_idempotent(self, db_session):
-        """Test that UPSERT is idempotent - calling twice returns same recording."""
-        # Create recording without ISRC
+    async def test_upsert_recording_creates_new_each_time(self, db_session):
+        """Test that _upsert_recording always creates a new recording (1:1 with files)."""
+        # Create artist and work
         artist = Artist(name="led zeppelin")
         db_session.add(artist)
         await db_session.flush()
@@ -225,21 +230,26 @@ class TestFileScanner:
         db_session.add(work)
         await db_session.flush()
 
-        existing_rec = Recording(
-            work_id=work.id, title="stairway to heaven", version_type="Original"
-        )
-        db_session.add(existing_rec)
-        await db_session.flush()
-
-        assert existing_rec.isrc is None
-
+        # Create first recording
         scanner = FileScanner(db_session)
-        recording = await scanner._upsert_recording(
-            work.id, "stairway to heaven", "Original", isrc="USLED7100123"
+        recording1 = await scanner._upsert_recording(
+            work.id, "stairway to heaven", "Original", duration=482.0, isrc="USLED7100123"
         )
 
-        # UPSERT doesn't update ISRC on existing recordings - it just returns the existing one
-        assert recording.id == existing_rec.id
+        assert recording1.work_id == work.id
+        assert recording1.title == "stairway to heaven"
+        assert recording1.version_type == "Original"
+        assert recording1.isrc == "USLED7100123"
+
+        # Create second recording with same metadata - should create NEW recording (not return existing)
+        recording2 = await scanner._upsert_recording(
+            work.id, "stairway to heaven", "Original", duration=482.0, isrc="USLED7100123"
+        )
+
+        # Should be different recordings (1:1 relationship with files)
+        assert recording2.id != recording1.id
+        assert recording2.work_id == work.id
+        assert recording2.title == "stairway to heaven"
 
     @pytest.mark.asyncio
     async def test_process_file_skips_existing(self, db_session):
@@ -395,7 +405,7 @@ class TestFileScanner:
 
     @pytest.mark.asyncio
     async def test_touch_updates_updated_at_for_unchanged_file(
-        self, db_session
+        self, db_session, tmp_path
     ):
         """TOUCH path: unchanged file (size+mtime match) gets updated_at batch-updated after _flush_touch."""
         artist = Artist(name="touch artist")
@@ -409,14 +419,18 @@ class TestFileScanner:
         )
         db_session.add(recording)
         await db_session.flush()
-        touch_path = Path("/music/touch song.mp3")
-        # Normalize path to forward slashes for cross-platform compatibility
-        path_str = str(touch_path).replace("\\", "/")
+        # Use a real temp file so stat() and path resolution work on all platforms
+        touch_path = tmp_path / "touch song.mp3"
+        touch_path.touch()
+        path_str = touch_path.resolve().as_posix()
+        if sys.platform == "win32":
+            path_str = path_str.lower()
+        stat_result = touch_path.stat()
         lib_file = LibraryFile(
             recording_id=recording.id,
             path=path_str,
-            size=1024,
-            mtime=11111.0,
+            size=stat_result.st_size,
+            mtime=float(stat_result.st_mtime),
             format="mp3",
         )
         db_session.add(lib_file)
@@ -424,12 +438,11 @@ class TestFileScanner:
         old_updated = lib_file.updated_at
 
         scanner = FileScanner(db_session)
-        # Path index uses forward slashes for cross-platform compatibility
         scanner._path_index = {
             path_str: {
                 "id": lib_file.id,
-                "size": 1024,
-                "mtime": 11111.0,
+                "size": stat_result.st_size,
+                "mtime": stat_result.st_mtime,
             }
         }
         scanner._path_index_seen = set()
@@ -437,9 +450,7 @@ class TestFileScanner:
         scanner._missing_candidates = None
         stats = ScanStats()
 
-        mock_stat = MagicMock(st_size=1024, st_mtime=11111.0)
-        with patch.object(Path, "stat", return_value=mock_stat):
-            await scanner.process_file(touch_path, stats)
+        await scanner.process_file(touch_path, stats)
 
         assert stats.skipped == 1
         assert len(scanner._touch_ids) == 1

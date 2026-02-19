@@ -204,8 +204,12 @@ class Normalizer:
         text = Normalizer.remove_truncation_markers(text)
 
         # 6. Remove feat. suffix from titles (optional space after keyword: "ft. X" or "ft.X")
+        # IMPORTANT: Use word boundaries (\b) to avoid matching partial words
+        # e.g., "f." should not match "fire", "feat" should not match "feature"
+        # NOTE: "with" is NOT included because it appears in many legitimate song titles
+        # (e.g., "Fight Fire with Fire", "With or Without You", "Dancing with Myself")
         text = re.sub(
-            r"\s+(feat\.?|ft\.?|f\.?|featuring|with)\s*.*$",
+            r"\s+\b(feat\.?|ft\.?|f\.?|featuring)\b\s*.*$",
             "",
             text,
             flags=re.IGNORECASE,
@@ -213,7 +217,7 @@ class Normalizer:
 
         # 7. Normalize special characters
         text = text.replace("&", "and")
-        text = text.replace("+", "and")
+        text = text.replace("+", "plus")
         text = text.replace("/", " ")
 
         # 8. Strip all non-word characters (except spaces)
@@ -288,17 +292,66 @@ class Normalizer:
         # 4. Remove leading articles (The, A, An)
         text = re.sub(r"^(the|a|an)\s+", "", text)
 
-        # 5. Normalize special characters
+        # 5. Remove collaboration keyword suffixes (duet, feat., ft., featuring, vs.) and anything after
+        # Use \b before and (?!\w) after (not \b after, since punctuation e.g. "feat." breaks \b)
+        # Require period for feat/ft to avoid stripping "Little Feat" (band name)
+        text = re.sub(
+            r"\s+\b(duet|feat\.|ft\.|f\.|featuring|vs\.?)(?!\w)\s*.*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        # 6. Normalize special characters
         text = text.replace("&", "and")
-        text = text.replace("+", "and")
+        text = text.replace("+", "plus")
         text = text.replace("/", " ")
-        # Note: Commas are removed in step 6 (punctuation removal)
+        # Note: Commas are removed in step 7 (punctuation removal)
         # This preserves numbers like "10,000" → "10000"
 
-        # 6. Remove all punctuation/symbols (but keep spaces)
+        # 7. Remove all punctuation/symbols (but keep spaces)
         text = re.sub(r"[^\w\s]", "", text)
 
-        # 7. Normalize spacing
+        # 8. Normalize spacing
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def normalize_artist_full(text: str) -> str:
+        """Normalize artist name preserving collaboration strings for Work primary.
+
+        Same as clean_artist but does NOT strip feat./duet/etc and what follows.
+        Used for Work.artist_id so "Daft Punk feat. Pharrell Williams" becomes
+        "daft punk feat pharrell williams" (one artist), while split_artists
+        still extracts individual artists for WorkArtist links.
+        """
+        if not text:
+            return ""
+
+        # 1. Strip accents
+        text = Normalizer.strip_accents(text)
+        text = text.lower().strip()
+
+        # 2. Remove remaster tags
+        text = Normalizer.remove_remaster_tags(text)
+
+        # 3. Remove year brackets and truncation
+        text = Normalizer.remove_year_brackets(text)
+        text = Normalizer.remove_truncation_markers(text)
+
+        # 4. Remove leading articles
+        text = re.sub(r"^(the|a|an)\s+", "", text)
+
+        # 5. NO collaboration strip - preserve full string
+
+        # 6. Normalize special characters
+        text = text.replace("&", "and")
+        text = text.replace("+", "plus")
+        text = text.replace("/", " ")
+
+        # 7. Remove all punctuation/symbols (feat. -> feat)
+        text = re.sub(r"[^\w\s]", "", text)
+
+        # 8. Normalize spacing
         return re.sub(r"\s+", " ", text).strip()
 
     @staticmethod
@@ -326,15 +379,22 @@ class Normalizer:
         if not text:
             return []
 
-        # Standardize separators to a pipe for easier splitting
+        # Standardize separators to a pipe for easier splitting.
+        # Longer patterns first. F/ and W/ must precede generic / for "KORN F/SKRILLEX".
         separators = [
             r"\s+feat\.?\s+",
             r"\s+ft\.?\s+",
             r"\s+featuring\s+",
+            r"\s+duet\s+with\s+",  # "Artist A duet with Artist B"
+            r"\s+duet\s+",  # "2pac duet" or "Artist A duet Artist B"
+            r"\s+vs\.?\s+",  # "Artist A vs Artist B"
             r"\s+with\s+",
+            r"\s+F/\s*",  # Featuring shorthand, e.g. "KORN F/SKRILLEX"
+            r"\s+W/\s*",  # With shorthand
             r"\s+&\s+",
             r"\s+/\s+",
-            r",\s+",
+            # Comma: split "A, B" and "Smith, John" but NOT "10,000" (thousands separator)
+            r"(?<!\d),\s*(?!\d)",
             r"\s+and\s+",
         ]
 

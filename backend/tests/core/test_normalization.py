@@ -28,7 +28,7 @@ def test_clean_artist_cases():
         ("Panic! At The Disco", "panic at the disco"),
         ("R.E.M.", "rem"),
         ("Jay-Z", "jayz"),
-        ("Florence + The Machine", "florence and the machine"),
+        ("Florence + The Machine", "florence plus the machine"),
     ]
 
     for input_str, expected in cases:
@@ -83,6 +83,40 @@ def test_split_artists():
     assert Normalizer.split_artists("Artist A / Artist B") == ["artist a", "artist b"]
 
 
+def test_split_artists_preserves_numeric_commas():
+    """Commas in numbers (e.g. 10,000) must NOT split - they are thousands separators."""
+    # 10,000 Maniacs should remain a single artist
+    assert Normalizer.split_artists("10,000 Maniacs") == ["10000 maniacs"]
+    assert Normalizer.split_artists("1,000 Clowns") == ["1000 clowns"]
+    # Regular comma separators should still split
+    assert Normalizer.split_artists("Artist A, Artist B") == ["artist a", "artist b"]
+
+
+def test_split_artists_removes_duet_and_vs():
+    """Collaboration keywords (duet, vs) must be used as separators and removed from results."""
+    # "2pac duet" with nothing after -> single artist "2pac"
+    assert Normalizer.split_artists("2pac duet") == ["2pac"]
+    assert Normalizer.split_artists("2Pac Duet") == ["2pac"]
+    # "Artist A duet Artist B" -> split and remove keyword
+    assert Normalizer.split_artists("2pac duet Dr. Dre") == ["2pac", "dr dre"]
+    # "Artist A vs Artist B"
+    assert Normalizer.split_artists("Artist A vs Artist B") == ["artist a", "artist b"]
+    assert Normalizer.split_artists("Artist A vs. Artist B") == ["artist a", "artist b"]
+
+
+def test_clean_artist_removes_collaboration_keywords():
+    """clean_artist must strip trailing collaboration keywords (duet, feat., vs, etc.)."""
+    assert Normalizer.clean_artist("2pac duet") == "2pac"
+    assert Normalizer.clean_artist("2Pac Duet") == "2pac"
+    assert Normalizer.clean_artist("Artist feat. Someone") == "artist"
+    assert Normalizer.clean_artist("Artist ft. X") == "artist"
+    assert Normalizer.clean_artist("Artist vs Other") == "artist"
+    # Word boundaries: "Feature" in band names should NOT be removed
+    assert Normalizer.clean_artist("Feature Artist") == "feature artist"
+    # "Little Feat" is a band name - feat without period must NOT be stripped
+    assert Normalizer.clean_artist("Little Feat") == "little feat"
+
+
 # --- Task 5: Comprehensive tests for enhanced normalization ---
 
 
@@ -113,11 +147,38 @@ def test_clean_removes_feat_suffix():
     assert Normalizer.clean("Song Title feat. Artist B") == "song title"
     assert Normalizer.clean("Song ft. Someone") == "song"
     assert Normalizer.clean("Song featuring Artist") == "song"
-    assert Normalizer.clean("Song with Guest") == "song"
     assert Normalizer.clean("Song FEAT. Artist") == "song"
     assert Normalizer.clean("Song Title") == "song title"
     # No space after ft. (optional space in regex)
     assert Normalizer.clean("Song ft.Someone") == "song"
+
+
+def test_clean_preserves_titles_with_common_words():
+    """Test that clean() does NOT remove common words that appear in legitimate titles.
+
+    Regression test for bug where 'with', 'f', etc. were being removed from titles.
+    These words appear in many legitimate song titles and should be preserved.
+
+    Bug examples:
+    - "All Within My Hands" was truncated to "all" (matched "with" in "within")
+    - "Fight Fire with Fire" was truncated to "fight" (matched "f" in "fire")
+    - "The Four Horsemen" was truncated to "the" (matched "f" in "four")
+    """
+    # Test cases from the bug report
+    assert Normalizer.clean("All Within My Hands") == "all within my hands"
+    assert Normalizer.clean("Fight Fire with Fire") == "fight fire with fire"
+    assert Normalizer.clean("The Four Horsemen") == "the four horsemen"
+    assert Normalizer.clean("The Frayed Ends of Sanity") == "the frayed ends of sanity"
+
+    # Other common titles with "with"
+    assert Normalizer.clean("With or Without You") == "with or without you"
+    assert Normalizer.clean("Dancing with Myself") == "dancing with myself"
+    assert Normalizer.clean("Killing Me Softly with His Song") == "killing me softly with his song"
+
+    # Titles starting with "f" should not be truncated
+    assert Normalizer.clean("Fire and Rain") == "fire and rain"
+    assert Normalizer.clean("Forever Young") == "forever young"
+    assert Normalizer.clean("Fortunate Son") == "fortunate son"
 
 
 def test_extract_version_type_enhanced():

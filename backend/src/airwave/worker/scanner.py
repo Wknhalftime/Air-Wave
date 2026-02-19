@@ -162,13 +162,13 @@ class LibraryMetadata:
         self.raw_artist = raw_artist
         self.raw_title = raw_title
 
-        # Immediate normalization for matching
-        self.artist = Normalizer.clean_artist(raw_artist or "Unknown Artist")
+        # Normalization for Work primary: preserve full collab string (e.g. "daft punk feat pharrell williams")
+        self.artist = Normalizer.normalize_artist_full(raw_artist or "Unknown Artist")
 
         # Enhanced version parsing extracts ALL tags and handles edge cases
         clean_title, version_type = Normalizer.extract_version_type_enhanced(
             raw_title or "Untitled",
-            album_title=album  # Pass album context for live detection
+            album_title=album_title  # Pass album context for live detection
         )
 
         self.title = Normalizer.clean(clean_title)
@@ -373,10 +373,14 @@ class FileScanner:
         if not name:
             name = "unknown artist"
 
+        # Set display_name to name as fallback (will be updated by backfill script if MBID exists)
+        display_name = name
+
         # Build UPSERT statement
         stmt = sqlite_insert(Artist).values(
             name=name,
             musicbrainz_id=mbid,
+            display_name=display_name,
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
         )
@@ -392,10 +396,14 @@ class FileScanner:
                 where=Artist.musicbrainz_id.is_(None),
             )
         else:
-            # Just update the timestamp
+            # Just update the timestamp and display_name if NULL
             stmt = stmt.on_conflict_do_update(
                 index_elements=[Artist.name],
-                set_=dict(updated_at=datetime.now(timezone.utc)),
+                set_=dict(
+                    display_name=display_name,
+                    updated_at=datetime.now(timezone.utc),
+                ),
+                where=Artist.display_name.is_(None),
             )
 
         # Execute the UPSERT
@@ -408,6 +416,211 @@ class FileScanner:
         artist = result.scalar_one()
 
         return artist
+
+    async def update_artist_display_names_from_musicbrainz(
+        self, batch_size: int = 50, limit: Optional[int] = None
+    ) -> Dict[str, int]:
+        """Batch-update display_name for artists with MusicBrainz IDs.
+
+        This method fetches canonical artist names from MusicBrainz API and updates
+        the display_name field for artists that have MBIDs but no display_name set.
+
+        Args:
+            batch_size: Number of artists to process per MusicBrainz API batch
+            limit: Optional limit on total number of artists to process
+
+        Returns:
+            Dictionary with statistics: {"updated": count, "failed": count, "skipped": count}
+        """
+        from airwave.worker.musicbrainz_client import MusicBrainzClient
+
+        stats = {"updated": 0, "failed": 0, "skipped": 0}
+
+        # Find artists with MBID but no display_name
+        stmt = select(Artist).where(
+            and_(
+                Artist.musicbrainz_id.isnot(None),
+                or_(
+                    Artist.display_name.is_(None),
+                    Artist.display_name == Artist.name  # Also update if display_name == name
+                )
+            )
+        )
+
+        if limit:
+            stmt = stmt.limit(limit)
+
+        result = await self.session.execute(stmt)
+        artists = result.scalars().all()
+
+        if not artists:
+            logger.info("No artists found that need display_name updates")
+            return stats
+
+        logger.info(
+            f"Found {len(artists)} artists with MBIDs that need display_name updates"
+        )
+
+        # Extract MBIDs and create mapping
+        mbid_to_artist: Dict[str, Artist] = {}
+        mbids: List[str] = []
+
+        for artist in artists:
+            if artist.musicbrainz_id:
+                mbids.append(artist.musicbrainz_id)
+                mbid_to_artist[artist.musicbrainz_id] = artist
+
+        # Fetch canonical names from MusicBrainz
+        client = MusicBrainzClient()
+        try:
+            mbid_to_name = await client.fetch_artist_names_batch(
+                mbids, batch_size=batch_size
+            )
+
+            # Update artists with fetched names
+            for mbid, canonical_name in mbid_to_name.items():
+                artist = mbid_to_artist.get(mbid)
+                if not artist:
+                    continue
+
+                if canonical_name:
+                    artist.display_name = canonical_name
+                    artist.updated_at = datetime.now(timezone.utc)
+                    stats["updated"] += 1
+                    logger.debug(
+                        f"Updated display_name for artist {artist.name}: "
+                        f"{canonical_name}"
+                    )
+                else:
+                    # Keep the normalized name as fallback
+                    if not artist.display_name or artist.display_name == artist.name:
+                        artist.display_name = artist.name
+                    stats["failed"] += 1
+                    logger.warning(
+                        f"Failed to fetch display_name for artist {artist.name} "
+                        f"(MBID: {mbid})"
+                    )
+
+            # Commit changes
+            await self.session.commit()
+
+            logger.info(
+                f"Display name update complete: {stats['updated']} updated, "
+                f"{stats['failed']} failed"
+            )
+
+        finally:
+            await client.close()
+
+        return stats
+
+    @staticmethod
+    def _extract_part_number(title: str) -> Optional[Tuple[str, int]]:
+        """Extract part/movement number from title if present.
+
+        Supports multiple formats:
+        - "Part 1", "Pt. 2", "Part 3"
+        - "Movement 1", "Mvt. 2", "Mov. 3"
+        - "No. 1", "Number 2"
+        - "I", "II", "III" (Roman numerals 1-10)
+
+        Args:
+            title: Work title to check
+
+        Returns:
+            Tuple of (part_type, part_number) if found, None otherwise
+            part_type: "part", "movement", "number", or "roman"
+            part_number: Integer (1-10 for roman numerals)
+        """
+        import re
+
+        title_lower = title.lower()
+
+        # Pattern 1: Part/Pt. followed by number
+        match = re.search(r'\b(part|pt\.?)\s*(\d+)\b', title_lower)
+        if match:
+            return ("part", int(match.group(2)))
+
+        # Pattern 2: Movement/Mvt./Mov. followed by number
+        match = re.search(r'\b(movement|mvt\.?|mov\.?)\s*(\d+)\b', title_lower)
+        if match:
+            return ("movement", int(match.group(2)))
+
+        # Pattern 3: No./Number followed by number
+        match = re.search(r'\b(no\.?|number)\s*(\d+)\b', title_lower)
+        if match:
+            return ("number", int(match.group(2)))
+
+        # Pattern 4: Roman numerals (I-X, case-insensitive)
+        # Match roman numerals but be very careful with single "I" (pronoun)
+        roman_map = {
+            'i': 1, 'ii': 2, 'iii': 3, 'iv': 4, 'v': 5,
+            'vi': 6, 'vii': 7, 'viii': 8, 'ix': 9, 'x': 10
+        }
+        # Look for standalone roman numerals (word boundaries)
+        # For single "I", only match if it's at the END or after specific keywords
+        match = re.search(r'\b([ivx]+)\b', title_lower)
+        if match:
+            roman = match.group(1).lower()
+            if roman in roman_map:
+                # For single "i", apply strict rules to avoid pronoun false positives
+                if roman == 'i':
+                    match_start = match.start()
+                    match_end = match.end()
+
+                    # Rule 1: "I" at the beginning is always a pronoun
+                    if match_start == 0:
+                        return None
+
+                    # Rule 2: "I" in the middle (not at end) is likely a pronoun
+                    # Only allow if at the very end of the string or followed by punctuation/parenthesis
+                    if match_end < len(title_lower):
+                        next_char = title_lower[match_end]
+                        # Allow if followed by space then punctuation/end, or direct punctuation
+                        if next_char not in ' ()[].,;:-':
+                            return None
+                        # If followed by space, check what comes after
+                        if next_char == ' ' and match_end + 1 < len(title_lower):
+                            char_after_space = title_lower[match_end + 1]
+                            # If followed by space then letter, it's likely "I <verb>"
+                            if char_after_space.isalpha():
+                                return None
+
+                return ("roman", roman_map[roman])
+
+        return None
+
+    def _parts_differ(self, title1: str, title2: str) -> bool:
+        """Check if two titles have different part numbers.
+
+        Returns True if titles have different parts (should be separate works),
+        False if they have same parts or no parts (can be same work).
+
+        Args:
+            title1: First work title
+            title2: Second work title
+
+        Returns:
+            True if parts differ, False otherwise
+        """
+        part1 = self._extract_part_number(title1)
+        part2 = self._extract_part_number(title2)
+
+        # If neither has a part number, they can match
+        if part1 is None and part2 is None:
+            return False
+
+        # If one has a part and the other doesn't, they're different works
+        if (part1 is None) != (part2 is None):
+            return True
+
+        # Both have parts - compare them
+        # Same part type and number = same work
+        if part1[0] == part2[0] and part1[1] == part2[1]:
+            return False
+
+        # Different part types or numbers = different works
+        return True
 
     async def _find_similar_work(
         self,
@@ -469,12 +682,27 @@ class FileScanner:
         result = await self.session.execute(stmt)
         work_tuples = result.all()
 
+        # Normalize input title for case-insensitive comparison
+        title_lower = title.lower()
+
         # Find best match using fuzzy string matching
         best_match_id = None
         best_ratio = 0.0
 
         for work_id, work_title in work_tuples:
-            ratio = difflib.SequenceMatcher(None, title, work_title).ratio()
+            work_title_lower = work_title.lower()
+
+            # ENHANCED: Use comprehensive part number checking
+            if self._parts_differ(title, work_title):
+                if settings.DEBUG_WORK_GROUPING:
+                    logger.debug(
+                        f"[FUZZY] Skipping work_id={work_id} due to different parts: "
+                        f"'{title}' vs '{work_title}'"
+                    )
+                continue  # Different parts, skip this work
+
+            # Case-insensitive comparison
+            ratio = difflib.SequenceMatcher(None, title_lower, work_title_lower).ratio()
 
             # OPTIMIZATION: Early termination on very high match
             if ratio > 0.95:
@@ -490,11 +718,21 @@ class FileScanner:
         if best_match_id:
             best_match = await self.session.get(Work, best_match_id)
             # ENHANCED LOGGING with structured data
-            logger.info(
-                f"Fuzzy matched work: '{title}' → '{best_match.title}' "
-                f"(similarity={best_ratio:.3f}, artist_id={artist_id}, "
-                f"works_compared={len(work_tuples)})"
-            )
+            from airwave.core.config import settings
+
+            if settings.DEBUG_WORK_GROUPING:
+                logger.info(
+                    f"[FUZZY] Match found: work_id={best_match.id}, "
+                    f"existing_title='{best_match.title}', new_title='{title}', "
+                    f"similarity={best_ratio:.3f}, artist_id={artist_id}, "
+                    f"works_compared={len(work_tuples)}"
+                )
+            else:
+                logger.info(
+                    f"Fuzzy matched work: '{title}' → '{best_match.title}' "
+                    f"(similarity={best_ratio:.3f}, artist_id={artist_id}, "
+                    f"works_compared={len(work_tuples)})"
+                )
             return best_match
 
         return None
@@ -515,20 +753,58 @@ class FileScanner:
         Returns:
             Work object with ID populated
         """
+        from airwave.core.config import settings
+
         # FAST PATH: Try exact match first
         stmt = select(Work).where(Work.title == title, Work.artist_id == artist_id)
         result = await self.session.execute(stmt)
         existing = result.scalar_one_or_none()
 
         if existing:
-            return existing
+            # ENHANCED: Even if exact match, verify parts don't differ
+            if self._parts_differ(title, existing.title):
+                # Parts differ - create new work even though exact match found
+                # This handles edge cases where normalization removed part info
+                if settings.DEBUG_WORK_GROUPING:
+                    logger.info(
+                        f"[WORK] Exact match found but parts differ: "
+                        f"existing='{existing.title}' vs new='{title}' - creating separate work"
+                    )
+                # Fall through to create new work
+            else:
+                if settings.DEBUG_WORK_GROUPING:
+                    logger.debug(
+                        f"[WORK] Exact match found: work_id={existing.id}, "
+                        f"title='{title}', artist_id={artist_id}"
+                    )
+                return existing
 
         # FUZZY MATCHING: Try to find similar work
         similar_work = await self._find_similar_work(title, artist_id)
         if similar_work:
-            return similar_work
+            # ENHANCED: Verify parts don't differ even for fuzzy matches
+            if self._parts_differ(title, similar_work.title):
+                if settings.DEBUG_WORK_GROUPING:
+                    logger.info(
+                        f"[WORK] Fuzzy match found but parts differ: "
+                        f"existing='{similar_work.title}' vs new='{title}' - creating separate work"
+                    )
+                # Fall through to create new work
+            else:
+                if settings.DEBUG_WORK_GROUPING:
+                    logger.info(
+                        f"[WORK] Fuzzy match used: work_id={similar_work.id}, "
+                        f"existing_title='{similar_work.title}', new_title='{title}', "
+                        f"artist_id={artist_id}"
+                    )
+                return similar_work
 
         # Insert new work
+        if settings.DEBUG_WORK_GROUPING:
+            logger.info(
+                f"[WORK] Creating new work: title='{title}', artist_id={artist_id}"
+            )
+
         stmt = sqlite_insert(Work).values(
             title=title,
             artist_id=artist_id,
@@ -549,6 +825,13 @@ class FileScanner:
             )
             result = await self.session.execute(stmt_select)
             work = result.scalar_one()
+
+            if settings.DEBUG_WORK_GROUPING:
+                logger.info(
+                    f"[WORK] New work created: work_id={work.id}, "
+                    f"title='{title}', artist_id={artist_id}"
+                )
+
             return work
         except IntegrityError:
             # Another thread created it, query again
@@ -561,6 +844,13 @@ class FileScanner:
             work = result.scalar_one_or_none()
             if not work:
                 raise RuntimeError(f"Failed to create or retrieve work: title={title!r}, artist_id={artist_id}")
+
+            if settings.DEBUG_WORK_GROUPING:
+                logger.debug(
+                    f"[WORK] Race condition resolved: work_id={work.id}, "
+                    f"title='{title}', artist_id={artist_id}"
+                )
+
             return work
 
     async def _upsert_recording(
@@ -571,11 +861,13 @@ class FileScanner:
         duration: Optional[float] = None,
         isrc: Optional[str] = None,
     ) -> Recording:
-        """Atomically insert or get existing recording using database UPSERT.
+        """Create a new recording for each file (1:1 relationship).
 
-        Uses query-first-then-insert pattern with IntegrityError handling since Recordings
-        don't have a unique constraint on (work_id, title). This replaces the old
-        _get_or_create_recording() method which used manual flush/rollback/retry logic.
+        IMPORTANT: This method ALWAYS creates a new recording. It does NOT deduplicate
+        recordings based on title, ISRC, or any other field. Each physical file gets
+        its own recording entity, allowing users to see all instances and choose defaults.
+
+        This implements a strict 1:1 relationship between LibraryFile and Recording.
 
         Args:
             work_id: Work ID
@@ -587,19 +879,16 @@ class FileScanner:
         Returns:
             Recording object with ID populated
         """
-        # Query first since there's no unique constraint on (work_id, title)
-        stmt = select(Recording).where(
-            Recording.work_id == work_id,
-            Recording.title == title
-        )
-        result = await self.session.execute(stmt)
-        existing = result.scalar_one_or_none()
+        from airwave.core.config import settings
 
-        if existing:
-            return existing
+        # ALWAYS create new recording (no deduplication)
+        if settings.DEBUG_WORK_GROUPING:
+            logger.info(
+                f"[RECORDING] Creating new recording: work_id={work_id}, "
+                f"title='{title}', version_type='{version_type}', duration={duration}s, isrc='{isrc}'"
+            )
 
-        # Insert new recording
-        stmt = sqlite_insert(Recording).values(
+        recording = Recording(
             work_id=work_id,
             title=title,
             version_type=version_type,
@@ -608,31 +897,16 @@ class FileScanner:
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
         )
+        self.session.add(recording)
+        await self.session.flush()
 
-        try:
-            await self.session.execute(stmt)
-            await self.session.flush()
+        if settings.DEBUG_WORK_GROUPING:
+            logger.info(
+                f"[RECORDING] New recording created: recording_id={recording.id}, "
+                f"work_id={work_id}, title='{title}', version_type='{version_type}'"
+            )
 
-            # Query to get the recording we just created
-            stmt_select = select(Recording).where(
-                Recording.work_id == work_id,
-                Recording.title == title
-            )
-            result = await self.session.execute(stmt_select)
-            recording = result.scalar_one()
-            return recording
-        except IntegrityError:
-            # Another thread created it, query again
-            await self.session.rollback()
-            stmt = select(Recording).where(
-                Recording.work_id == work_id,
-                Recording.title == title
-            )
-            result = await self.session.execute(stmt)
-            recording = result.scalar_one_or_none()
-            if not recording:
-                raise RuntimeError(f"Failed to create or retrieve recording: work_id={work_id}, title={title!r}")
-            return recording
+        return recording
 
     async def _upsert_work_artist(
         self, work_id: int, artist_id: int, role: str = "Primary"
@@ -1568,6 +1842,8 @@ class FileScanner:
         else:
             normalized_path = resolved_path
         
+        from airwave.core.config import settings
+
         new_file = LibraryFile(
             recording_id=recording.id,
             path=normalized_path,
@@ -1578,6 +1854,13 @@ class FileScanner:
             bitrate=bitrate,
         )
         self.session.add(new_file)
+
+        if settings.DEBUG_WORK_GROUPING:
+            logger.info(
+                f"[FILE] Linking file to recording: recording_id={recording.id}, "
+                f"path='{normalized_path}'"
+            )
+
         if not await self._safe_flush("library file flush"):
             stmt = select(LibraryFile).where(LibraryFile.path == normalized_path)
             res = await self.session.execute(stmt)
