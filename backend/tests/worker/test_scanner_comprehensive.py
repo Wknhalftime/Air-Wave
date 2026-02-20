@@ -460,3 +460,67 @@ class TestFileScanner:
         assert lib_file.updated_at is not None
         assert lib_file.updated_at.timestamp() >= old_ts
 
+    async def test_find_similar_work_with_remix_descriptor(self, db_session):
+        """Test that fuzzy matching strips version descriptors to match remixes to base works.
+
+        Tests both delimiter-based extraction (parentheses/brackets) and embedded patterns.
+        Delimiter-based extraction is more accurate for multi-word titles.
+        """
+        scanner = FileScanner(db_session)
+
+        # Create artist
+        artist = Artist(name="Test Artist")
+        db_session.add(artist)
+        await db_session.flush()
+
+        # Create base work with single-word title
+        work1 = Work(title="wonderwall", artist_id=artist.id)
+        db_session.add(work1)
+
+        # Create base work with multi-word title
+        work2 = Work(title="larger than life", artist_id=artist.id)
+        db_session.add(work2)
+        await db_session.flush()
+
+        # Test 1: Embedded pattern (single-word title)
+        # The fuzzy matching should strip "radio mix" before comparison
+        found_work = await scanner._find_similar_work(
+            "wonderwall radio mix",
+            artist.id
+        )
+        assert found_work is not None
+        assert found_work.id == work1.id
+
+        # Test 2: Named remix embedded pattern (single-word title)
+        found_work = await scanner._find_similar_work(
+            "wonderwall Davidson Ospina Radio Mix",
+            artist.id
+        )
+        assert found_work is not None
+        assert found_work.id == work1.id
+
+        # Test 3: Delimiter-based extraction with parentheses (multi-word title)
+        # This should work correctly because "(the video mix)" is extracted as a complete unit
+        found_work = await scanner._find_similar_work(
+            "larger than life (the video mix)",
+            artist.id
+        )
+        assert found_work is not None
+        assert found_work.id == work2.id
+
+        # Test 4: Delimiter-based extraction with square brackets (multi-word title)
+        found_work = await scanner._find_similar_work(
+            "larger than life [radio edit]",
+            artist.id
+        )
+        assert found_work is not None
+        assert found_work.id == work2.id
+
+        # Test 5: Named remix in parentheses (multi-word title)
+        found_work = await scanner._find_similar_work(
+            "larger than life (davidson ospina radio mix)",
+            artist.id
+        )
+        assert found_work is not None
+        assert found_work.id == work2.id
+

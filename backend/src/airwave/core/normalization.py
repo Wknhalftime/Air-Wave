@@ -469,6 +469,7 @@ class Normalizer:
         Improvements over extract_version_type():
         - Extracts ALL version tags, not just first
         - Handles dash-separated versions ("Song - Live Version")
+        - Extracts embedded remix/mix descriptors without delimiters
         - Uses album context for live detection (conservative)
         - Classifies ambiguous parentheses using heuristics
         - Negative patterns for part numbers and subtitles
@@ -488,6 +489,12 @@ class Normalizer:
             >>> Normalizer.extract_version_type_enhanced("Song - Live Version")
             ('Song', 'Live')
 
+            >>> Normalizer.extract_version_type_enhanced("Song davidson ospina radio mix")
+            ('Song', 'Radio')  # Embedded remix descriptor extracted
+
+            >>> Normalizer.extract_version_type_enhanced("Song the video mix")
+            ('Song', 'Video')  # Generic mix pattern extracted
+
             >>> Normalizer.extract_version_type_enhanced("Song (Part 1)")
             ('Song (Part 1)', 'Original')  # Part numbers NOT extracted
 
@@ -505,6 +512,7 @@ class Normalizer:
 
         # Strategy 1: Extract parentheses/brackets with version keywords
         # BUT check negative patterns first to avoid extracting part numbers/subtitles
+        extracted_positions = []  # Track what we've extracted to avoid duplicates
         matches = list(Normalizer.VERSION_REGEX.finditer(title))
         for match in matches:
             paren_content = match.group(1)
@@ -522,6 +530,45 @@ class Normalizer:
             # Extract this version tag
             version_parts.append(paren_content.title())
             clean_title = clean_title.replace(match.group(0), "")
+            extracted_positions.append((match.start(), match.end()))
+
+        # Strategy 1.5: Extract parentheses/brackets with mix/remix descriptors
+        # Handles cases like "(the video mix)", "(davidson ospina radio mix)"
+        # This catches mix descriptors that don't start with a keyword (missed by Strategy 1)
+        mix_paren_pattern = r"[\(\[]\s*([^)\]]*(?:mix|remix|edit|version)[^)\]]*)\s*[\)\]]"
+        mix_matches = list(re.finditer(mix_paren_pattern, title, re.IGNORECASE))
+        for match in mix_matches:
+            # Skip if already extracted by Strategy 1
+            if any(match.start() >= start and match.end() <= end for start, end in extracted_positions):
+                continue
+
+            paren_content = match.group(1).strip()
+            paren_lower = paren_content.lower()
+
+            # NEGATIVE PATTERN: Skip part numbers
+            if re.search(r"\b(part|pt\.?)\s*\d+\b", paren_lower):
+                continue
+
+            # Classify the version type based on keywords
+            if 'radio' in paren_lower or 'edit' in paren_lower:
+                version_parts.append('Radio')
+            elif 'video' in paren_lower:
+                version_parts.append('Video')
+            elif any(word in paren_lower for word in ['club', 'dance']):
+                version_parts.append('Remix')
+            elif 'instrumental' in paren_lower:
+                version_parts.append('Instrumental')
+            elif 'acoustic' in paren_lower:
+                version_parts.append('Acoustic')
+            elif 'extended' in paren_lower:
+                version_parts.append('Extended')
+            elif 'live' in paren_lower:
+                version_parts.append('Live')
+            else:
+                version_parts.append('Remix')
+
+            clean_title = clean_title.replace(match.group(0), "").strip()
+            extracted_positions.append((match.start(), match.end()))
 
         # Strategy 2: Check for dash-separated versions
         # "Song Title - Live Version" or "Song Title - Radio Edit"
@@ -539,7 +586,54 @@ class Normalizer:
             if any(keyword in album_lower for keyword in live_keywords):
                 version_parts.append("Live")
 
-        # Strategy 4: Handle remaining parentheses with negative patterns
+        # Strategy 4: Extract embedded remix/mix descriptors (no delimiters)
+        # These patterns catch descriptive remix names embedded in titles
+        # Examples: "song davidson ospina radio mix", "song the video mix"
+        #
+        # Note: We use capitalized words to identify remix artist names (e.g., "Davidson Ospina")
+        # to avoid matching common lowercase words like "to give radio mix"
+        embedded_patterns = [
+            # Named remixes with capitalized names: "Davidson Ospina Radio Mix"
+            # This pattern requires at least one capital letter in the remix artist name
+            (r'\s+([A-Z]\w+\s+){1,2}(radio|video|club|dance)\s+mix$', 'named_remix'),
+
+            # Generic "the X mix" patterns at end
+            # Examples: "the video mix", "the conversation mix"
+            (r'\s+the\s+\w+\s+mix$', 'generic_mix'),
+
+            # Common mix types at end of title (simple patterns)
+            (r'\s+(radio|video|club|dance|extended|instrumental|vocal|dub|acoustic)\s+mix$', 'mix_type'),
+            (r'\s+(radio|video|club|dance|extended)\s+edit$', 'edit_type'),
+            (r'\s+(radio|video|club|dance)\s+version$', 'version_type'),
+        ]
+
+        for pattern, pattern_type in embedded_patterns:
+            match = re.search(pattern, clean_title, re.IGNORECASE)
+            if match:
+                descriptor = match.group(0).strip()
+                clean_title = clean_title[:match.start()].strip()
+
+                # Classify the version type based on keywords
+                descriptor_lower = descriptor.lower()
+                if 'radio' in descriptor_lower or 'edit' in descriptor_lower:
+                    version_parts.append('Radio')
+                elif 'video' in descriptor_lower:
+                    version_parts.append('Video')
+                elif any(word in descriptor_lower for word in ['club', 'dance']):
+                    version_parts.append('Remix')
+                elif 'instrumental' in descriptor_lower:
+                    version_parts.append('Instrumental')
+                elif 'acoustic' in descriptor_lower:
+                    version_parts.append('Acoustic')
+                elif 'extended' in descriptor_lower:
+                    version_parts.append('Extended')
+                else:
+                    version_parts.append('Remix')
+
+                # Only extract first embedded pattern to avoid over-extraction
+                break
+
+        # Strategy 5: Handle remaining parentheses with negative patterns
         remaining_parens = re.findall(r"[\(\[]([^\)\]]+)[\)\]]", clean_title)
         for paren_content in remaining_parens:
             words = paren_content.split()

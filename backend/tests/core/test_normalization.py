@@ -280,3 +280,109 @@ def test_extract_version_type_enhanced_backward_compatibility():
     assert Normalizer.extract_version_type_enhanced("Song [Remix]") == ("Song", "Remix")
     assert Normalizer.extract_version_type_enhanced("Song Title") == ("Song Title", "Original")
     assert Normalizer.extract_version_type_enhanced("") == ("", "Original")
+
+
+def test_extract_version_type_enhanced_delimiter_based_extraction():
+    """Test extraction of mix/remix descriptors within parentheses/brackets.
+
+    Strategy 1.5 prioritizes delimiter-based extraction, which is more accurate
+    than embedded pattern matching for multi-word titles.
+    """
+    # Parentheses with "the X mix" patterns
+    clean, version = Normalizer.extract_version_type_enhanced("larger than life (the video mix)")
+    assert clean == "larger than life"
+    assert version == "Video"
+
+    clean, version = Normalizer.extract_version_type_enhanced("all i have to give (the conversation mix)")
+    assert clean == "all i have to give"
+    assert version == "Remix"
+
+    # Square brackets
+    clean, version = Normalizer.extract_version_type_enhanced("larger than life [the video mix]")
+    assert clean == "larger than life"
+    assert version == "Video"
+
+    # Named remixes in parentheses
+    clean, version = Normalizer.extract_version_type_enhanced("all i have to give (davidson ospina radio mix)")
+    assert clean == "all i have to give"
+    assert version == "Radio"
+
+    # Simple mix types in parentheses
+    clean, version = Normalizer.extract_version_type_enhanced("wonderwall (radio mix)")
+    assert clean == "wonderwall"
+    assert version == "Radio"
+
+    clean, version = Normalizer.extract_version_type_enhanced("wonderwall (club mix)")
+    assert clean == "wonderwall"
+    assert version == "Remix"
+
+    # Edit patterns in parentheses
+    clean, version = Normalizer.extract_version_type_enhanced("wonderwall (radio edit)")
+    assert clean == "wonderwall"
+    assert version == "Radio"
+
+
+def test_extract_version_type_enhanced_embedded_remix_patterns():
+    """Test extraction of embedded remix/mix descriptors without delimiters.
+
+    Note: These patterns work best with single-word titles. For multi-word titles,
+    delimiter-based extraction (parentheses/brackets) is more accurate.
+    """
+    # Simple mix types at end (single word titles work best)
+    clean, version = Normalizer.extract_version_type_enhanced("wonderwall radio mix")
+    assert clean == "wonderwall"
+    assert version == "Radio"
+
+    clean, version = Normalizer.extract_version_type_enhanced("wonderwall video mix")
+    assert clean == "wonderwall"
+    assert version == "Video"
+
+    clean, version = Normalizer.extract_version_type_enhanced("wonderwall club mix")
+    assert clean == "wonderwall"
+    assert version == "Remix"
+
+    # Edit patterns
+    clean, version = Normalizer.extract_version_type_enhanced("wonderwall radio edit")
+    assert clean == "wonderwall"
+    assert version == "Radio"
+
+    # Version patterns
+    clean, version = Normalizer.extract_version_type_enhanced("wonderwall radio version")
+    assert clean == "wonderwall"
+    assert version == "Radio"
+
+    # Other mix types
+    clean, version = Normalizer.extract_version_type_enhanced("wonderwall instrumental mix")
+    assert clean == "wonderwall"
+    assert version == "Instrumental"
+
+    clean, version = Normalizer.extract_version_type_enhanced("wonderwall acoustic mix")
+    assert clean == "wonderwall"
+    assert version == "Acoustic"
+
+    clean, version = Normalizer.extract_version_type_enhanced("wonderwall extended mix")
+    assert clean == "wonderwall"
+    assert version == "Extended"
+
+    # Named remixes with capitalized names (e.g., "Davidson Ospina Radio Mix")
+    # Note: These require capitalization to distinguish from common words
+    clean, version = Normalizer.extract_version_type_enhanced("Song Davidson Ospina Radio Mix")
+    assert clean == "Song"
+    assert version == "Radio"
+
+    clean, version = Normalizer.extract_version_type_enhanced("Song Tiesto Club Mix")
+    assert clean == "Song"
+    assert version == "Remix"
+
+
+def test_extract_version_type_enhanced_embedded_patterns_not_in_middle():
+    """Test that embedded patterns only match at the end of the title."""
+    # Pattern in middle should NOT be extracted
+    clean, version = Normalizer.extract_version_type_enhanced("radio mix song")
+    assert clean == "radio mix song"
+    assert version == "Original"
+
+    # Pattern at end should be extracted
+    clean, version = Normalizer.extract_version_type_enhanced("song radio mix")
+    assert clean == "song"
+    assert version == "Radio"
