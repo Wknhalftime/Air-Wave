@@ -80,6 +80,41 @@ class TestLibraryMetadata:
         assert meta.artist == "unknown artist"
         assert meta.title == "untitled"
 
+    def test_metadata_album_context_detection(self):
+        """Test that album context is used for live version detection."""
+        # Track from live album should be detected as Live version
+        meta_live = LibraryMetadata(
+            raw_artist="Queen",
+            raw_title="Bohemian Rhapsody",
+            album_title="Live at Wembley Stadium"
+        )
+        assert meta_live.version_type == "Live"
+        assert meta_live.title == "bohemian rhapsody"
+
+        # Track from acoustic album
+        meta_acoustic = LibraryMetadata(
+            raw_artist="Nirvana",
+            raw_title="About a Girl",
+            album_title="MTV Unplugged in New York"
+        )
+        assert meta_acoustic.version_type == "Live"
+
+        # Album context should NOT override explicit version tag
+        meta_explicit = LibraryMetadata(
+            raw_artist="Queen",
+            raw_title="Bohemian Rhapsody (Remix)",
+            album_title="Live at Wembley Stadium"
+        )
+        assert meta_explicit.version_type == "Remix"  # NOT "Live"
+
+        # Non-live album should not affect version detection
+        meta_studio = LibraryMetadata(
+            raw_artist="Queen",
+            raw_title="Bohemian Rhapsody",
+            album_title="A Night at the Opera"
+        )
+        assert meta_studio.version_type == "Original"
+
 
 class TestFileScanner:
     """Test the FileScanner class."""
