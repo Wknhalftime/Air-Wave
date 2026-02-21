@@ -24,9 +24,6 @@ export default function Admin() {
     const [activeTab, setActiveTab] = useState<'ingestion' | 'processing' | 'system'>('ingestion');
 
     // Track task IDs for progress - restore from localStorage on mount
-    const [scanTaskId, setScanTaskId] = useState<string | null>(() => {
-        return localStorage.getItem('airwave_scan_task_id');
-    });
     const [syncTaskId, setSyncTaskId] = useState<string | null>(() => {
         return localStorage.getItem('airwave_sync_task_id');
     });
@@ -38,14 +35,6 @@ export default function Admin() {
     });
 
     // Persist task IDs to localStorage when they change
-    useEffect(() => {
-        if (scanTaskId) {
-            localStorage.setItem('airwave_scan_task_id', scanTaskId);
-        } else {
-            localStorage.removeItem('airwave_scan_task_id');
-        }
-    }, [scanTaskId]);
-
     useEffect(() => {
         if (syncTaskId) {
             localStorage.setItem('airwave_sync_task_id', syncTaskId);
@@ -71,11 +60,6 @@ export default function Admin() {
     }, [discoveryTaskId]);
 
     // --- Status Tab ---
-    const scanMutation = useMutation({
-        mutationFn: () => fetcher<{ status: string, task_id: string }>('/admin/trigger-scan', { method: 'POST' }),
-        onSuccess: (data) => setScanTaskId(data.task_id)
-    });
-
     const syncMutation = useMutation({
         mutationFn: (path: string) => fetcher<{ status: string, task_id: string }>('/admin/scan', {
             method: 'POST',
@@ -152,19 +136,10 @@ export default function Admin() {
 
     // Track task statuses for success wizards
     const { status: importStatus } = useTaskProgress(importTaskId);
-    const { status: scanStatus } = useTaskProgress(scanTaskId);
     const { status: syncStatus } = useTaskProgress(syncTaskId);
     const { status: discoveryStatus } = useTaskProgress(discoveryTaskId);
 
     // Clear task IDs when tasks complete
-    useEffect(() => {
-        if (scanStatus?.status && ['completed', 'failed', 'cancelled'].includes(scanStatus.status)) {
-            // Delay clearing to allow user to see final status
-            const timer = setTimeout(() => setScanTaskId(null), 3000);
-            return () => clearTimeout(timer);
-        }
-    }, [scanStatus?.status]);
-
     useEffect(() => {
         if (syncStatus?.status && ['completed', 'failed', 'cancelled'].includes(syncStatus.status)) {
             const timer = setTimeout(() => setSyncTaskId(null), 3000);
@@ -324,56 +299,6 @@ export default function Admin() {
                                                 </Link>
                                                 <button
                                                     onClick={() => setDiscoveryTaskId(null)}
-                                                    className="px-3 py-1.5 bg-gray-200 text-gray-700 text-sm rounded hover:bg-gray-300 font-medium transition-colors"
-                                                >
-                                                    Dismiss
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                            )}
-                        </div>
-
-                        {/* Scan Logs */}
-                        <div className="p-4 border rounded-lg bg-gray-50 hover:bg-gray-100 transition">
-                            <div className="flex items-center gap-3 mb-2">
-                                <Activity className="w-5 h-5 text-blue-600" />
-                                <h3 className="font-medium">Scan Logs</h3>
-                            </div>
-                            <p className="text-sm text-gray-500 mb-4">Promote new logs to Library Tracks.</p>
-                            <button
-                                onClick={() => scanMutation.mutate()}
-                                disabled={scanMutation.isPending || !!scanTaskId}
-                                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 w-full disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                {scanMutation.isPending ? 'Starting...' : scanTaskId ? 'Running...' : 'Trigger Scan'}
-                            </button>
-
-                            {/* Progress */}
-                            {scanTaskId && scanStatus?.status === 'running' && (
-                                <TaskProgress taskId={scanTaskId} onComplete={() => setScanTaskId(null)} />
-                            )}
-
-                            {/* Success Wizard */}
-                            {scanTaskId && scanStatus?.status === 'completed' && (
-                                <div className="mt-3 bg-green-50 border border-green-200 rounded-lg p-4">
-                                    <div className="flex items-start gap-3">
-                                        <CheckCircle className="w-5 h-5 text-green-600 flex-shrink-0 mt-0.5" />
-                                        <div className="flex-1">
-                                            <h4 className="font-semibold text-green-900 mb-1">Scan Complete!</h4>
-                                            <p className="text-sm text-green-700 mb-3">
-                                                Processed <strong>{scanStatus.total.toLocaleString()}</strong> items.
-                                            </p>
-                                            <div className="flex gap-2 flex-wrap">
-                                                <Link
-                                                    to="/library"
-                                                    className="inline-flex items-center gap-2 px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700 font-medium transition-colors"
-                                                >
-                                                    View Library
-                                                </Link>
-                                                <button
-                                                    onClick={() => setScanTaskId(null)}
                                                     className="px-3 py-1.5 bg-gray-200 text-gray-700 text-sm rounded hover:bg-gray-300 font-medium transition-colors"
                                                 >
                                                     Dismiss
