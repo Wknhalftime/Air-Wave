@@ -98,13 +98,13 @@ class TestIdentityBridgeMatching:
         db_session.add(recording)
         await db_session.flush()
 
-        # Create Identity Bridge
+        # Create Identity Bridge (links to Work, not Recording)
         sig = Normalizer.generate_signature("GnR", "Sweet Child")
         bridge = IdentityBridge(
             log_signature=sig,
             reference_artist="GnR",
             reference_title="Sweet Child",
-            recording_id=recording.id,
+            work_id=work.id,
         )
         db_session.add(bridge)
         await db_session.commit()
@@ -139,7 +139,7 @@ class TestIdentityBridgeMatching:
         db_session.add_all([rec1, rec2])
         await db_session.flush()
 
-        # Create bridges
+        # Create bridges (link to Work, not Recording)
         sig1 = Normalizer.generate_signature("Metallica", "Sandman")
         sig2 = Normalizer.generate_signature("Metallica", "Nothing Else")
 
@@ -147,13 +147,13 @@ class TestIdentityBridgeMatching:
             log_signature=sig1,
             reference_artist="Metallica",
             reference_title="Sandman",
-            recording_id=rec1.id,
+            work_id=work1.id,
         )
         bridge2 = IdentityBridge(
             log_signature=sig2,
             reference_artist="Metallica",
             reference_title="Nothing Else",
-            recording_id=rec2.id,
+            work_id=work2.id,
         )
         db_session.add_all([bridge1, bridge2])
         await db_session.commit()
@@ -439,18 +439,18 @@ class TestLinkOrphanedLogs:
             raw_artist="Foo Fighters",
             raw_title="Everlong",
             played_at=datetime.fromisoformat("2024-01-01T10:00:00"),
-            recording_id=None,  # Orphaned
+            work_id=None,  # Orphaned
         )
         db_session.add(log)
         await db_session.flush()
 
-        # Create identity bridge
+        # Create identity bridge (links to Work, not Recording)
         sig = Normalizer.generate_signature("Foo Fighters", "Everlong")
         bridge = IdentityBridge(
             log_signature=sig,
             reference_artist="Foo Fighters",
             reference_title="Everlong",
-            recording_id=recording.id,
+            work_id=work.id,
         )
         db_session.add(bridge)
         await db_session.commit()
@@ -460,8 +460,8 @@ class TestLinkOrphanedLogs:
         # Run link_orphaned_logs (returns int count)
         linked_count = await matcher.link_orphaned_logs()
 
-        # Verify log was linked
+        # Verify log was linked to work
         await db_session.refresh(log)
-        assert log.recording_id == recording.id
+        assert log.work_id == work.id
         assert linked_count >= 1
 

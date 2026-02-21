@@ -20,7 +20,7 @@ def test_db_url():
     assert path_str in settings.DB_URL or settings.DB_PATH.name in settings.DB_URL
 
 
-def test_data_dir_creation():
-    """Verify DATA_DIR exists (it should be created on import)."""
-    assert settings.DATA_DIR.exists()
-    assert settings.DATA_DIR.is_dir()
+def test_data_dir_path():
+    """Verify DATA_DIR is a valid Path. Existence is ensured by init_db(), not on import."""
+    assert isinstance(settings.DATA_DIR, Path)
+    assert settings.DATA_DIR.name

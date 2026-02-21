@@ -27,23 +27,23 @@ async def setup_export_data(db_session):
     db_session.add(recording)
     await db_session.flush()
 
-    # 1. Matched Log (Identity Bridge)
+    # 1. Matched Log (Identity Bridge) - now links to work
     log_mj = BroadcastLog(
         station_id=station.id,
         played_at=datetime.now(),
         raw_artist="Export Artist",
         raw_title="Export Song",
-        recording_id=recording.id,
+        work_id=work.id,
         match_reason="Identity Bridge (Exact Match)"
     )
     
-    # 2. Matched Log (Auto)
+    # 2. Matched Log (Auto) - now links to work
     log_auto = BroadcastLog(
         station_id=station.id,
         played_at=datetime.now() - timedelta(hours=1),
         raw_artist="Export Artist",
         raw_title="Export Song",
-        recording_id=recording.id,
+        work_id=work.id,
         match_reason="Vector Match"
     )
 
@@ -53,7 +53,7 @@ async def setup_export_data(db_session):
         played_at=datetime.now() - timedelta(days=1),
         raw_artist="Unknown",
         raw_title="Unknown",
-        recording_id=None,
+        work_id=None,
         match_reason=None
     )
 

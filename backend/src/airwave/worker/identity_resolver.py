@@ -1,15 +1,13 @@
-import logging
 import re
 import unicodedata
 from typing import Dict, List, Optional
 
+from loguru import logger
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from airwave.core.models import ArtistAlias, ProposedSplit
 from airwave.core.normalization import Normalizer
-
-logger = logging.getLogger(__name__)
 
 
 class IdentityResolver:
@@ -98,6 +96,7 @@ class IdentityResolver:
         split_results = await self.session.execute(split_stmt)
         already_proposed = set(split_results.scalars().all())
 
+        splits_created = 0
         for name in unresolved:
             proposed_split = self._detect_split(name)
 
@@ -105,6 +104,7 @@ class IdentityResolver:
                 # If it's a split, and not already proposed, register it
                 if name not in already_proposed:
                     await self._register_proposed_split(name, proposed_split)
+                    splits_created += 1
                 # Return the 'clean' joined name to help the matcher find existing clean tracks
                 # Using semicolon as it's rare in artist names and not used in splitting logic
                 results[name] = "; ".join(proposed_split)
@@ -112,6 +112,10 @@ class IdentityResolver:
                 # No split detected, but let's at least Title Case the unresolved name for better matching
                 results[name] = self._clean_artist_name(name)
 
+        aliases_used = len(unique_names) - len(unresolved)
+        logger.info(
+            f"resolve_batch: {len(unique_names)} names, {aliases_used} alias hits, {splits_created} new splits"
+        )
         return results
 
     def _detect_split(self, name: str) -> Optional[List[str]]:

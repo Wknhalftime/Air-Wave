@@ -79,7 +79,7 @@ async def test_reject_match_creates_new_track(client, db_session):
         raw_artist="New Artist",
         raw_title="New Song",
         played_at=datetime.fromisoformat("2024-01-01T12:00:00"),
-        recording_id=r.id,
+        work_id=w_wrong.id,
         match_reason="Wrong Match",
     )
     db_session.add(log)
@@ -100,14 +100,14 @@ async def test_reject_match_creates_new_track(client, db_session):
     new_track = res.scalar_one_or_none()
     assert new_track
 
-    # B. Log Updated
+    # B. Log Updated (now linked to new track's work)
     await db_session.refresh(log)
-    assert log.recording_id == new_track.id
+    assert log.work_id == new_track.work_id
     assert "Verified by User" in log.match_reason
 
-    # C. Identity Bridge Created
+    # C. Identity Bridge Created (links to work)
     stmt = select(IdentityBridge).where(
-        IdentityBridge.recording_id == new_track.id
+        IdentityBridge.work_id == new_track.work_id
     )
     res = await db_session.execute(stmt)
     ib = res.scalar_one_or_none()

@@ -3,6 +3,7 @@ import { useParams, Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { fetcher, API_BASE } from '../lib/api';
 import { ArrowLeft, Radio, AlertTriangle, Calendar, FileText, Music, Loader2 } from 'lucide-react';
+import { toTitleCase, formatArtistForDisplay } from '../utils/format';
 
 interface UnmatchedTrack {
     artist: string;
@@ -191,8 +192,8 @@ export default function StationDetail() {
                         <div className="space-y-3">
                             {health.unmatched_tracks.map((track, i) => (
                                 <div key={i} className="p-3 bg-gray-50 rounded-lg text-sm border border-gray-100 hover:border-indigo-200 transition-colors cursor-pointer">
-                                    <div className="font-medium text-gray-900">{track.title}</div>
-                                    <div className="text-gray-500">{track.artist}</div>
+                                    <div className="font-medium text-gray-900">{toTitleCase(track.title)}</div>
+                                    <div className="text-gray-500">{formatArtistForDisplay(track.artist)}</div>
                                     <div className="mt-2 text-xs font-semibold text-yellow-600 bg-yellow-50 inline-block px-2 py-1 rounded">
                                         {track.count} failures
                                     </div>

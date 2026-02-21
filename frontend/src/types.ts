@@ -3,14 +3,12 @@ export interface QueueItem {
     raw_artist: string;
     raw_title: string;
     count: number;
-    suggested_recording_id: number | null;
-    suggested_recording?: {
+    suggested_work_id: number | null;  // Phase 4: Work-level suggestion
+    suggested_work?: {
         id: number;
         title: string;
-        work?: {
-            artist?: {
-                name: string;
-            }
+        artist?: {
+            name: string;
         }
     }
 }
@@ -26,4 +24,14 @@ export interface AuditEntry {
     log_count: number;
     can_undo: boolean;
     undone_at: string | null;
+}
+
+export interface ArtistQueueItem {
+    raw_name: string;
+    item_count: number;
+    is_verified: boolean;
+    suggested_artist?: {
+        id: number;
+        name: string;
+    };
 }

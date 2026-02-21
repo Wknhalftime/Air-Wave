@@ -11,7 +11,6 @@ from airwave.api.deps import get_db
 from airwave.core.models import (
     Artist,
     BroadcastLog,
-    BroadcastLog,
     Recording,
     Station,
     Work,
@@ -23,10 +22,10 @@ router = APIRouter()
 
 
 class SearchResultTrack(BaseModel):
-    id: int
+    id: int  # Recording ID (for backward compatibility)
+    work_id: int  # Phase 4: Work ID for identity layer
     artist: str
     title: str
-    album: Optional[str] = None  # Deprecated/Empty for now
     album: Optional[str] = None  # Deprecated/Empty for now
     path: Optional[str] = None
     status: Literal["Gold", "Silver", "Bronze"]
@@ -121,7 +120,8 @@ async def search(
             
             response.tracks.append(
                 SearchResultTrack(
-                    id=r.id,
+                    id=r.id,  # Recording ID
+                    work_id=r.work_id,  # Phase 4: Work ID for identity layer
                     artist=r.work.artist.name if r.work and r.work.artist else "Unknown",
                     title=r.title,
                     album=None,
@@ -165,7 +165,7 @@ async def search(
                 raw_title=row.BroadcastLog.raw_title,
                 station_callsign=row.callsign,
                 match_reason=row.BroadcastLog.match_reason,
-                track_id=row.BroadcastLog.recording_id,  # Mapping recording_id to track_id field
+                track_id=row.BroadcastLog.work_id,  # Phase 4: Use work_id
             )
             for row in rows
         ]

@@ -1,3 +1,9 @@
+"""Identity Bridge API endpoints.
+
+Phase 4: IdentityBridge links to Work (not Recording). Recording is resolved
+at runtime via RecordingResolver based on station context and policies.
+"""
+
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -6,38 +12,46 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from airwave.api.deps import get_db
-from airwave.core.models import IdentityBridge, Recording, Artist, Work
+from airwave.core.models import IdentityBridge, Artist, Work
 
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict
 
+
 class ArtistSchema(BaseModel):
+    id: int
     name: str
     model_config = ConfigDict(from_attributes=True)
 
+
 class WorkSchema(BaseModel):
+    id: int
+    title: str
     artist: Optional[ArtistSchema] = None
     model_config = ConfigDict(from_attributes=True)
 
-class RecordingSchema(BaseModel):
-    title: str
-    work: Optional[WorkSchema] = None
-    model_config = ConfigDict(from_attributes=True)
 
 class BridgeResponse(BaseModel):
+    """Identity Bridge response schema.
+    
+    Phase 4: Links to Work (not Recording). Use RecordingResolver to get
+    actual recording files when needed.
+    """
     id: int
     log_signature: str
     reference_artist: str
     reference_title: str
-    recording_id: int
+    work_id: int
     is_revoked: bool
     updated_at: datetime
     created_at: datetime
-    recording: Optional[RecordingSchema] = None
+    work: Optional[WorkSchema] = None
     
     model_config = ConfigDict(from_attributes=True)
 
+
 router = APIRouter()
+
 
 @router.get("/", response_model=List[BridgeResponse])
 async def list_bridges(
@@ -48,8 +62,9 @@ async def list_bridges(
     db: AsyncSession = Depends(get_db),
 ):
     """List identity bridges with pagination and search."""
+    # Phase 4: Load work relationship (not recording)
     stmt = select(IdentityBridge).options(
-        selectinload(IdentityBridge.recording).selectinload(Recording.work).selectinload(Work.artist)
+        selectinload(IdentityBridge.work).selectinload(Work.artist)
     )
 
     if not include_revoked:
@@ -57,22 +72,14 @@ async def list_bridges(
 
     if search:
         search_pattern = f"%{search}%"
-        stmt = stmt.join(IdentityBridge.recording).outerjoin(Recording.work).outerjoin(Work.artist).where(
+        stmt = stmt.join(IdentityBridge.work).outerjoin(Work.artist).where(
             or_(
                 IdentityBridge.reference_artist.ilike(search_pattern),
                 IdentityBridge.reference_title.ilike(search_pattern),
-                Recording.title.ilike(search_pattern),
+                Work.title.ilike(search_pattern),
                 Artist.name.ilike(search_pattern)
             )
         )
-
-    # Count total
-    # Note: For strict pagination in production, a separate count query is better
-    # but for simplicity/mvp we might just fetch and slice, or do two queries.
-    # Let's do two queries for proper metadata.
-    
-    # ... actually, let's keep it simple for now and rely on client infinite scroll or simple paging
-    # We'll return a simple list and let client handle "no more results" by empty list.
     
     stmt = stmt.order_by(desc(IdentityBridge.updated_at))
     stmt = stmt.offset((page - 1) * page_size).limit(page_size)
@@ -81,6 +88,7 @@ async def list_bridges(
     bridges = result.scalars().all()
 
     return bridges
+
 
 @router.patch("/{bridge_id}", response_model=BridgeResponse)
 async def update_bridge_status(
@@ -97,12 +105,9 @@ async def update_bridge_status(
     await db.commit()
     await db.refresh(bridge)
     
-    # Eager load relationships for response
-    # We need to reload with options or just return the bridge and let pydantic handle missing relations if optional
-    # But BridgeResponse expects recording.
-    # Let's eager load.
+    # Eager load work relationship for response
     stmt = select(IdentityBridge).where(IdentityBridge.id == bridge_id).options(
-        selectinload(IdentityBridge.recording).selectinload(Recording.work).selectinload(Work.artist)
+        selectinload(IdentityBridge.work).selectinload(Work.artist)
     )
     result = await db.execute(stmt)
     bridge = result.scalar_one()

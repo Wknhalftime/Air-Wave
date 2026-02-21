@@ -27,7 +27,7 @@ from loguru import logger
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from airwave.core.models import BroadcastLog, Station
+from airwave.core.models import BroadcastLog, Recording, Station
 from airwave.core.utils import parse_flexible_date
 from airwave.worker.identity_resolver import IdentityResolver
 from airwave.worker.matcher import Matcher
@@ -314,13 +314,46 @@ class CSVImporter:
         match_results = await self.matcher.match_batch(match_queries)
 
         # 6. Map Results back to All Rows
+        # Phase 4: match_batch now returns work_id (for bridge matches) or recording_id (for new matches)
+        # We need to look up work_id for recording matches
         inserts = []
+        recording_ids_to_lookup = set()
+        
+        for ra, rt in unique_pairs.keys():
+            resolved_key = pair_to_resolved[(ra, rt)]
+            match_id, match_reason = match_results.get(
+                resolved_key, (None, "No Match Found")
+            )
+            if match_id is not None and "Identity Bridge" not in match_reason:
+                # Non-bridge match returns recording_id, need to look up work_id
+                recording_ids_to_lookup.add(match_id)
+        
+        # Batch fetch work_ids for recording matches
+        recording_to_work = {}
+        if recording_ids_to_lookup:
+            rec_stmt = select(Recording.id, Recording.work_id).where(
+                Recording.id.in_(list(recording_ids_to_lookup))
+            )
+            rec_result = await self.session.execute(rec_stmt)
+            for rec_id, work_id in rec_result.all():
+                recording_to_work[rec_id] = work_id
+        
         for ra, rt in unique_pairs.keys():
             # Get match result for this pair
             resolved_key = pair_to_resolved[(ra, rt)]  # (resolved_a, rt)
-            recording_id, match_reason = match_results.get(
+            match_id, match_reason = match_results.get(
                 resolved_key, (None, "No Match Found")
             )
+            
+            # Phase 4: Determine work_id
+            work_id = None
+            if match_id is not None:
+                if "Identity Bridge" in match_reason:
+                    # Bridge match already returns work_id
+                    work_id = match_id
+                else:
+                    # Non-bridge match returns recording_id, look up work_id
+                    work_id = recording_to_work.get(match_id)
 
             # Apply to all original rows that had this pair
             indices = unique_pairs[(ra, rt)]
@@ -334,13 +367,19 @@ class CSVImporter:
                         "played_at": row_data["played_at"],
                         "raw_artist": row_data["raw_artist"],
                         "raw_title": row_data["raw_title"],
-                        "recording_id": recording_id,
+                        "work_id": work_id,
                         "match_reason": match_reason,
                     }
                 )
 
         # 7. Bulk Insert
         if inserts:
+            matched = sum(1 for row in inserts if row["work_id"] is not None)
+            unmatched = len(inserts) - matched
+            logger.info(
+                f"process_batch: batch_id={batch_id}, rows={len(inserts)}, "
+                f"matched={matched}, unmatched={unmatched}"
+            )
             # Chunk the inserts to avoid SQLite limits
             batch_size = 400
             for i in range(0, len(inserts), batch_size):

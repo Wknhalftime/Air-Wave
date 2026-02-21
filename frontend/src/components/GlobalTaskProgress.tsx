@@ -68,6 +68,17 @@ function TaskProgressBar({ taskKey, taskId, type, onDismiss }: {
         }
     }, [status?.status, taskKey, onDismiss]);
 
+    // Auto-dismiss when task no longer exists (e.g. backend restarted)
+    useEffect(() => {
+        if (error === 'Task not found' || error === 'Connection lost') {
+            const timer = setTimeout(() => {
+                localStorage.removeItem(taskKey);
+                onDismiss();
+            }, 2000);
+            return () => clearTimeout(timer);
+        }
+    }, [error, taskKey, onDismiss]);
+
     const handleCancel = async () => {
         if (!taskId || status?.status !== 'running') return;
         setIsCancelling(true);

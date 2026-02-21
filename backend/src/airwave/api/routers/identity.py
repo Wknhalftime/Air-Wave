@@ -3,7 +3,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -12,6 +12,7 @@ from airwave.core.models import (
     Artist,
     ArtistAlias,
     BroadcastLog,
+    DiscoveryQueue,
     IdentityBridge,
     ProposedSplit,
     Recording,
@@ -106,12 +107,14 @@ async def get_bridges(
     term: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """List all Identity Bridge entries with optional search."""
+    """List all Identity Bridge entries with optional search.
+    
+    Phase 4: Returns work info (not recording). Use RecordingResolver for files.
+    """
     stmt = (
         select(IdentityBridge)
         .options(
-            selectinload(IdentityBridge.recording)
-            .selectinload(Recording.work)
+            selectinload(IdentityBridge.work)
             .selectinload(Work.artist)
         )
         .order_by(IdentityBridge.updated_at.desc())
@@ -130,21 +133,23 @@ async def get_bridges(
     result = await db.execute(stmt)
     bridges = result.scalars().all()
 
-    # Pydantic schemas expect attributes to be accessible.
-    # We map manually to ensure structure matches IdentityBridgeSchema
+    # Phase 4: Map to schema using work info
     resp = []
     for b in bridges:
         artist_name = "Unknown"
-        if b.recording and b.recording.work and b.recording.work.artist:
-            artist_name = b.recording.work.artist.name
+        work_title = "Unknown"
+        if b.work:
+            work_title = b.work.title
+            if b.work.artist:
+                artist_name = b.work.artist.name
             
         resp.append({
             "id": b.id,
             "raw_artist": b.reference_artist,
             "raw_title": b.reference_title,
-            "recording": {
-                "id": b.recording_id,
-                "title": b.recording.title if b.recording else "Unknown",
+            "recording": {  # Keep schema compatibility but return work info
+                "id": b.work_id,
+                "title": work_title,
                 "artist": artist_name
             },
             "confidence": b.confidence,
@@ -167,12 +172,10 @@ async def delete_bridge(id: int, db: AsyncSession = Depends(get_db)):
     if not bridge:
         raise HTTPException(status_code=404, detail="Bridge not found")
     
-    # Check if any logs are using this bridge (by recording_id + signature implied match)
-    # Actually, we check if logs matched via "Identity Bridge" to this recording exist.
-    # A bit loose but gives a warning count.
+    # Phase 4: Check logs by work_id
     log_stmt = select(func.count(BroadcastLog.id)).where(
         BroadcastLog.match_reason.like("%Identity Bridge%"),
-        BroadcastLog.recording_id == bridge.recording_id
+        BroadcastLog.work_id == bridge.work_id
     )
     log_count = await db.execute(log_stmt)
     count = log_count.scalar() or 0
@@ -192,15 +195,25 @@ async def create_bridge(
     req: CreateBridgeRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """Manually create an Identity Bridge (Teach the AI)."""
+    """Manually create an Identity Bridge (Teach the AI).
     
-    # Verify recording exists
+    Phase 4: Creates bridge with work_id extracted from recording.
+    """
+    
+    # Verify recording exists and get work_id
     rec_stmt = select(Recording).where(Recording.id == req.recording_id)
     rec_res = await db.execute(rec_stmt)
     recording = rec_res.scalar_one_or_none()
     
     if not recording:
         raise HTTPException(status_code=404, detail="Recording not found")
+    
+    work_id = recording.work_id
+    if not work_id:
+        raise HTTPException(
+            status_code=400, 
+            detail="Recording does not have a work_id. Cannot create identity bridge."
+        )
     
     # Generate signature
     signature = Normalizer.generate_signature(req.raw_artist, req.raw_title)
@@ -218,12 +231,12 @@ async def create_bridge(
             detail="Bridge already exists for this artist/title pair"
         )
     
-    # Create bridge
+    # Phase 4: Create bridge with work_id only
     bridge = IdentityBridge(
         log_signature=signature,
         reference_artist=req.raw_artist,
         reference_title=req.raw_title,
-        recording_id=req.recording_id,
+        work_id=work_id,
         confidence=1.0
     )
     db.add(bridge)
@@ -235,15 +248,15 @@ async def create_bridge(
         signature=signature,
         raw_artist=req.raw_artist,
         raw_title=req.raw_title,
-        recording_id=req.recording_id,
-        log_ids=[], # Manual bridge creation doesn't immediately link logs in this endpoint
+        recording_id=req.recording_id,  # Keep for audit trail
+        log_ids=[],
         bridge_id=bridge.id
     )
     db.add(audit)
     
     await db.commit()
     
-    return {"message": "Bridge created", "id": bridge.id, "audit_id": audit.id}
+    return {"message": "Bridge created", "id": bridge.id, "audit_id": audit.id, "work_id": work_id}
 
 
 @router.post("/aliases")
@@ -382,6 +395,53 @@ async def get_aliases(db: AsyncSession = Depends(get_db)):
     stmt = select(ArtistAlias).order_by(ArtistAlias.created_at.desc())
     result = await db.execute(stmt)
     return result.scalars().all()
+
+
+def _revoke_bridge(audit) -> None:
+    """Revoke bridge if it exists."""
+    if audit.bridge:
+        audit.bridge.is_revoked = True
+
+
+async def _unlink_logs(db: AsyncSession, audit) -> set:
+    """Unlink logs and return set of unlinked log IDs."""
+    logs_to_unlink = set(audit.log_ids or [])
+    if audit.bridge_id and audit.bridge and audit.bridge.work_id:
+        stmt = select(BroadcastLog).where(
+            BroadcastLog.match_reason == "identity_bridge",
+            BroadcastLog.work_id == audit.bridge.work_id,
+        )
+        res = await db.execute(stmt)
+        target_sig = audit.signature
+        for log in res.scalars():
+            if Normalizer.generate_signature(log.raw_artist, log.raw_title) == target_sig:
+                logs_to_unlink.add(log.id)
+    if logs_to_unlink:
+        await db.execute(
+            update(BroadcastLog)
+            .where(BroadcastLog.id.in_(logs_to_unlink))
+            .values(work_id=None, match_reason=None)
+        )
+    return logs_to_unlink
+
+
+async def _recreate_queue_item(db: AsyncSession, audit, logs_to_unlink: set) -> None:
+    """Recreate or update DiscoveryQueue item for unlinked logs."""
+    if not logs_to_unlink:
+        return
+    q_stmt = select(DiscoveryQueue).where(DiscoveryQueue.signature == audit.signature)
+    queue_item = (await db.execute(q_stmt)).scalar_one_or_none()
+    if queue_item:
+        queue_item.count += len(logs_to_unlink)
+    else:
+        db.add(DiscoveryQueue(
+            signature=audit.signature,
+            raw_artist=audit.raw_artist,
+            raw_title=audit.raw_title,
+            count=len(logs_to_unlink),
+        ))
+
+
 @router.post("/audit/{audit_id}/undo")
 async def undo_verification_action(
     audit_id: int,
@@ -408,98 +468,12 @@ async def undo_verification_action(
             "was_already_undone": True
         }
 
-    # 3. Perform Undo Logic
     try:
-        # A. Revoke Bridge (if exists)
-        if original_audit.bridge:
-            original_audit.bridge.is_revoked = True
+        _revoke_bridge(original_audit)
+        logs_to_unlink = await _unlink_logs(db, original_audit)
+        await _recreate_queue_item(db, original_audit, logs_to_unlink)
 
-        # B. Unlink Logs
-        # Use simple unlinking for now - set recording_id=None
-        # We need to find logs that were linked by this action OR by the bridge
-        # The audit.log_ids list defines explicitly linked logs.
-        # We also want to catch any logs that auto-matched via this bridge?
-        # For safety/simplicity, we primarily trust log_ids from the audit, 
-        # plus any log currently matching this bridge.
-        
-        logs_to_unlink = set(original_audit.log_ids)
-        
-        # Find additional logs matched by this bridge ID (if bridge exists)
-        if original_audit.bridge_id:
-            # Revised logic for AC 3:
-            # We must unlink ANY logs matched by "identity_bridge" to this recording 
-            # if they match the signature of the bridge we are revoking.
-            # This handles "ghost matches" that happened automatically after the action.
-            
-            bridge_logs_stmt = select(BroadcastLog).where(
-                BroadcastLog.match_reason == "identity_bridge",
-                BroadcastLog.recording_id == original_audit.recording_id
-            )
-            bridge_logs_res = await db.execute(bridge_logs_stmt)
-            
-            # Filter in Python to avoid complex SQL substring/hash matching for signature
-            # Since we have the signature in the audit Log
-            target_sig = original_audit.signature
-            
-            for log in bridge_logs_res.scalars():
-                # We can re-generate signature to be sure, or check against raw values if they are close enough?
-                # Best is to regenerate signature 
-                log_sig = Normalizer.generate_signature(log.raw_artist, log.raw_title)
-                if log_sig == target_sig:
-                    logs_to_unlink.add(log.id)
-
-        # Perform Unlink
-        if logs_to_unlink:
-            unlink_stmt = (
-                update(BroadcastLog)
-                .where(BroadcastLog.id.in_(logs_to_unlink))
-                .values(
-                    recording_id=None,
-                    match_reason=None
-                )
-            )
-            await db.execute(unlink_stmt)
-
-        # C. Recreate DiscoveryQueue Item
-        # Count unmatched logs with this signature
-        # We need to re-calculate count.
-        # Since we just unlinked some, they are now unmatched.
-        # But we need to check ALL logs with this signature.
-        
-        # This part is expensive if we scan all logs. 
-        # Optimized: Count logs in logs_to_unlink? No, that's partial.
-        # Better: Create/Update queue item.
-        
-        # Let's count unmatched logs with this signature
-        # Note: Normalizer.generate_signature needs raw artist/title from logs.
-        # Or we can just count the logs we just unlinked + any existing unmatched?
-        
-        # For MVP correctness:
-        # 1. Unlink the targeted logs.
-        
-        # 2. Re-insert queue item with count = len(logs_to_unlink) 
-        # (This might be an undercount if there were other unmatched ones, but queue usually consolidates)
-        # Actually, if we just check if a queue item exists, and update it, or create new.
-        
-        q_stmt = select(DiscoveryQueue).where(DiscoveryQueue.signature == original_audit.signature)
-        q_res = await db.execute(q_stmt)
-        queue_item = q_res.scalar_one_or_none()
-        
-        count_to_add = len(logs_to_unlink)
-        if count_to_add > 0:
-            if queue_item:
-                queue_item.count += count_to_add
-            else:
-                queue_item = DiscoveryQueue(
-                    signature=original_audit.signature,
-                    raw_artist=original_audit.raw_artist,
-                    raw_title=original_audit.raw_title,
-                    count=count_to_add
-                    # suggested_recording_id=None (leave null to prompt re-match)
-                )
-                db.add(queue_item)
-
-        # D. Mark as Undone
+        # Mark as Undone
         original_audit.is_undone = True
         original_audit.undone_at = datetime.now()
 
@@ -521,7 +495,7 @@ async def undo_verification_action(
         return {
             "status": "success",
             "message": "Action undone",
-            "restored_queue_count": count_to_add
+            "restored_queue_count": len(logs_to_unlink),
         }
 
     except Exception as e:

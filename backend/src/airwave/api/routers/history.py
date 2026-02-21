@@ -1,3 +1,8 @@
+"""History endpoint for broadcast logs.
+
+Phase 4: Uses work relationship instead of recording.
+"""
+
 from datetime import datetime
 from typing import Optional
 
@@ -7,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from airwave.api.deps import get_db
-from airwave.core.models import BroadcastLog, Recording, Work
+from airwave.core.models import BroadcastLog, Work
 
 router = APIRouter()
 
@@ -20,13 +25,16 @@ async def get_logs(
     limit: int = 100,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get broadcast logs."""
+    """Get broadcast logs.
+    
+    Phase 4: Loads work relationship instead of recording.
+    """
     from datetime import timedelta
 
+    # Phase 4: Load work relationship (not recording)
     query = select(BroadcastLog).options(
         selectinload(BroadcastLog.station),
-        selectinload(BroadcastLog.recording)
-        .selectinload(Recording.work)
+        selectinload(BroadcastLog.work)
         .selectinload(Work.artist),
     )
 

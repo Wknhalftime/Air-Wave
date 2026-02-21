@@ -145,20 +145,20 @@ async def test_get_top_tracks(client, db_session):
     db_session.add(r)
     await db_session.flush()
 
-    # 2 Logs for this recording
+    # 2 Logs for this recording (link to work)
     log1 = BroadcastLog(
         station_id=s.id,
         raw_artist="A",
         raw_title="B",
         played_at=datetime.now(),
-        recording_id=r.id,
+        work_id=w.id,
     )
     log2 = BroadcastLog(
         station_id=s.id,
         raw_artist="A",
         raw_title="B",
         played_at=datetime.now(),
-        recording_id=r.id,
+        work_id=w.id,
     )
     db_session.add_all([log1, log2])
     await db_session.commit()
@@ -192,7 +192,7 @@ async def test_get_top_artists(client, db_session):
             raw_artist="A",
             raw_title="T",
             played_at=datetime.now(),
-            recording_id=r.id,
+            work_id=w.id,
         )
         db_session.add(log)
     await db_session.commit()
@@ -244,7 +244,7 @@ async def test_get_victory_stats(client, db_session):
         raw_artist="A",
         raw_title="T",
         played_at=datetime.now(),
-        recording_id=r.id,
+        work_id=w.id,
         match_reason="Identity Bridge (Exact Match)",
     )
     log_unmatched = BroadcastLog(

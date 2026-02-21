@@ -1,3 +1,5 @@
+"""In-memory store for tracking background task progress."""
+
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -28,48 +30,29 @@ class TaskProgress(BaseModel):
 
 class TaskStore:
     """In-memory store for tracking background task progress.
-    Thread-safe instance-based store with backward-compatible class methods.
 
-    Usage (Instance-based - Recommended):
-        # Create task store instance
+    Thread-safe. Use the module-level functions (create_task, update_progress, etc.)
+    for the global singleton, or instantiate TaskStore() for isolated state (e.g. tests).
+
+    Usage (module-level - recommended):
+        from airwave.core.task_store import create_task, update_progress, get_task
+
+        task = create_task("task-123", "scan", total=100)
+        update_progress("task-123", current=50, message="Processing...")
+        status = get_task("task-123")
+
+    Usage (instance-based, e.g. for dependency injection):
         task_store = TaskStore()
-
-        # Create new task
         task = task_store.create_task("task-123", "scan", total=100)
-
-        # Update progress
-        task_store.update_progress("task-123", current=50, message="Processing file 50")
-
-        # Mark complete
-        task_store.complete_task("task-123", success=True)
-
-        # Retrieve status
-        status = task_store.get_task("task-123")
-
-    Usage (Class methods - Backward Compatible):
-        # Uses global singleton instance
-        task = TaskStore.create_task("task-123", "scan", total=100)
-        TaskStore.update_progress("task-123", current=50, message="Processing file 50")
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize a new task store instance with isolated state."""
         self._tasks: Dict[str, TaskProgress] = {}
         self._lock = threading.Lock()
 
-    def create_task(
-        self, task_id: str, task_type: str, total: int
-    ) -> TaskProgress:
-        """Initialize a new task with progress tracking.
-
-        Args:
-            task_id: Unique identifier for the task
-            task_type: Type of task ('scan', 'sync', 'import')
-            total: Total number of items to process
-
-        Returns:
-            TaskProgress instance
-        """
+    def create_task(self, task_id: str, task_type: str, total: int) -> TaskProgress:
+        """Initialize a new task with progress tracking."""
         with self._lock:
             task = TaskProgress(
                 task_id=task_id,
@@ -92,7 +75,6 @@ class TaskStore:
                 if task.total > 0:
                     task.progress = current / task.total
                 else:
-                    # Sync/scan does not know total in advance; use pseudo-progress so UI bar advances
                     task.progress = min(0.99, current / (current + 100)) if current > 0 else 0.0
                 task.message = message
 
@@ -105,67 +87,44 @@ class TaskStore:
                 task.total = total
                 if message:
                     task.message = message
-                # Recalculate progress
-                task.progress = (
-                    task.current / task.total if task.total > 0 else 0.0
-                )
+                task.progress = task.current / task.total if task.total > 0 else 0.0
 
     def get_task(self, task_id: str) -> Optional[TaskProgress]:
-        """Retrieve the status of a task.
-
-        Args:
-            task_id: Task identifier
-
-        Returns:
-            TaskProgress instance or None if not found
-        """
+        """Retrieve the status of a task."""
         with self._lock:
             return self._tasks.get(task_id)
 
     def complete_task(
         self, task_id: str, success: bool = True, error: Optional[str] = None
     ) -> None:
-        """Mark a task as completed or failed and set the final message."""
+        """Mark a task as completed or failed."""
         with self._lock:
             if task := self._tasks.get(task_id):
                 task.status = "completed" if success else "failed"
                 task.completed_at = datetime.now(timezone.utc)
                 task.error = error
                 task.progress = 1.0 if success else task.progress
-                task.message = (
-                    "Completed successfully" if success else f"Failed: {error}"
-                )
+                task.message = "Completed successfully" if success else f"Failed: {error}"
 
     def cleanup_old_tasks(self, hours: int = 1) -> None:
         """Remove completed tasks older than specified hours."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         with self._lock:
             to_remove = [
-                task_id
-                for task_id, task in self._tasks.items()
+                tid
+                for tid, task in self._tasks.items()
                 if task.completed_at and task.completed_at < cutoff
             ]
-            for task_id in to_remove:
-                del self._tasks[task_id]
+            for tid in to_remove:
+                del self._tasks[tid]
 
     def get_all_tasks(self) -> Dict[str, TaskProgress]:
-        """Get all tasks (for debugging/admin purposes).
-
-        Returns:
-            Dictionary of all tasks
-        """
+        """Get all tasks (for debugging/admin purposes)."""
         with self._lock:
             return self._tasks.copy()
 
     def cancel_task(self, task_id: str) -> bool:
-        """Request cancellation of a running task.
-
-        Args:
-            task_id: Task identifier
-
-        Returns:
-            True if cancellation was requested, False if task not found or already completed
-        """
+        """Request cancellation of a running task."""
         with self._lock:
             if task := self._tasks.get(task_id):
                 if task.status == "running":
@@ -175,25 +134,14 @@ class TaskStore:
         return False
 
     def is_cancelled(self, task_id: str) -> bool:
-        """Check if a task has been requested to cancel.
-
-        Args:
-            task_id: Task identifier
-
-        Returns:
-            True if cancellation was requested, False otherwise
-        """
+        """Check if a task has been requested to cancel."""
         with self._lock:
             if task := self._tasks.get(task_id):
                 return task.cancel_requested
         return False
 
     def mark_cancelled(self, task_id: str) -> None:
-        """Mark a task as cancelled (called by the task itself when it stops).
-
-        Args:
-            task_id: Task identifier
-        """
+        """Mark a task as cancelled (called by the task itself when it stops)."""
         with self._lock:
             if task := self._tasks.get(task_id):
                 task.status = "cancelled"
@@ -201,99 +149,22 @@ class TaskStore:
                 task.message = "Cancelled by user"
 
 
-# Save instance methods before adding class methods
-_instance_create_task = TaskStore.create_task
-_instance_update_progress = TaskStore.update_progress
-_instance_update_total = TaskStore.update_total
-_instance_get_task = TaskStore.get_task
-_instance_complete_task = TaskStore.complete_task
-_instance_cleanup_old_tasks = TaskStore.cleanup_old_tasks
-_instance_get_all_tasks = TaskStore.get_all_tasks
-_instance_cancel_task = TaskStore.cancel_task
-_instance_is_cancelled = TaskStore.is_cancelled
-_instance_mark_cancelled = TaskStore.mark_cancelled
+# Global singleton instance
+task_store = TaskStore()
 
-# Global singleton instance for backward compatibility
-_global_task_store = TaskStore()
-
-
-# Backward-compatible class methods (delegate to global instance)
-# These allow existing code to continue working without changes
-@classmethod
-def _create_task_classmethod(cls, task_id: str, task_type: str, total: int) -> TaskProgress:
-    """Backward-compatible class method."""
-    return _instance_create_task(_global_task_store, task_id, task_type, total)
+# Module-level functions delegating to global task_store
+create_task = task_store.create_task
+update_progress = task_store.update_progress
+update_total = task_store.update_total
+get_task = task_store.get_task
+complete_task = task_store.complete_task
+cleanup_old_tasks = task_store.cleanup_old_tasks
+get_all_tasks = task_store.get_all_tasks
+cancel_task = task_store.cancel_task
+is_cancelled = task_store.is_cancelled
+mark_cancelled = task_store.mark_cancelled
 
 
-@classmethod
-def _update_progress_classmethod(cls, task_id: str, current: int, message: str) -> None:
-    """Backward-compatible class method."""
-    _instance_update_progress(_global_task_store, task_id, current, message)
-
-
-@classmethod
-def _update_total_classmethod(cls, task_id: str, total: int, message: Optional[str] = None) -> None:
-    """Backward-compatible class method."""
-    _instance_update_total(_global_task_store, task_id, total, message)
-
-
-@classmethod
-def _get_task_classmethod(cls, task_id: str) -> Optional[TaskProgress]:
-    """Backward-compatible class method."""
-    return _instance_get_task(_global_task_store, task_id)
-
-
-@classmethod
-def _complete_task_classmethod(cls, task_id: str, success: bool = True, error: Optional[str] = None) -> None:
-    """Backward-compatible class method."""
-    _instance_complete_task(_global_task_store, task_id, success, error)
-
-
-@classmethod
-def _cleanup_old_tasks_classmethod(cls, hours: int = 1) -> None:
-    """Backward-compatible class method."""
-    _instance_cleanup_old_tasks(_global_task_store, hours)
-
-
-@classmethod
-def _get_all_tasks_classmethod(cls) -> Dict[str, TaskProgress]:
-    """Backward-compatible class method."""
-    return _instance_get_all_tasks(_global_task_store)
-
-
-@classmethod
-def _cancel_task_classmethod(cls, task_id: str) -> bool:
-    """Backward-compatible class method."""
-    return _instance_cancel_task(_global_task_store, task_id)
-
-
-@classmethod
-def _is_cancelled_classmethod(cls, task_id: str) -> bool:
-    """Backward-compatible class method."""
-    return _instance_is_cancelled(_global_task_store, task_id)
-
-
-@classmethod
-def _mark_cancelled_classmethod(cls, task_id: str) -> None:
-    """Backward-compatible class method."""
-    _instance_mark_cancelled(_global_task_store, task_id)
-
-
-@classmethod
-def _get_global_classmethod(cls) -> TaskStore:
-    """Get the global singleton instance (for backward compatibility)."""
-    return _global_task_store
-
-
-# Add class methods to TaskStore for backward compatibility
-TaskStore.create_task = _create_task_classmethod  # type: ignore
-TaskStore.update_progress = _update_progress_classmethod  # type: ignore
-TaskStore.update_total = _update_total_classmethod  # type: ignore
-TaskStore.get_task = _get_task_classmethod  # type: ignore
-TaskStore.complete_task = _complete_task_classmethod  # type: ignore
-TaskStore.cleanup_old_tasks = _cleanup_old_tasks_classmethod  # type: ignore
-TaskStore.get_all_tasks = _get_all_tasks_classmethod  # type: ignore
-TaskStore.cancel_task = _cancel_task_classmethod  # type: ignore
-TaskStore.is_cancelled = _is_cancelled_classmethod  # type: ignore
-TaskStore.mark_cancelled = _mark_cancelled_classmethod  # type: ignore
-TaskStore.get_global = _get_global_classmethod  # type: ignore
+def get_task_store() -> TaskStore:
+    """Return the global task store instance (for dependency injection)."""
+    return task_store

@@ -1,5 +1,6 @@
 import { Music, Disc } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import { formatArtistForDisplay } from '../../utils/format';
 
 interface ArtistStats {
     id: number;
@@ -23,18 +24,18 @@ export function ArtistCard({ artist }: ArtistCardProps) {
                 {artist.avatar_url ? (
                     <img
                         src={artist.avatar_url}
-                        alt={artist.name}
+                        alt={formatArtistForDisplay(artist.name)}
                         className="w-full h-full object-cover"
                     />
                 ) : (
-                    artist.name.charAt(0).toUpperCase()
+                    formatArtistForDisplay(artist.name).charAt(0)
                 )}
             </div>
             <h3
                 className="text-lg font-semibold text-gray-900 text-center truncate w-full px-2"
-                title={artist.name}
+                title={formatArtistForDisplay(artist.name)}
             >
-                {artist.name}
+                {formatArtistForDisplay(artist.name)}
             </h3>
             <div className="flex items-center gap-3 mt-2 text-xs text-gray-500">
                 <span className="flex items-center gap-1">

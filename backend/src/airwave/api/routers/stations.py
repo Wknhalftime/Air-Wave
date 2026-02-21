@@ -11,13 +11,15 @@ router = APIRouter(tags=["Stations"])
 
 @router.get("/", response_model=List[dict])
 async def list_stations(db: AsyncSession = Depends(get_db)):
-    """List all stations with aggregate matching statistics."""
-    # Efficient query to get stations + total logs + matched logs
+    """List all stations with aggregate matching statistics.
+    
+    Phase 4: Uses work_id for match statistics.
+    """
     stmt = (
         select(
             Station,
             func.count(BroadcastLog.id).label("total_logs"),
-            func.count(BroadcastLog.recording_id).label("matched_logs")
+            func.count(BroadcastLog.work_id).label("matched_logs")  # Phase 4
         )
         .outerjoin(BroadcastLog, Station.id == BroadcastLog.station_id)
         .group_by(Station.id)
@@ -57,13 +59,14 @@ async def get_station_health(station_id: int, db: AsyncSession = Depends(get_db)
     # 2. Get Import Batches (Recent Activity)
     # Find batches that contain logs for this station.
     # We join BrowseLog -> ImportBatch and group by batch.
+    # Phase 4: Use work_id for match statistics
     stmt_batches = (
         select(
             ImportBatch.id,
             ImportBatch.created_at,
             ImportBatch.filename,
             func.count(BroadcastLog.id).label("total_in_batch"),
-            func.count(BroadcastLog.recording_id).label("matched_in_batch")
+            func.count(BroadcastLog.work_id).label("matched_in_batch")
         )
         .join(BroadcastLog, BroadcastLog.import_batch_id == ImportBatch.id)
         .where(BroadcastLog.station_id == station_id)
@@ -87,7 +90,7 @@ async def get_station_health(station_id: int, db: AsyncSession = Depends(get_db)
             "match_rate": round(rate, 1)
         })
 
-    # 3. Top Unmatched Tracks
+    # 3. Top Unmatched Tracks (Phase 4: check by work_id)
     stmt_unmatched = (
         select(
             BroadcastLog.raw_artist, 
@@ -96,7 +99,7 @@ async def get_station_health(station_id: int, db: AsyncSession = Depends(get_db)
         )
         .where(
             BroadcastLog.station_id == station_id,
-            BroadcastLog.recording_id.is_(None)
+            BroadcastLog.work_id.is_(None)
         )
         .group_by(BroadcastLog.raw_artist, BroadcastLog.raw_title)
         .order_by(desc("count"))

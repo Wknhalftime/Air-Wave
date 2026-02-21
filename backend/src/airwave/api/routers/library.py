@@ -1,6 +1,7 @@
+import os
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import and_, desc, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -28,6 +29,24 @@ from airwave.api.schemas import (
 )
 
 router = APIRouter()
+
+
+async def _get_artist_or_404(db: AsyncSession, artist_id: int) -> Artist:
+    """Get artist by ID or raise 404."""
+    stmt = select(Artist).where(Artist.id == artist_id)
+    result = await db.execute(stmt)
+    artist = result.scalar_one_or_none()
+    if not artist:
+        raise HTTPException(status_code=404, detail="Artist not found")
+    return artist
+
+
+async def _get_work_or_404(db: AsyncSession, work_id: int) -> Work:
+    """Get work by ID or raise 404."""
+    work = await db.get(Work, work_id)
+    if not work:
+        raise HTTPException(status_code=404, detail="Work not found")
+    return work
 
 
 @router.get("/artists", response_model=list[ArtistStats])
@@ -96,7 +115,6 @@ async def get_artist(
     row = result.one_or_none()
 
     if not row:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Artist not found")
 
     return ArtistDetail(
@@ -120,14 +138,7 @@ async def list_artist_works(
 
     Cached for 3 minutes with pagination parameters in cache key.
     """
-    # Verify artist exists
-    artist_stmt = select(Artist).where(Artist.id == artist_id)
-    artist_result = await db.execute(artist_stmt)
-    artist = artist_result.scalar_one_or_none()
-
-    if not artist:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="Artist not found")
+    artist = await _get_artist_or_404(db, artist_id)
 
     # Subquery to get all artist names for each work
     # This is correlated to Work.id and gets ALL artists, not just the filtered one
@@ -195,7 +206,6 @@ async def get_work(
     work_row = work_result.one_or_none()
 
     if not work_row:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Work not found")
 
     work = work_row.Work
@@ -245,20 +255,23 @@ async def list_work_recordings(
 
     Cached for 2 minutes with pagination and filter parameters in cache key.
     """
-    # Verify work exists
-    work_stmt = select(Work).where(Work.id == work_id)
-    work_result = await db.execute(work_stmt)
-    work = work_result.scalar_one_or_none()
-
-    if not work:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="Work not found")
+    work = await _get_work_or_404(db, work_id)
 
     # Query recordings with artist names and file status
     # Use subquery to check if recording has files
     has_file_subquery = (
         select(func.count(LibraryFile.id))
         .where(LibraryFile.recording_id == Recording.id)
+        .correlate(Recording)
+        .scalar_subquery()
+    )
+
+    # Subquery to get first file path for filename extraction
+    first_file_path_subquery = (
+        select(LibraryFile.path)
+        .where(LibraryFile.recording_id == Recording.id)
+        .order_by(LibraryFile.id)
+        .limit(1)
         .correlate(Recording)
         .scalar_subquery()
     )
@@ -273,6 +286,7 @@ async def list_work_recordings(
             Work.title.label("work_title"),
             func.group_concat(Artist.name, ', ').label("artist_names"),
             (has_file_subquery > 0).label("has_file"),
+            first_file_path_subquery.label("file_path"),
         )
         .join(Work, Recording.work_id == Work.id)
         .outerjoin(WorkArtist, Work.id == WorkArtist.work_id)
@@ -316,6 +330,7 @@ async def list_work_recordings(
             work_title=row.work_title,
             is_verified=row.is_verified,
             has_file=row.has_file,
+            filename=os.path.basename(row.file_path) if row.file_path else None,
         )
         for row in rows
     ]
@@ -394,6 +409,7 @@ async def get_pending_matches(
 ):
     """Get recent matches that might need verification."""
     # We select Log + Recording + Work + Artist info
+    # Phase 4: Join via work_id (not recording_id)
     stmt = (
         select(
             func.max(BroadcastLog.id).label("id"),
@@ -402,16 +418,14 @@ async def get_pending_matches(
             BroadcastLog.raw_artist,
             BroadcastLog.raw_title,
             func.max(BroadcastLog.match_reason).label("match_reason"),
-            BroadcastLog.recording_id,
+            BroadcastLog.work_id,
             Artist.name.label("artist_name"),
-            Recording.title.label("recording_title"),
             Work.title.label("work_title"),
         )
         .join(Station)
-        .join(Recording, BroadcastLog.recording_id == Recording.id)
-        .join(Work, Recording.work_id == Work.id)
+        .join(Work, BroadcastLog.work_id == Work.id)
         .join(Artist, Work.artist_id == Artist.id)
-        .where(BroadcastLog.recording_id.is_not(None))
+        .where(BroadcastLog.work_id.is_not(None))
         .where(BroadcastLog.match_reason.is_not(None))
         .where(BroadcastLog.match_reason.not_like("%Identity Bridge%"))
         .where(BroadcastLog.match_reason.not_like("%Verified by User%"))
@@ -422,9 +436,8 @@ async def get_pending_matches(
         .group_by(
             BroadcastLog.raw_artist,
             BroadcastLog.raw_title,
-            BroadcastLog.recording_id,
+            BroadcastLog.work_id,
             Artist.name,
-            Recording.title,
             Work.title,
         )
         .order_by(desc("played_at"))
@@ -442,11 +455,11 @@ async def get_pending_matches(
             "raw_artist": row.raw_artist,
             "raw_title": row.raw_title,
             "match_reason": row.match_reason,
-            "track": {  # Keep 'track' key for frontend
-                "id": row.recording_id,
+            "track": {  # Keep 'track' key for frontend compatibility
+                "id": row.work_id,  # Phase 4: Use work_id
                 "artist": row.artist_name,
-                "title": row.recording_title,  # Or row.work_title if simplified
-                "path": "N/A",  # Path is on LibraryFile, excluded for perf or need join
+                "title": row.work_title,
+                "path": "N/A",
             },
         }
         for row in rows
@@ -461,6 +474,8 @@ async def verify_match(
 ):
     """Manually verify a match.
     Creates an Identity Bridge entry.
+    
+    Phase 4: Uses work_id for identity resolution.
     """
     stmt = select(BroadcastLog).where(BroadcastLog.id == log_id)
     result = await db.execute(stmt)
@@ -469,29 +484,31 @@ async def verify_match(
     if not log:
         return {"error": "Log not found"}
 
-    # Fetch Recording/Work/Artist
-    rec_stmt = (
-        select(Recording)
-        .options(selectinload(Recording.work).selectinload(Work.artist))
-        .where(Recording.id == log.recording_id)
+    if not log.work_id:
+        return {"error": "Log has no work_id to verify"}
+
+    # Phase 4: Fetch Work/Artist directly
+    work_stmt = (
+        select(Work)
+        .options(selectinload(Work.artist))
+        .where(Work.id == log.work_id)
     )
-    rec_res = await db.execute(rec_stmt)
-    recording = rec_res.scalar_one()
+    work_res = await db.execute(work_stmt)
+    work = work_res.scalar_one()
 
     if apply_to_artist:
-        target_artist_name = recording.work.artist.name
+        target_artist_name = work.artist.name
 
-        # Find all logs with same raw_artist AND matched to a recording by this artist
+        # Phase 4: Find logs via Work -> Artist
         target_logs_stmt = (
             select(BroadcastLog)
-            .join(Recording)
-            .join(Work)
-            .join(Artist)
+            .join(Work, BroadcastLog.work_id == Work.id)
+            .join(Artist, Work.artist_id == Artist.id)
             .where(
                 BroadcastLog.raw_artist == log.raw_artist,
                 Artist.name == target_artist_name,
                 BroadcastLog.match_reason.not_like("%Verified%"),
-                BroadcastLog.recording_id.is_not(None),
+                BroadcastLog.work_id.is_not(None),
             )
         )
         target_logs_res = await db.execute(target_logs_stmt)
@@ -513,12 +530,13 @@ async def verify_match(
             ib_res = await db.execute(ib_stmt)
             existing = ib_res.scalar_one_or_none()
 
-            if not existing and target.recording_id:
+            # Phase 4: Create bridge with work_id
+            if not existing and target.work_id:
                 ib = IdentityBridge(
                     log_signature=sig,
                     reference_artist=target.raw_artist,
                     reference_title=target.raw_title,
-                    recording_id=target.recording_id,
+                    work_id=target.work_id,
                     confidence=1.0,
                 )
                 db.add(ib)
@@ -555,6 +573,8 @@ async def reject_match(
 ):
     """Reject a match (Unlink).
     Creates a new Virtual Recording to represent the distinct track.
+    
+    Phase 4: Uses work_id for identity resolution.
     """
     stmt = select(BroadcastLog).where(BroadcastLog.id == log_id)
     result = await db.execute(stmt)
@@ -563,35 +583,38 @@ async def reject_match(
     if not log:
         return {"error": "Log not found"}
 
-    if apply_to_artist and log.recording_id:
-        rec_stmt = (
-            select(Recording)
-            .options(selectinload(Recording.work).selectinload(Work.artist))
-            .where(Recording.id == log.recording_id)
+    if apply_to_artist and log.work_id:
+        # Phase 4: Get artist from work directly
+        work_stmt = (
+            select(Work)
+            .options(selectinload(Work.artist))
+            .where(Work.id == log.work_id)
         )
-        rec_res = await db.execute(rec_stmt)
-        recording = rec_res.scalar_one()
-        target_artist_name = recording.work.artist.name
+        work_res = await db.execute(work_stmt)
+        work = work_res.scalar_one()
+        target_artist_name = work.artist.name
 
-        # Subquery for Recording IDs by this artist
+        # Subquery for Work IDs by this artist
         sub_stmt = (
-            select(Recording.id)
-            .join(Work)
+            select(Work.id)
             .join(Artist)
             .where(Artist.name == target_artist_name)
         )
 
-        await db.execute(
+        # Phase 4: Unlink by setting work_id=None
+        unlink_result = await db.execute(
             update(BroadcastLog)
             .where(
                 BroadcastLog.raw_artist == log.raw_artist,
-                BroadcastLog.recording_id.in_(sub_stmt),
+                BroadcastLog.work_id.in_(sub_stmt),
             )
             .values(
-                recording_id=None,
+                work_id=None,
                 match_reason="Rejected by User (Batch via Artist)",
             )
         )
+        await db.commit()
+        return {"status": "rejected", "unlinked_count": unlink_result.rowcount or 0}
     else:
         # Create Virtual Recording
         signature = Normalizer.generate_signature(log.raw_artist, log.raw_title)
@@ -637,23 +660,23 @@ async def reject_match(
 
             # Note: No LibraryFile created for Virtual Recording
 
-        # 4. Identity Bridge
+        # 4. Identity Bridge (Phase 4: links to work, not recording)
         ib = IdentityBridge(
             log_signature=signature,
             reference_artist=log.raw_artist,
             reference_title=log.raw_title,
-            recording_id=new_rec.id,  # New Recording ID
+            work_id=work.id,  # Phase 4: Link to Work
             confidence=1.0,
         )
         db.add(ib)
 
-        # 5. Update Logs
+        # 5. Update Logs (Phase 4: link to work, not recording)
         await db.execute(
             update(BroadcastLog)
             .where(BroadcastLog.raw_artist == log.raw_artist)
             .where(BroadcastLog.raw_title == log.raw_title)
             .values(
-                recording_id=new_rec.id,
+                work_id=work.id,
                 match_reason="Verified by User (Separate Track)",
             )
         )

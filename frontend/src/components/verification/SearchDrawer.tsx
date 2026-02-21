@@ -1,13 +1,15 @@
 import { useState, useEffect, useRef } from 'react';
 import { Search, X, Loader2 } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
+import { toTitleCase, formatArtistForDisplay } from '../../utils/format';
 import { fetcher } from '../../lib/api';
 
 // Constants
 const SEARCH_DEBOUNCE_MS = 300;  // Delay before triggering search API call
 
 interface SearchResult {
-    id: number;
+    id: number;  // Recording ID
+    work_id: number;  // Phase 4: Work ID for identity layer
     artist: string;
     title: string;
     album: string | null;
@@ -212,8 +214,8 @@ export default function SearchDrawer({ isOpen, onClose, onSelect, initialQuery =
                                         : 'hover:bg-gray-50'
                                         }`}
                                 >
-                                    <div className="font-semibold text-gray-900">{result.title}</div>
-                                    <div className="text-sm text-gray-600 mt-1">{result.artist}</div>
+                                    <div className="font-semibold text-gray-900">{toTitleCase(result.title)}</div>
+                                    <div className="text-sm text-gray-600 mt-1">{formatArtistForDisplay(result.artist)}</div>
                                     <div className="flex items-center gap-2 mt-2">
                                         <span
                                             className={`text-xs px-2 py-0.5 rounded font-medium ${result.status === 'Gold'

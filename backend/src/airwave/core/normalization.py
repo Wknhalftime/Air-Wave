@@ -156,6 +156,62 @@ class Normalizer:
         return text.strip()
 
     @staticmethod
+    def _core_normalize(
+        text: str,
+        *,
+        strip_articles: bool = False,
+        strip_collab: str | None = None,
+        smart_quotes: bool = False,
+    ) -> str:
+        """Core normalization pipeline shared by clean, clean_artist, normalize_artist_full.
+
+        Args:
+            text: Raw text to normalize.
+            strip_articles: Remove leading "The", "A", "An".
+            strip_collab: "feat_suffix" for title feat. removal, "full" for artist collab removal, None for none.
+            smart_quotes: Normalize smart quotes to straight quotes.
+
+        Returns:
+            Normalized text.
+        """
+        if not text:
+            return ""
+
+        if smart_quotes:
+            text = text.replace("\u2018", "'").replace("\u2019", "'")
+            text = text.replace("\u201c", '"').replace("\u201d", '"')
+
+        text = Normalizer.strip_accents(text)
+        text = text.lower().strip()
+        text = Normalizer.remove_remaster_tags(text)
+        text = Normalizer.remove_year_brackets(text)
+        text = Normalizer.remove_truncation_markers(text)
+
+        if strip_articles:
+            text = re.sub(r"^(the|a|an)\s+", "", text)
+
+        if strip_collab == "feat_suffix":
+            text = re.sub(
+                r"\s+\b(feat\.?|ft\.?|f\.?|featuring)\b\s*.*$",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            )
+        elif strip_collab == "full":
+            text = re.sub(
+                r"\s+\b(duet|feat\.|ft\.|f\.|featuring|vs\.?)(?!\w)\s*.*$",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            )
+
+        text = text.replace("&", "and")
+        text = text.replace("+", "plus")
+        text = text.replace("/", " ")
+        text = re.sub(r"[^\w\s]", "", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
     def clean(text: str) -> str:
         """Enhanced text cleaning for titles with comprehensive normalization.
 
@@ -183,48 +239,7 @@ class Normalizer:
             >>> Normalizer.clean("Rock & Roll!")
             'rock and roll'
         """
-        if not text:
-            return ""
-
-        # 1. Smart quote normalization (before accent stripping)
-        text = text.replace("\u2018", "'").replace("\u2019", "'")  # Smart single
-        text = text.replace("\u201c", '"').replace("\u201d", '"')  # Smart double
-
-        # 2. Strip accents
-        text = Normalizer.strip_accents(text)
-        text = text.lower().strip()
-
-        # 3. Remove remaster tags
-        text = Normalizer.remove_remaster_tags(text)
-
-        # 4. Remove year brackets
-        text = Normalizer.remove_year_brackets(text)
-
-        # 5. Remove truncation markers
-        text = Normalizer.remove_truncation_markers(text)
-
-        # 6. Remove feat. suffix from titles (optional space after keyword: "ft. X" or "ft.X")
-        # IMPORTANT: Use word boundaries (\b) to avoid matching partial words
-        # e.g., "f." should not match "fire", "feat" should not match "feature"
-        # NOTE: "with" is NOT included because it appears in many legitimate song titles
-        # (e.g., "Fight Fire with Fire", "With or Without You", "Dancing with Myself")
-        text = re.sub(
-            r"\s+\b(feat\.?|ft\.?|f\.?|featuring)\b\s*.*$",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        )
-
-        # 7. Normalize special characters
-        text = text.replace("&", "and")
-        text = text.replace("+", "plus")
-        text = text.replace("/", " ")
-
-        # 8. Strip all non-word characters (except spaces)
-        text = re.sub(r"[^\w\s]", "", text)
-
-        # 9. Normalize whitespace
-        return re.sub(r"\s+", " ", text).strip()
+        return Normalizer._core_normalize(text, strip_collab="feat_suffix", smart_quotes=True)
 
     @staticmethod
     def generate_signature(artist: str, title: str) -> str:
@@ -275,45 +290,7 @@ class Normalizer:
             >>> Normalizer.clean_artist("Guns N' Roses")
             'guns n roses'
         """
-        if not text:
-            return ""
-
-        # 1. Strip accents
-        text = Normalizer.strip_accents(text)
-        text = text.lower().strip()
-
-        # 2. Remove remaster tags
-        text = Normalizer.remove_remaster_tags(text)
-
-        # 3. Remove year brackets and truncation (AC2: same as clean())
-        text = Normalizer.remove_year_brackets(text)
-        text = Normalizer.remove_truncation_markers(text)
-
-        # 4. Remove leading articles (The, A, An)
-        text = re.sub(r"^(the|a|an)\s+", "", text)
-
-        # 5. Remove collaboration keyword suffixes (duet, feat., ft., featuring, vs.) and anything after
-        # Use \b before and (?!\w) after (not \b after, since punctuation e.g. "feat." breaks \b)
-        # Require period for feat/ft to avoid stripping "Little Feat" (band name)
-        text = re.sub(
-            r"\s+\b(duet|feat\.|ft\.|f\.|featuring|vs\.?)(?!\w)\s*.*$",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        )
-
-        # 6. Normalize special characters
-        text = text.replace("&", "and")
-        text = text.replace("+", "plus")
-        text = text.replace("/", " ")
-        # Note: Commas are removed in step 7 (punctuation removal)
-        # This preserves numbers like "10,000" → "10000"
-
-        # 7. Remove all punctuation/symbols (but keep spaces)
-        text = re.sub(r"[^\w\s]", "", text)
-
-        # 8. Normalize spacing
-        return re.sub(r"\s+", " ", text).strip()
+        return Normalizer._core_normalize(text, strip_articles=True, strip_collab="full")
 
     @staticmethod
     def normalize_artist_full(text: str) -> str:
@@ -324,35 +301,7 @@ class Normalizer:
         "daft punk feat pharrell williams" (one artist), while split_artists
         still extracts individual artists for WorkArtist links.
         """
-        if not text:
-            return ""
-
-        # 1. Strip accents
-        text = Normalizer.strip_accents(text)
-        text = text.lower().strip()
-
-        # 2. Remove remaster tags
-        text = Normalizer.remove_remaster_tags(text)
-
-        # 3. Remove year brackets and truncation
-        text = Normalizer.remove_year_brackets(text)
-        text = Normalizer.remove_truncation_markers(text)
-
-        # 4. Remove leading articles
-        text = re.sub(r"^(the|a|an)\s+", "", text)
-
-        # 5. NO collaboration strip - preserve full string
-
-        # 6. Normalize special characters
-        text = text.replace("&", "and")
-        text = text.replace("+", "plus")
-        text = text.replace("/", " ")
-
-        # 7. Remove all punctuation/symbols (feat. -> feat)
-        text = re.sub(r"[^\w\s]", "", text)
-
-        # 8. Normalize spacing
-        return re.sub(r"\s+", " ", text).strip()
+        return Normalizer._core_normalize(text, strip_articles=True)
 
     @staticmethod
     def split_artists(text: str) -> List[str]:
@@ -461,6 +410,103 @@ class Normalizer:
         return title, "Original"
 
     @staticmethod
+    def _classify_version_type(text: str) -> str:
+        """Classify a version descriptor string into a canonical type."""
+        t = text.lower()
+        if "radio" in t or "edit" in t:
+            return "Radio"
+        if "video" in t:
+            return "Video"
+        if any(w in t for w in ["club", "dance"]):
+            return "Remix"
+        if "instrumental" in t:
+            return "Instrumental"
+        if "acoustic" in t:
+            return "Acoustic"
+        if "extended" in t:
+            return "Extended"
+        if "live" in t:
+            return "Live"
+        return "Remix"
+
+    @staticmethod
+    def _extract_version_parens(title: str) -> tuple[str, List[str]]:
+        """Extract version tags from parentheses and brackets. Returns (clean_title, version_parts)."""
+        version_parts: List[str] = []
+        clean_title = title
+        extracted_positions: List[tuple[int, int]] = []
+
+        matches = list(Normalizer.VERSION_REGEX.finditer(title))
+        for match in matches:
+            paren_content = match.group(1)
+            paren_lower = paren_content.lower()
+            words = paren_content.split()
+            if re.search(r"\b(part|pt\.?)\s*\d+\b", paren_lower):
+                continue
+            if paren_lower.startswith("the ") and len(words) > 2:
+                continue
+            version_parts.append(paren_content.title())
+            clean_title = clean_title.replace(match.group(0), "")
+            extracted_positions.append((match.start(), match.end()))
+
+        mix_paren_pattern = r"[\(\[]\s*([^)\]]*(?:mix|remix|edit|version)[^)\]]*)\s*[\)\]]"
+        for match in re.finditer(mix_paren_pattern, title, re.IGNORECASE):
+            if any(match.start() >= s and match.end() <= e for s, e in extracted_positions):
+                continue
+            paren_content = match.group(1).strip()
+            paren_lower = paren_content.lower()
+            if re.search(r"\b(part|pt\.?)\s*\d+\b", paren_lower):
+                continue
+            version_parts.append(Normalizer._classify_version_type(paren_content))
+            clean_title = clean_title.replace(match.group(0), "").strip()
+            extracted_positions.append((match.start(), match.end()))
+
+        remaining_parens = re.findall(r"[\(\[]([^\)\]]+)[\)\]]", clean_title)
+        for paren_content in remaining_parens:
+            words = paren_content.split()
+            paren_lower = paren_content.lower()
+            if re.search(r"\b(part|pt\.?)\s*\d+\b", paren_lower):
+                continue
+            if paren_lower.startswith("the ") and len(words) > 2:
+                continue
+            if len(words) <= 3 and any(
+                w in paren_lower for w in ["edit", "mix", "version", "cut", "take", "session"]
+            ):
+                version_parts.append(paren_content.title())
+                clean_title = clean_title.replace(f"({paren_content})", "").replace(f"[{paren_content}]", "")
+
+        return clean_title, version_parts
+
+    @staticmethod
+    def _extract_version_dash(clean_title: str, version_parts: List[str]) -> tuple[str, List[str]]:
+        """Extract dash-separated version tags. Returns (clean_title, version_parts)."""
+        dash_pattern = r"\s+-\s+(live|remix|mix|edit|version|demo|radio|acoustic|unplugged)\b.*$"
+        dash_match = re.search(dash_pattern, clean_title, re.IGNORECASE)
+        if dash_match:
+            version_parts = version_parts + [dash_match.group(1).title()]
+            clean_title = re.sub(dash_pattern, "", clean_title, flags=re.IGNORECASE)
+        return clean_title, version_parts
+
+    @staticmethod
+    def _extract_version_embedded(clean_title: str, version_parts: List[str]) -> tuple[str, List[str]]:
+        """Extract embedded remix/mix descriptors (no delimiters). Returns (clean_title, version_parts)."""
+        embedded_patterns = [
+            (r'\s+([A-Z]\w+\s+){1,2}(radio|video|club|dance)\s+mix$', 'named_remix'),
+            (r'\s+the\s+\w+\s+mix$', 'generic_mix'),
+            (r'\s+(radio|video|club|dance|extended|instrumental|vocal|dub|acoustic)\s+mix$', 'mix_type'),
+            (r'\s+(radio|video|club|dance|extended)\s+edit$', 'edit_type'),
+            (r'\s+(radio|video|club|dance)\s+version$', 'version_type'),
+        ]
+        for pattern, _ in embedded_patterns:
+            match = re.search(pattern, clean_title, re.IGNORECASE)
+            if match:
+                descriptor = match.group(0).strip()
+                version_parts = version_parts + [Normalizer._classify_version_type(descriptor)]
+                clean_title = clean_title[:match.start()].strip()
+                break
+        return clean_title, version_parts
+
+    @staticmethod
     def extract_version_type_enhanced(
         title: str, album_title: str | None = None
     ) -> tuple[str, str]:
@@ -507,169 +553,27 @@ class Normalizer:
         if not title:
             return "", "Original"
 
-        version_parts = []
-        clean_title = title
+        clean_title, version_parts = Normalizer._extract_version_parens(title)
+        clean_title, version_parts = Normalizer._extract_version_dash(clean_title, version_parts)
 
-        # Strategy 1: Extract parentheses/brackets with version keywords
-        # BUT check negative patterns first to avoid extracting part numbers/subtitles
-        extracted_positions = []  # Track what we've extracted to avoid duplicates
-        matches = list(Normalizer.VERSION_REGEX.finditer(title))
-        for match in matches:
-            paren_content = match.group(1)
-            paren_lower = paren_content.lower()
-            words = paren_content.split()
-
-            # NEGATIVE PATTERN 1: Skip part numbers (different works, not versions)
-            if re.search(r"\b(part|pt\.?)\s*\d+\b", paren_lower):
-                continue
-
-            # NEGATIVE PATTERN 2: Skip subtitles starting with "The"
-            if paren_lower.startswith("the ") and len(words) > 2:
-                continue
-
-            # Extract this version tag
-            version_parts.append(paren_content.title())
-            clean_title = clean_title.replace(match.group(0), "")
-            extracted_positions.append((match.start(), match.end()))
-
-        # Strategy 1.5: Extract parentheses/brackets with mix/remix descriptors
-        # Handles cases like "(the video mix)", "(davidson ospina radio mix)"
-        # This catches mix descriptors that don't start with a keyword (missed by Strategy 1)
-        mix_paren_pattern = r"[\(\[]\s*([^)\]]*(?:mix|remix|edit|version)[^)\]]*)\s*[\)\]]"
-        mix_matches = list(re.finditer(mix_paren_pattern, title, re.IGNORECASE))
-        for match in mix_matches:
-            # Skip if already extracted by Strategy 1
-            if any(match.start() >= start and match.end() <= end for start, end in extracted_positions):
-                continue
-
-            paren_content = match.group(1).strip()
-            paren_lower = paren_content.lower()
-
-            # NEGATIVE PATTERN: Skip part numbers
-            if re.search(r"\b(part|pt\.?)\s*\d+\b", paren_lower):
-                continue
-
-            # Classify the version type based on keywords
-            if 'radio' in paren_lower or 'edit' in paren_lower:
-                version_parts.append('Radio')
-            elif 'video' in paren_lower:
-                version_parts.append('Video')
-            elif any(word in paren_lower for word in ['club', 'dance']):
-                version_parts.append('Remix')
-            elif 'instrumental' in paren_lower:
-                version_parts.append('Instrumental')
-            elif 'acoustic' in paren_lower:
-                version_parts.append('Acoustic')
-            elif 'extended' in paren_lower:
-                version_parts.append('Extended')
-            elif 'live' in paren_lower:
-                version_parts.append('Live')
-            else:
-                version_parts.append('Remix')
-
-            clean_title = clean_title.replace(match.group(0), "").strip()
-            extracted_positions.append((match.start(), match.end()))
-
-        # Strategy 2: Check for dash-separated versions
-        # "Song Title - Live Version" or "Song Title - Radio Edit"
-        dash_pattern = r"\s+-\s+(live|remix|mix|edit|version|demo|radio|acoustic|unplugged)\b.*$"
-        dash_match = re.search(dash_pattern, clean_title, re.IGNORECASE)
-        if dash_match:
-            version_parts.append(dash_match.group(1).title())
-            clean_title = re.sub(dash_pattern, "", clean_title, flags=re.IGNORECASE)
-
-        # Strategy 3: Album context heuristics (conservative)
-        # Only apply if no version info already extracted
         if album_title and not version_parts:
             album_lower = album_title.lower()
-            live_keywords = ["live", "concert", "unplugged", "acoustic session"]
-            if any(keyword in album_lower for keyword in live_keywords):
+            if any(kw in album_lower for kw in ["live", "concert", "unplugged", "acoustic session"]):
                 version_parts.append("Live")
 
-        # Strategy 4: Extract embedded remix/mix descriptors (no delimiters)
-        # These patterns catch descriptive remix names embedded in titles
-        # Examples: "song davidson ospina radio mix", "song the video mix"
-        #
-        # Note: We use capitalized words to identify remix artist names (e.g., "Davidson Ospina")
-        # to avoid matching common lowercase words like "to give radio mix"
-        embedded_patterns = [
-            # Named remixes with capitalized names: "Davidson Ospina Radio Mix"
-            # This pattern requires at least one capital letter in the remix artist name
-            (r'\s+([A-Z]\w+\s+){1,2}(radio|video|club|dance)\s+mix$', 'named_remix'),
+        clean_title, version_parts = Normalizer._extract_version_embedded(clean_title, version_parts)
 
-            # Generic "the X mix" patterns at end
-            # Examples: "the video mix", "the conversation mix"
-            (r'\s+the\s+\w+\s+mix$', 'generic_mix'),
-
-            # Common mix types at end of title (simple patterns)
-            (r'\s+(radio|video|club|dance|extended|instrumental|vocal|dub|acoustic)\s+mix$', 'mix_type'),
-            (r'\s+(radio|video|club|dance|extended)\s+edit$', 'edit_type'),
-            (r'\s+(radio|video|club|dance)\s+version$', 'version_type'),
-        ]
-
-        for pattern, pattern_type in embedded_patterns:
-            match = re.search(pattern, clean_title, re.IGNORECASE)
-            if match:
-                descriptor = match.group(0).strip()
-                clean_title = clean_title[:match.start()].strip()
-
-                # Classify the version type based on keywords
-                descriptor_lower = descriptor.lower()
-                if 'radio' in descriptor_lower or 'edit' in descriptor_lower:
-                    version_parts.append('Radio')
-                elif 'video' in descriptor_lower:
-                    version_parts.append('Video')
-                elif any(word in descriptor_lower for word in ['club', 'dance']):
-                    version_parts.append('Remix')
-                elif 'instrumental' in descriptor_lower:
-                    version_parts.append('Instrumental')
-                elif 'acoustic' in descriptor_lower:
-                    version_parts.append('Acoustic')
-                elif 'extended' in descriptor_lower:
-                    version_parts.append('Extended')
-                else:
-                    version_parts.append('Remix')
-
-                # Only extract first embedded pattern to avoid over-extraction
-                break
-
-        # Strategy 5: Handle remaining parentheses with negative patterns
-        remaining_parens = re.findall(r"[\(\[]([^\)\]]+)[\)\]]", clean_title)
-        for paren_content in remaining_parens:
-            words = paren_content.split()
-            paren_lower = paren_content.lower()
-
-            # NEGATIVE PATTERN 1: Skip part numbers (different works, not versions)
-            if re.search(r"\b(part|pt\.?)\s*\d+\b", paren_lower):
-                continue
-
-            # NEGATIVE PATTERN 2: Skip subtitles starting with "The"
-            if paren_lower.startswith("the ") and len(words) > 2:
-                continue
-
-            # Extract if short and contains version keywords
-            if len(words) <= 3 and any(
-                word in paren_lower
-                for word in ["edit", "mix", "version", "cut", "take", "session"]
-            ):
-                version_parts.append(paren_content.title())
-                clean_title = clean_title.replace(f"({paren_content})", "")
-                clean_title = clean_title.replace(f"[{paren_content}]", "")
-
-        # Clean up the title
-        clean_title = re.sub(r"\s*[\(\[]\s*[\)\]]", "", clean_title)  # Empty brackets
+        clean_title = re.sub(r"\s*[\(\[]\s*[\)\]]", "", clean_title)
         clean_title = re.sub(r"\s+", " ", clean_title).strip()
 
-        # Combine version parts
         if version_parts:
-            # Deduplicate while preserving order
-            seen = set()
-            unique_parts = []
-            for part in version_parts:
-                if part.lower() not in seen:
-                    unique_parts.append(part)
-                    seen.add(part.lower())
-            version_type = " / ".join(unique_parts)
+            seen: set[str] = set()
+            unique: List[str] = []
+            for p in version_parts:
+                if p.lower() not in seen:
+                    unique.append(p)
+                    seen.add(p.lower())
+            version_type = " / ".join(unique)
         else:
             version_type = "Original"
 

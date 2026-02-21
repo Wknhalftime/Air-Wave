@@ -8,9 +8,9 @@ to determine match quality.
 Matching Strategies (in order):
     1. Identity Bridge: Pre-verified permanent mappings
     2. Exact Match: Normalized exact string matching
-    3. Variant Match: High fuzzy similarity (85% artist, 80% title)
-    4. Vector Semantic: ChromaDB cosine similarity search
-    5. Alias Match: Lower threshold for manual review (70%)
+    3. High Confidence: Fuzzy similarity above auto-accept threshold (configurable via Match Tuner)
+    4. Review Confidence: Fuzzy similarity above review threshold (configurable via Match Tuner)
+    5. Vector Semantic: ChromaDB cosine similarity search with title guard
 
 Typical usage example:
     matcher = Matcher(session)
@@ -21,10 +21,11 @@ Typical usage example:
 """
 
 import difflib
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
-from sqlalchemy import select, tuple_
+from sqlalchemy import delete, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -39,7 +40,12 @@ from airwave.core.models import (
 )
 from sqlalchemy import delete, func
 from airwave.core.normalization import Normalizer
-from airwave.core.task_store import TaskStore
+from airwave.core.task_store import (
+    is_cancelled,
+    mark_cancelled,
+    update_progress,
+    update_total,
+)
 from airwave.core.vector_db import VectorDB
 
 
@@ -51,11 +57,13 @@ class Matcher:
     semantic similarity searches. It's optimized for batch processing
     and includes diagnostic capabilities for troubleshooting.
 
-    Matching thresholds are configured in settings (core/config.py):
-        - MATCH_CONFIDENCE_HIGH_ARTIST: 0.85 (Artist similarity for variant match)
-        - MATCH_CONFIDENCE_HIGH_TITLE: 0.80 (Title similarity for variant match)
-        - MATCH_ALIAS_ARTIST_SCORE: 0.70 (Lower threshold for alias/manual review)
+    Matching thresholds are configured via Match Tuner UI (stored in settings):
+        - MATCH_VARIANT_ARTIST_SCORE: 0.85 (Auto-accept threshold for artist)
+        - MATCH_VARIANT_TITLE_SCORE: 0.80 (Auto-accept threshold for title)
+        - MATCH_ALIAS_ARTIST_SCORE: 0.70 (Review threshold for artist)
+        - MATCH_ALIAS_TITLE_SCORE: 0.70 (Review threshold for title)
         - MATCH_VECTOR_STRONG_DIST: 0.15 (Max cosine distance for vector search)
+        - MATCH_VECTOR_TITLE_GUARD: 0.5 (Minimum title similarity for vector matches)
 
     Attributes:
         session: Async SQLAlchemy database session.
@@ -118,7 +126,10 @@ class Matcher:
             print(f"Best match: {match_info['match']}")
             print(f"Candidates: {match_info['candidates']}")
         """
-        print(f"DEBUG: match_batch called with {queries}")
+        start_time = time.perf_counter()
+        n_queries = len(queries)
+        logger.debug(f"match_batch: {n_queries} queries")
+
         results = {}
 
         # 0. Deduplicate
@@ -144,10 +155,9 @@ class Matcher:
         signatures = list(sig_map.keys())
 
         # 1. Bulk Identity Bridge Lookup
-        # Note: IdentityBridge now links to recording_id
-
-        # 1. Bulk Identity Bridge Lookup
-        # Note: IdentityBridge now links to recording_id
+        # Phase 4: IdentityBridge links to work_id (Identity Layer)
+        # Bridge matches return work_id; non-bridge matches return recording_id
+        # Callers should handle both cases appropriately
 
         stmt = select(IdentityBridge).where(
             IdentityBridge.log_signature.in_(signatures)
@@ -163,7 +173,12 @@ class Matcher:
         for b in bridges:
             found_signatures.add(b.log_signature)
             for original in sig_map[b.log_signature]:
-                match_res = (b.recording_id, "Identity Bridge (Exact Match)")
+                # Phase 4: Return work_id for identity bridge matches
+                # This allows callers to use work_id directly without re-lookup
+                logger.debug(
+                    f"Identity bridge hit: {b.log_signature} -> work_id={b.work_id}"
+                )
+                match_res = (b.work_id, "Identity Bridge (Work Match)")
                 if explain:
                     bridge_matches[original] = match_res
                 else:
@@ -192,7 +207,6 @@ class Matcher:
             exact_matches_found = {}
             for i in range(0, len(residual_norms_list), 500):
                 chunk = residual_norms_list[i : i + 500]
-                print(f"DEBUG: Matcher looking for chunks: {chunk}")
                 stmt = (
                     select(Recording)
                     .join(Work)
@@ -207,8 +221,6 @@ class Matcher:
                 )
                 res = await self.session.execute(stmt)
                 found_recordings = res.scalars().all()
-                print(f"DEBUG: Matcher found: {found_recordings}")
-                
                 for rec in found_recordings:
                     # Map back to clean keys
                     # Note: We assume normalization is stable
@@ -230,6 +242,9 @@ class Matcher:
                      # Find all original queries that map to this clean pair
                     originals = norm_map.get(clean_pair, [])
                     for raw_q in originals:
+                        logger.debug(
+                            f"Exact match: {raw_q[0]} - {raw_q[1]} -> rec_id={rec.id}"
+                        )
                         match_res = (rec.id, "Exact DB Match")
                         if explain:
                             results[raw_q] = {
@@ -343,15 +358,36 @@ class Matcher:
                     if best_match[0] is None:
                         best_match = (tid, "Exact Text Match (Cleaned)")
 
+                # Phase 1 Fix: Use Match Tuner settings (MATCH_VARIANT_*) instead of hardcoded MATCH_CONFIDENCE_HIGH_*
                 elif (
-                    artist_sim > settings.MATCH_CONFIDENCE_HIGH_ARTIST
-                    and title_sim > settings.MATCH_CONFIDENCE_HIGH_TITLE
+                    artist_sim > settings.MATCH_VARIANT_ARTIST_SCORE  # Match Tuner "auto" threshold
+                    and title_sim > settings.MATCH_VARIANT_TITLE_SCORE  # Match Tuner "auto" threshold
                 ):
                     candidate_info["match_type"] = "High Confidence"
                     if best_match[0] is None:
+                        logger.info(
+                            f"Variant match: '{clean_a}' - '{clean_t}' -> rec_id={tid} "
+                            f"(artist_sim={artist_sim:.2f}, title_sim={title_sim:.2f})"
+                        )
                         best_match = (
                             tid,
                             f"High Confidence Match (Artist: {int(artist_sim*100)}%, Title: {int(title_sim*100)}%, Vector: {1-dist:.2f})",
+                        )
+
+                # Check if match meets review threshold (lower than auto-accept)
+                elif (
+                    artist_sim > settings.MATCH_ALIAS_ARTIST_SCORE  # Match Tuner "review" threshold
+                    and title_sim > settings.MATCH_ALIAS_TITLE_SCORE  # Match Tuner "review" threshold
+                ):
+                    candidate_info["match_type"] = "Review Confidence"
+                    if best_match[0] is None:
+                        logger.info(
+                            f"Review match: '{clean_a}' - '{clean_t}' -> rec_id={tid} "
+                            f"(artist_sim={artist_sim:.2f}, title_sim={title_sim:.2f})"
+                        )
+                        best_match = (
+                            tid,
+                            f"Review Confidence Match (Artist: {int(artist_sim*100)}%, Title: {int(title_sim*100)}%, Vector: {1-dist:.2f})",
                         )
 
                 elif (
@@ -360,6 +396,10 @@ class Matcher:
                 ):
                     candidate_info["match_type"] = "Vector Strong"
                     if best_match[0] is None:
+                        logger.info(
+                            f"Vector match: '{clean_a}' - '{clean_t}' -> rec_id={tid} "
+                            f"(dist={dist:.3f}, title_sim={title_sim:.2f})"
+                        )
                         best_match = (
                             tid,
                             f"Vector Similarity (Very High: {1-dist:.2f})",
@@ -371,6 +411,10 @@ class Matcher:
                 ):
                     candidate_info["match_type"] = "Title+Vector"
                     if best_match[0] is None:
+                        logger.info(
+                            f"Title+Vector match: '{clean_a}' - '{clean_t}' -> rec_id={tid} "
+                            f"(title_sim={title_sim:.2f}, dist={dist:.3f})"
+                        )
                         best_match = (
                             tid,
                             f"Title Match + Vector (Confidence: {1-dist:.2f})",
@@ -381,6 +425,10 @@ class Matcher:
             # Use 'best_match' found in loop (first priority win)
 
             for raw_q in originals:
+                if best_match[0] is None:
+                    logger.debug(
+                        f"No match: '{raw_q[0]}' - '{raw_q[1]}' (explain={explain})"
+                    )
                 if explain:
                     # Enrich candidates with serializable track info
                     serializable_candidates = []
@@ -420,6 +468,15 @@ class Matcher:
                     "note": "Identity Bridge",
                 }
 
+        elapsed = time.perf_counter() - start_time
+        def _rec_id(v):
+            if isinstance(v, tuple):
+                return v[0]
+            return v.get("match", (None,))[0]
+        matched = sum(1 for v in results.values() if _rec_id(v) is not None)
+        logger.info(
+            f"match_batch: {n_queries} queries, {matched} matched, {elapsed:.2f}s"
+        )
         return results
 
     async def find_match(
@@ -442,14 +499,14 @@ class Matcher:
         await self.session.execute(delete(DiscoveryQueue))
         
         # 2. Fetch Unmatched Logs (Aggregated by Raw Text)
-        # We group by raw text first to let SQL do the heavy lifting of counting identical strings
+        # Phase 4: Check by work_id (not recording_id) to find unmatched logs
         stmt = (
             select(
                 BroadcastLog.raw_artist, 
                 BroadcastLog.raw_title, 
                 func.count(BroadcastLog.id)
             )
-            .where(BroadcastLog.recording_id.is_(None))
+            .where(BroadcastLog.work_id.is_(None))
             .group_by(BroadcastLog.raw_artist, BroadcastLog.raw_title)
         )
         result = await self.session.execute(stmt)
@@ -458,7 +515,7 @@ class Matcher:
         if not rows:
             logger.info("No unmatched logs found.")
             if task_id:
-                TaskStore.update_progress(task_id, 100, "No unmatched logs found.")
+                update_progress(task_id, 100, "No unmatched logs found.")
             return 0
 
         # 3. Group by Normalized Signature in Python
@@ -487,49 +544,168 @@ class Matcher:
         logger.info(f"Aggregated into {total_items} unique signatures.")
         
         if task_id:
-             TaskStore.update_total(task_id, total_items, f"Processing {total_items} discovery items...")
+            update_total(task_id, total_items, f"Processing {total_items} discovery items...")
 
         # 4. Create Queue Objects
         dq_objects = [DiscoveryQueue(**item) for item in queue_items]
         self.session.add_all(dq_objects)
         await self.session.flush() # Flush to ensure they are tracked, though we don't need IDs yet (PK is signature)
         
-        # 5. Run Automatch for Suggestions
+        # 5. Run Automatch for Suggestions with Three-Range Filtering
         # Process in batches to efficiently find suggestions without overloading
         BATCH_SIZE = 500
         processed = 0
-        
+        auto_linked_count = 0  # Track auto-linked items (Phase 3)
+
         # Map for quick update
         obj_map = {obj.signature: obj for obj in dq_objects}
-        
+
+        # Phase 2 & 3: Three-range filtering + Identity Bridge auto-linking
+        # - Auto-Accept: High confidence matches → Auto-link to BroadcastLog
+        # - Review: Medium confidence matches → Add to Discovery Queue with suggestion
+        # - Reject: Low confidence matches → Don't add to Discovery Queue
+        # - Identity Bridge: Pre-verified → Auto-link to BroadcastLog
+
         for i in range(0, total_items, BATCH_SIZE):
+            # Check for cancellation before each batch
+            if task_id and is_cancelled(task_id):
+                await self.session.commit()
+                mark_cancelled(task_id)
+                logger.warning(f"Discovery cancelled after processing {processed}/{total_items} items")
+                return len(obj_map)
+
             batch_objs = dq_objects[i : i + BATCH_SIZE]
             batch_queries = [(obj.raw_artist, obj.raw_title) for obj in batch_objs]
-            
+
             # Use existing efficient match_batch
             matches = await self.match_batch(batch_queries)
-            
-            for (qa, qt), (rec_id, _) in matches.items():
-                if rec_id:
-                    sig = Normalizer.generate_signature(qa, qt)
+
+            # Check for cancellation after match_batch (can take 30+ sec); break before categorization
+            if task_id and is_cancelled(task_id):
+                await self.session.commit()
+                mark_cancelled(task_id)
+                logger.warning(f"Discovery cancelled after processing {processed}/{total_items} items")
+                return len(obj_map)
+
+            # Categorize matches by confidence level
+            auto_accept_matches = {}  # sig -> work_id (auto-link these)
+            review_matches = {}  # sig -> work_id (suggest these)
+            reject_matches = set()  # sig (don't add to queue)
+
+            for (qa, qt), (match_id, reason) in matches.items():
+                if not match_id:
+                    continue
+
+                sig = Normalizer.generate_signature(qa, qt)
+
+                # Phase 3: Identity Bridge matches are pre-verified → Auto-link
+                if "Identity Bridge" in reason:
+                    # match_id is already work_id for bridge matches
+                    auto_accept_matches[sig] = match_id
+                    logger.info(f"Identity Bridge auto-link: {qa} - {qt} -> work_id={match_id}")
+
+                # Exact matches always go to review (user should verify)
+                elif "Exact" in reason:
+                    # Get work_id from recording_id
+                    recording = await self.session.get(Recording, match_id)
+                    if recording and recording.work_id:
+                        review_matches[sig] = recording.work_id
+
+                # High Confidence matches → Auto-accept if above threshold
+                elif "High Confidence" in reason:
+                    # Get work_id from recording_id
+                    recording = await self.session.get(Recording, match_id)
+                    if recording and recording.work_id:
+                        auto_accept_matches[sig] = recording.work_id
+                        logger.info(f"High confidence auto-link: {qa} - {qt} -> work_id={recording.work_id}")
+
+                # Review Confidence matches → Add to queue for manual review
+                elif "Review Confidence" in reason:
+                    # Get work_id from recording_id
+                    recording = await self.session.get(Recording, match_id)
+                    if recording and recording.work_id:
+                        review_matches[sig] = recording.work_id
+
+                # Vector matches → Only suggest if they meet review threshold
+                # (Vector matches don't have explicit confidence scores in reason string)
+                elif "Vector" in reason:
+                    # Get work_id from recording_id
+                    recording = await self.session.get(Recording, match_id)
+                    if recording and recording.work_id:
+                        # Vector matches are lower confidence - only add to review queue
+                        review_matches[sig] = recording.work_id
+
+                else:
+                    # Unknown match type or below review threshold → Reject
+                    reject_matches.add(sig)
+
+            # Auto-link high confidence matches directly to BroadcastLog
+            if auto_accept_matches:
+                # Batch update BroadcastLogs with work_id
+                for sig, work_id in auto_accept_matches.items():
+                    stmt = (
+                        select(BroadcastLog)
+                        .where(BroadcastLog.raw_artist == obj_map[sig].raw_artist)
+                        .where(BroadcastLog.raw_title == obj_map[sig].raw_title)
+                        .where(BroadcastLog.work_id.is_(None))
+                    )
+                    result = await self.session.execute(stmt)
+                    logs = result.scalars().all()
+
+                    for log in logs:
+                        log.work_id = work_id
+                        auto_linked_count += 1
+
+                    # Remove from Discovery Queue (don't need manual review)
                     if sig in obj_map:
-                        obj_map[sig].suggested_recording_id = rec_id
+                        await self.session.delete(obj_map[sig])
+                        del obj_map[sig]
+
+            # Add review matches to Discovery Queue with suggestions
+            for sig, work_id in review_matches.items():
+                if sig in obj_map:
+                    obj_map[sig].suggested_work_id = work_id
+
+            # Remove rejected matches from Discovery Queue
+            for sig in reject_matches:
+                if sig in obj_map:
+                    await self.session.delete(obj_map[sig])
+                    del obj_map[sig]
             
             processed += len(batch_objs)
             if task_id and i % 1000 == 0:
-                 TaskStore.update_progress(
+                 update_progress(
                     task_id, 
                     processed, 
                     f"Analyzed {processed}/{total_items} items..."
                 )
 
         await self.session.commit()
-        logger.success(f"Discovery Queue Rebuilt. {total_items} items active.")
-        return total_items
+
+        # Calculate final counts
+        queue_items_count = len(obj_map)  # Items remaining in Discovery Queue
+        rejected_count = total_items - queue_items_count - auto_linked_count
+
+        logger.success(
+            f"Discovery Queue Rebuilt: {queue_items_count} items need review, "
+            f"{auto_linked_count} auto-linked, {rejected_count} rejected (below threshold)"
+        )
+
+        if task_id:
+            update_progress(
+                task_id,
+                total_items,
+                f"Complete: {queue_items_count} items need review, {auto_linked_count} auto-linked"
+            )
+
+        return queue_items_count
 
     async def link_orphaned_logs(self) -> int:
-        """Links logs that have a NULL recording_id to a recording via IdentityBridge."""
-        stmt = select(BroadcastLog).where(BroadcastLog.recording_id.is_(None))
+        """Links logs that have a NULL work_id to a work via IdentityBridge.
+        
+        Phase 4: Uses work_id as the primary link (Identity Layer).
+        """
+        stmt = select(BroadcastLog).where(BroadcastLog.work_id.is_(None))
         result = await self.session.stream(stmt)
 
         updated_count = 0
@@ -546,8 +722,9 @@ class Matcher:
             res = await self.session.execute(stmt)
             bridge = res.scalar_one_or_none()
 
-            if bridge:
-                log.recording_id = bridge.recording_id
+            if bridge and bridge.work_id:
+                # Phase 4: Only set work_id (recording resolved at runtime)
+                log.work_id = bridge.work_id
                 log.match_reason = "Auto-Promoted Identity"
                 updated_count += 1
 

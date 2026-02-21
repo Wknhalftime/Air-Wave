@@ -15,6 +15,7 @@ import Stations from './pages/Stations';
 import StationDetail from './pages/StationDetail';
 import Identity from './pages/Identity';
 import Reports from './pages/Reports';
+import Preferences from './pages/Preferences';
 
 const queryClient = new QueryClient();
 
@@ -35,6 +36,7 @@ function App() {
             <Route path="/history" element={<History />} />
             <Route path="/analytics" element={<Analytics />} />
             <Route path="/admin" element={<Admin />} />
+            <Route path="/preferences" element={<Preferences />} />
             <Route path="/admin/tuner" element={<MatchTuner />} />
             <Route path="/search" element={<Search />} />
             <Route path="/verification" element={<Verification />} />

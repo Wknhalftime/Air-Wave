@@ -1,0 +1,16 @@
+# Test artifacts
+test-reports/
+htmlcov/
+.coverage
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Data directory (databases, logs, caches)
+data/
+*.db
+*.db-shm
+*.db-wal

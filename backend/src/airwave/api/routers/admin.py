@@ -20,8 +20,15 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from airwave.api.deps import get_db
-from airwave.core.models import Album, Artist, SystemSetting, Work, WorkArtist
-from airwave.core.task_store import TaskStore
+from airwave.core.models import Album, Artist, Recording, SystemSetting, Work, WorkArtist
+from airwave.core.task_store import (
+    cancel_task,
+    complete_task,
+    create_task,
+    get_task,
+    update_progress,
+    update_total,
+)
 from airwave.worker.main import (
     run_bulk_import,
     run_discovery_task,
@@ -54,6 +61,11 @@ class MergeArtistsRequest(BaseModel):
     target_artist_id: int  # Artist to merge into (kept)
 
 
+class MergeWorksRequest(BaseModel):
+    source_work_id: int  # Work to merge from (will be removed)
+    target_work_id: int  # Work to merge into (kept)
+
+
 @router.get("/pipeline-stats")
 async def get_pipeline_stats(session: AsyncSession = Depends(get_db)):
     """Get stats for the mission control pipeline."""
@@ -65,9 +77,9 @@ async def get_pipeline_stats(session: AsyncSession = Depends(get_db)):
     res = await session.execute(select(func.count(BroadcastLog.id)))
     total_logs = res.scalar() or 0
 
-    # Unmatched
+    # Unmatched (Phase 4: check by work_id)
     res = await session.execute(
-        select(func.count(BroadcastLog.id)).where(BroadcastLog.recording_id.is_(None))
+        select(func.count(BroadcastLog.id)).where(BroadcastLog.work_id.is_(None))
     )
     unmatched_logs = res.scalar() or 0
 
@@ -139,191 +151,19 @@ async def reindex_vector_db(
     return {"message": "Reindex started in background"}
 
 
-# Match Tuner API
-
-from pydantic import BaseModel
-
-
-class MatchCandidate(BaseModel):
-    recording_id: int
-    artist: str
-    title: str
-    artist_sim: float
-    title_sim: float
-    vector_dist: float
-    match_type: str
-
-
-class MatchSample(BaseModel):
-    id: int
-    raw_artist: str
-    raw_title: str
-    match: Optional[dict]
-    candidates: List[MatchCandidate]
-
-
-@router.get("/match-samples", response_model=List[MatchSample])
-async def get_match_samples(
-    limit: int = 20, session: AsyncSession = Depends(get_db)
-):
-    """Fetch a sample of Unmatched or Pending logs and run strict 'Explain' matching
-    to show what candidates exist.
-    """
-    from sqlalchemy import func, select
-
-    from airwave.core.models import BroadcastLog
-    from airwave.worker.matcher import Matcher
-
-    # Get random sample of Unmatched logs
-    stmt = (
-        select(BroadcastLog)
-        .where(BroadcastLog.recording_id.is_(None))
-        .order_by(func.random())
-        .limit(limit)
-    )
-    res = await session.execute(stmt)
-    logs = res.scalars().all()
-
-    if not logs:
-        return []
-
-    matcher = Matcher(session)
-    queries = [(log.raw_artist, log.raw_title) for log in logs]
-
-    # Run Matcher with Explain=True
-    # Returns Dict { (raw_a, raw_t) -> { 'match': ..., 'candidates': ... } }
-    results = await matcher.match_batch(queries, explain=True)
-
-    response = []
-    for log in logs:
-        key = (log.raw_artist, log.raw_title)
-        if key in results:
-            data = results[key]
-            # Transform match result tuple (id, reason) to dict or None
-            match_data = None
-            if data["match"][0]:
-                match_data = {
-                    "recording_id": data["match"][0],
-                    "reason": data["match"][1],
-                }
-
-            # Map candidates (which might still have 'track_id' if matcher wasn't fully updated in return dict keys?
-            # I should check matcher.py explain return structure.
-            # Assuming matcher returns dicts with 'id' or 'recording_id'.
-            # Let's assume matcher candidates use 'id' or we map keys.
-            # Matcher.py typically returns internal objects or dicts.
-            # If Matcher.explain_match returns dictionaries, we need to ensure keys match MatchCandidate.
-
-            candidates_mapped = []
-            for c in data["candidates"]:
-                # Handle key mapping if necessary
-                candidates_mapped.append(
-                    MatchCandidate(
-                        recording_id=c.get("id")
-                        or c.get("track_id")
-                        or c.get("recording_id"),
-                        artist=c["artist"],
-                        title=c["title"],
-                        artist_sim=c["artist_sim"],
-                        title_sim=c["title_sim"],
-                        vector_dist=c["vector_dist"],
-                        match_type=c["match_type"],
-                    )
-                )
-
-            response.append(
-                MatchSample(
-                    id=log.id,
-                    raw_artist=log.raw_artist,
-                    raw_title=log.raw_title,
-                    match=match_data,
-                    candidates=candidates_mapped,
-                )
-            )
-
-    return response
-
-
-class ThresholdSettings(BaseModel):
-    artist_auto: float
-    artist_review: float
-    title_auto: float
-    title_review: float
-
-
-@router.post("/settings/thresholds")
-async def update_thresholds(
-    settings_in: ThresholdSettings, session: AsyncSession = Depends(get_db)
-):
-    """Update matching thresholds in DB and Memory."""
-    from airwave.core.config import settings
-    from airwave.core.models import SystemSetting
-
-    # Helper to update both
-    async def update_setting(key: str, val: float):
-        # Update Memory
-        setattr(settings, key, val)
-
-        # Update DB
-        stmt = select(SystemSetting).where(SystemSetting.key == key)
-        res = await session.execute(stmt)
-        obj = res.scalar_one_or_none()
-        if not obj:
-            obj = SystemSetting(key=key, value=str(val))
-            session.add(obj)
-        else:
-            obj.value = str(val)
-
-    await update_setting("MATCH_VARIANT_ARTIST_SCORE", settings_in.artist_auto)
-    await update_setting("MATCH_ALIAS_ARTIST_SCORE", settings_in.artist_review)
-    await update_setting("MATCH_VARIANT_TITLE_SCORE", settings_in.title_auto)
-    await update_setting("MATCH_ALIAS_TITLE_SCORE", settings_in.title_review)
-
-    # Also link Vector Guard to Title Review (as agreed in design)
-    # "Title Tolerance" slider controls both
-    await update_setting(
-        "MATCH_VECTOR_TITLE_GUARD", settings_in.title_review * 0.8
-    )  # Heuristic: Vector guard slightly looser than text?
-    # Actually, User request logic: "Title Tolerance" slider controls both.
-    # If slider is 0.8 (Strict), Vector Guard should be 0.8?
-    # Design says: "Logic: The 'Title Tolerance' slider will control both MATCH_VARIANT_TITLE_SCORE and MATCH_VECTOR_TITLE_GUARD"
-    # Actually, MATCH_VARIANT_TITLE_SCORE is for "High Confidence" (Green).
-    # MATCH_ALIAS_TITLE_SCORE is for "Review" (Yellow).
-    # MATCH_VECTOR_TITLE_GUARD is a hard floor.
-    # Let's map Vector Guard to 0.5 * Title Review (allow vectors to be much looser) or just keep it fixed?
-    # User agreed to: "Title Tolerance slider will control both".
-    # Let's set Vector Guard to be slightly more permissive than the "Review" threshold.
-    # usage: if Review is 0.6, Vector Guard 0.5.
-
-    await session.commit()
-    return {"status": "updated", "current_settings": settings_in}
-
-
-@router.get("/settings/thresholds")
-async def get_thresholds():
-    from airwave.core.config import settings
-
-    return {
-        "artist_auto": settings.MATCH_VARIANT_ARTIST_SCORE,
-        "artist_review": settings.MATCH_ALIAS_ARTIST_SCORE,
-        "title_auto": settings.MATCH_VARIANT_TITLE_SCORE,
-        "title_review": settings.MATCH_ALIAS_TITLE_SCORE,
-    }
-
-
-@router.post("/match-tuner/re-evaluate")
-async def re_evaluate_matches(background_tasks: BackgroundTasks):
-    """Re-evaluate all unmatched and flagged broadcast logs with current thresholds."""
-    import uuid
-
-    from airwave.core.task_store import TaskStore
-    from airwave.worker.main import run_re_evaluate
-
+def _create_and_dispatch_task(
+    background_tasks: BackgroundTasks,
+    task_type: str,
+    runner_fn,
+    message: str = "Initializing...",
+    *args,
+) -> str:
+    """Create a task in TaskStore and dispatch it in the background."""
     task_id = str(uuid.uuid4())
-    TaskStore.create_task(task_id, "re-evaluate", 1)
-    TaskStore.update_progress(task_id, 0, "Initializing re-evaluation...")
-    background_tasks.add_task(run_re_evaluate, task_id)
-    return {"status": "started", "task_id": task_id}
+    create_task(task_id, task_type, 1)
+    update_progress(task_id, 0, message)
+    background_tasks.add_task(runner_fn, *args, task_id)
+    return task_id
 
 
 @router.post("/scan")
@@ -335,42 +175,32 @@ async def trigger_scan(
     """Trigger a file sync scan with progress tracking."""
     path = req.path
     if not path:
-        # Fetch from settings
         stmt = select(SystemSetting).where(SystemSetting.key == "music_dir")
         result = await db.execute(stmt)
         setting = result.scalar_one_or_none()
-        if setting:
-            path = setting.value
-        else:
-            path = "D:\\Media\\Music"  # Fallback
+        path = setting.value if setting else "D:\\Media\\Music"
 
-    task_id = str(uuid.uuid4())
-    # Pre-create task entry so SSE can connect immediately
-    TaskStore.create_task(task_id, "sync", 1)
-    TaskStore.update_progress(task_id, 0, "Initializing scan...")
-    background_tasks.add_task(run_sync_files, path, task_id)
+    task_id = _create_and_dispatch_task(
+        background_tasks, "sync", run_sync_files, "Initializing scan...", path
+    )
     return {"status": "started", "path": path, "task_id": task_id}
 
 
 @router.post("/trigger-scan")
 async def trigger_internal_scan(background_tasks: BackgroundTasks):
     """Trigger the 'scan' command (Log -> Library promotion) with progress tracking."""
-    task_id = str(uuid.uuid4())
-    # Pre-create task entry so SSE can connect immediately
-    TaskStore.create_task(task_id, "scan", 1)
-    TaskStore.update_progress(task_id, 0, "Initializing scan...")
-    background_tasks.add_task(run_scan, task_id)
+    task_id = _create_and_dispatch_task(
+        background_tasks, "scan", run_scan, "Initializing scan..."
+    )
     return {"status": "started", "task_id": task_id}
 
 
 @router.post("/trigger-discovery")
 async def trigger_discovery(background_tasks: BackgroundTasks):
     """Rebuild the DiscoveryQueue from unmatched logs with progress tracking."""
-    task_id = str(uuid.uuid4())
-    # Pre-create task entry so SSE can connect immediately
-    TaskStore.create_task(task_id, "discovery", 1)
-    TaskStore.update_progress(task_id, 0, "Initializing discovery...")
-    background_tasks.add_task(run_discovery_task, task_id)
+    task_id = _create_and_dispatch_task(
+        background_tasks, "discovery", run_discovery_task, "Initializing discovery..."
+    )
     return {"status": "started", "task_id": task_id}
 
 
@@ -392,10 +222,10 @@ async def import_folder(background_tasks: BackgroundTasks, req: ScanRequest):
         )
 
     logger.info(f"Starting bulk import from: {path}")
-    task_id = str(uuid.uuid4())
-    TaskStore.create_task(task_id, "import", 1)
-    TaskStore.update_progress(task_id, 0, f"Initializing import for {path}...")
-    background_tasks.add_task(run_bulk_import, path, task_id)
+    task_id = _create_and_dispatch_task(
+        background_tasks, "import", run_bulk_import,
+        f"Initializing import for {path}...", path
+    )
     return {"status": "started", "path": path, "task_id": task_id}
 
 
@@ -412,11 +242,9 @@ async def upload_import(
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    task_id = str(uuid.uuid4())
-    # Pre-create task entry so SSE can connect immediately
-    TaskStore.create_task(task_id, "import", 1)
-    TaskStore.update_progress(task_id, 0, "Starting import...")
-    background_tasks.add_task(run_import, file_path, task_id)
+    task_id = _create_and_dispatch_task(
+        background_tasks, "import", run_import, "Starting import...", file_path
+    )
     return {"status": "started", "filename": file.filename, "task_id": task_id}
 
 
@@ -432,7 +260,7 @@ async def stream_task_progress(task_id: str):
             yield f"data: {json.dumps({'connected': True})}\n\n"
 
             while True:
-                task = TaskStore.get_task(task_id)
+                task = get_task(task_id)
 
                 if not task:
                     yield f"data: {json.dumps({'error': 'Task not found'})}\n\n"
@@ -492,13 +320,13 @@ async def cancel_task(task_id: str):
     Returns:
         Status of the cancellation request
     """
-    success = TaskStore.cancel_task(task_id)
+    success = cancel_task(task_id)
 
     if success:
         logger.info(f"Cancellation requested for task {task_id}")
         return {"status": "cancellation_requested", "task_id": task_id}
     else:
-        task = TaskStore.get_task(task_id)
+        task = get_task(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
         else:
@@ -590,4 +418,70 @@ async def merge_artists(
         "status": "merged",
         "source_artist_id": body.source_artist_id,
         "target_artist_id": body.target_artist_id,
+    }
+
+
+@router.post("/works/merge")
+async def merge_works(
+    body: MergeWorksRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Merge source work into target work (move recordings, then delete source).
+
+    This endpoint is useful for fixing duplicate works that should have been
+    merged by the fuzzy matching system but weren't (e.g., remixes/mixes that
+    were incorrectly created as separate works instead of separate recordings).
+
+    Args:
+        body: Request containing source_work_id (to be deleted) and target_work_id (to be kept)
+        db: Database session
+
+    Returns:
+        Status message with work IDs
+
+    Raises:
+        HTTPException: If works are the same, not found, or belong to different artists
+    """
+    if body.source_work_id == body.target_work_id:
+        raise HTTPException(
+            status_code=400, detail="Source and target work must differ"
+        )
+
+    # Load both works
+    res = await db.execute(
+        select(Work).where(Work.id.in_([body.source_work_id, body.target_work_id]))
+    )
+    works = {w.id: w for w in res.scalars().all()}
+    source = works.get(body.source_work_id)
+    target = works.get(body.target_work_id)
+
+    if not source or not target:
+        raise HTTPException(status_code=404, detail="Work not found")
+
+    # Verify both works belong to the same artist
+    if source.artist_id != target.artist_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Works belong to different artists (source: {source.artist_id}, target: {target.artist_id})"
+        )
+
+    # Move all recordings from source to target
+    await db.execute(
+        update(Recording)
+        .where(Recording.work_id == body.source_work_id)
+        .values(work_id=body.target_work_id)
+    )
+
+    # Expire the source work's recordings relationship to avoid SQLAlchemy issues
+    db.expire(source, ['recordings'])
+
+    # Delete source work
+    await db.delete(source)
+    await db.commit()
+
+    logger.info(f"Merged work {body.source_work_id} into {body.target_work_id}")
+    return {
+        "status": "merged",
+        "source_work_id": body.source_work_id,
+        "target_work_id": body.target_work_id,
     }

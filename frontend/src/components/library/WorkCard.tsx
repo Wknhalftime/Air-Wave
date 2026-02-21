@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 import { Music, Clock } from 'lucide-react';
 import type { WorkListItem } from '../../hooks/useLibrary';
+import { toTitleCase, formatArtistForDisplay } from '../../utils/format';
 
 interface WorkCardProps {
     work: WorkListItem;
@@ -26,7 +27,7 @@ export default function WorkCard({ work }: WorkCardProps) {
         >
             <div className="flex items-start justify-between mb-3">
                 <h3 className="text-lg font-semibold text-gray-900 group-hover:text-indigo-600 transition-colors line-clamp-2 flex-1">
-                    {work.title}
+                    {toTitleCase(work.title)}
                 </h3>
                 {work.year && (
                     <span className="ml-2 text-xs text-gray-500 font-medium bg-gray-50 px-2 py-1 rounded">
@@ -36,7 +37,7 @@ export default function WorkCard({ work }: WorkCardProps) {
             </div>
             
             <p className="text-sm text-gray-600 mb-4 line-clamp-1">
-                {work.artist_names}
+                {formatArtistForDisplay(work.artist_names)}
             </p>
             
             <div className="flex items-center gap-4 text-xs text-gray-500">

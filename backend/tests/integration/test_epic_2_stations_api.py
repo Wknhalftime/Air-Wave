@@ -22,7 +22,7 @@ async def setup_station_data(db_session):
     db_session.add(rec)
     await db_session.flush()
     
-    # 3. Create Logs
+    # 3. Create Logs (now link to work, not recording)
     # 3x Matched
     for i in range(3):
         log = BroadcastLog(
@@ -30,7 +30,7 @@ async def setup_station_data(db_session):
             played_at=func.now(),
             raw_artist="matched artist",
             raw_title="matched song",
-            recording_id=rec.id,
+            work_id=work.id,
             match_reason="Test Match"
         )
         db_session.add(log)

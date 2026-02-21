@@ -80,7 +80,7 @@ cd backend
 poetry run uvicorn airwave.api.main:app --reload
 
 # In another terminal, seed the database with test data
-poetry run python -m scripts.seed_database  # (if available)
+poetry run python -m airwave.worker.seed  # if available
 ```
 
 ### 2. Run Load Test
@@ -151,7 +151,7 @@ Check the output for:
 
 # Option 2: Create test data manually
 poetry run python
->>> from airwave.models import Artist, Work, Recording
+>>> from airwave.core.models import Artist, Work, Recording
 >>> # Create test data...
 ```
 

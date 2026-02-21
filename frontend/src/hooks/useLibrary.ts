@@ -57,6 +57,7 @@ export interface RecordingListItem {
     work_title: string; // Work title for the "Work" column
     is_verified: boolean; // Matched/Unmatched status
     has_file: boolean; // Whether recording has associated library file
+    filename: string | null; // Filename (not full path) from first library file
 }
 
 // ============================================================================

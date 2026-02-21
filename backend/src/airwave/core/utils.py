@@ -38,7 +38,7 @@ def parse_flexible_date(value: Any) -> Optional[datetime]:
     for fmt in formats:
         try:
             dt = datetime.strptime(value_str, fmt)
-            # Assyume mostly UTC/Local naive logs -> treat as UTC for consistency
+            # Assume mostly UTC/Local naive logs -> treat as UTC for consistency
             return dt.replace(tzinfo=timezone.utc)
         except ValueError:
             continue

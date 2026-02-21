@@ -28,14 +28,14 @@ async def setup_verification_data(db_session):
     db_session.add_all([rec_a, rec_b])
     await db_session.flush()
 
-    # Logs
+    # Logs (now link to work, not recording)
     # 1. Pending Match (Low Confidence / Variant)
     log_1 = BroadcastLog(
         station_id=station.id,
         played_at=func.now(),
         raw_artist="Artiste A",
         raw_title="Song A",
-        recording_id=rec_a.id,
+        work_id=work_a.id,
         match_reason="Variant Match (0.85)"
     )
     
@@ -48,7 +48,7 @@ async def setup_verification_data(db_session):
         played_at=older_time,
         raw_artist="Artiste B",
         raw_title="Song B",
-        recording_id=rec_b.id,
+        work_id=work_b.id,
         match_reason="Vector Match (0.2)"
     )
 
@@ -58,7 +58,7 @@ async def setup_verification_data(db_session):
         played_at=func.now(),
         raw_artist="Artiste A",
         raw_title="Song A",
-        recording_id=rec_a.id,
+        work_id=work_a.id,
         match_reason="Variant Match (0.85)"
     )
 
@@ -116,7 +116,7 @@ async def test_approval_creates_identity_bridge(async_client: AsyncClient, db_se
     ib = res.scalar_one_or_none()
     
     assert ib is not None
-    assert ib.recording_id == ids["rec_a_id"]
+    assert ib.work_id is not None  # Bridge links to work, not recording
     assert ib.confidence == 1.0
 
 @pytest.mark.asyncio
@@ -163,19 +163,21 @@ async def test_rejection_creates_virtual_recording(async_client: AsyncClient, db
     assert "new_track_id" in data
     new_id = data["new_track_id"]
     
-    # Check Log updated
+    # Check Log updated (now linked to work)
     stmt = select(BroadcastLog).where(BroadcastLog.id == log_id)
     res = await db_session.execute(stmt)
     log = res.scalar_one()
     
-    assert log.recording_id == new_id
+    # Get the new recording to find its work_id
+    new_rec = await db_session.get(Recording, new_id)
+    assert log.work_id == new_rec.work_id
     assert "Verified by User (Separate Track)" in log.match_reason
     
-    # Check Identity Bridge for NEW track
-    # raw: Artiste B / Song B -> new_id
+    # Check Identity Bridge for NEW track (links to work)
+    # raw: Artiste B / Song B -> new work
     stmt = select(IdentityBridge).where(
         IdentityBridge.reference_artist == "Artiste B",
-        IdentityBridge.recording_id == new_id
+        IdentityBridge.work_id == new_rec.work_id
     )
     res = await db_session.execute(stmt)
     ib = res.scalar_one_or_none()

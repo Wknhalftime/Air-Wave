@@ -37,50 +37,55 @@ def upgrade() -> None:
                 ),
             )
 
-    op.create_table(
-        "verification_audit",
-        sa.Column("id", sa.Integer(), primary_key=True),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.func.now(),
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.func.now(),
-        ),
-        sa.Column("action_type", sa.String(), nullable=False),
-        sa.Column("signature", sa.String(), nullable=False),
-        sa.Column("raw_artist", sa.String(), nullable=False),
-        sa.Column("raw_title", sa.String(), nullable=False),
-        sa.Column("recording_id", sa.Integer(), nullable=True),
-        sa.Column("log_ids", sa.JSON(), nullable=False, server_default="[]"),
-        sa.Column("bridge_id", sa.Integer(), nullable=True),
-        sa.Column("is_undone", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("undone_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("performed_by", sa.String(), nullable=True),
-        sa.ForeignKeyConstraint(["recording_id"], ["recordings.id"]),
-        sa.ForeignKeyConstraint(["bridge_id"], ["identity_bridge.id"]),
-    )
+    if "verification_audit" not in tables:
+        op.create_table(
+            "verification_audit",
+            sa.Column("id", sa.Integer(), primary_key=True),
+            sa.Column(
+                "created_at",
+                sa.DateTime(timezone=True),
+                nullable=False,
+                server_default=sa.func.now(),
+            ),
+            sa.Column(
+                "updated_at",
+                sa.DateTime(timezone=True),
+                nullable=False,
+                server_default=sa.func.now(),
+            ),
+            sa.Column("action_type", sa.String(), nullable=False),
+            sa.Column("signature", sa.String(), nullable=False),
+            sa.Column("raw_artist", sa.String(), nullable=False),
+            sa.Column("raw_title", sa.String(), nullable=False),
+            sa.Column("recording_id", sa.Integer(), nullable=True),
+            sa.Column("log_ids", sa.JSON(), nullable=False, server_default="[]"),
+            sa.Column("bridge_id", sa.Integer(), nullable=True),
+            sa.Column("is_undone", sa.Boolean(), nullable=False, server_default=sa.false()),
+            sa.Column("undone_at", sa.DateTime(timezone=True), nullable=True),
+            sa.Column("performed_by", sa.String(), nullable=True),
+            sa.ForeignKeyConstraint(["recording_id"], ["recordings.id"]),
+            sa.ForeignKeyConstraint(["bridge_id"], ["identity_bridge.id"]),
+        )
 
-    op.create_index(
-        "idx_verification_audit_created_at",
-        "verification_audit",
-        ["created_at"],
-    )
-    op.create_index(
-        "idx_verification_audit_artist_title",
-        "verification_audit",
-        ["raw_artist", "raw_title"],
-    )
-    op.create_index(
-        "idx_broadcast_logs_recording_match_reason",
-        "broadcast_logs",
-        ["recording_id", "match_reason"],
-    )
+        op.create_index(
+            "idx_verification_audit_created_at",
+            "verification_audit",
+            ["created_at"],
+        )
+        op.create_index(
+            "idx_verification_audit_artist_title",
+            "verification_audit",
+            ["raw_artist", "raw_title"],
+        )
+
+    # Add index for broadcast_logs if it doesn't exist
+    broadcast_logs_indexes = {idx["name"] for idx in inspector.get_indexes("broadcast_logs")} if "broadcast_logs" in tables else set()
+    if "idx_broadcast_logs_recording_match_reason" not in broadcast_logs_indexes:
+        op.create_index(
+            "idx_broadcast_logs_recording_match_reason",
+            "broadcast_logs",
+            ["recording_id", "match_reason"],
+        )
 
 
 def downgrade() -> None:

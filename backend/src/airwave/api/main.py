@@ -22,19 +22,21 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 
-from airwave.api.middleware import QueryLoggingMiddleware
+from airwave.api.middleware import QueryLoggingMiddleware, RequestIDMiddleware
 from airwave.api.routers import (
     admin,
     analytics,
+    bridges,
+    discovery,
     export,
     history,
     identity,
     library,
+    match_tuner,
+    preferences,
     search,
-    system,
     stations,
-    discovery,
-    bridges,
+    system,
 )
 from airwave.core.config import settings
 from airwave.core.db import AsyncSessionLocal, init_db
@@ -83,7 +85,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Middleware - Query Logging (must be added before CORS)
+# Middleware - Request ID first (outermost = runs last in chain)
+app.add_middleware(RequestIDMiddleware)
+# Query Logging (must be added before CORS)
 app.add_middleware(QueryLoggingMiddleware, slow_query_threshold=1.0)
 
 # CORS - Allow Vite Frontend
@@ -108,6 +112,9 @@ app.include_router(
     analytics.router, prefix="/api/v1/analytics", tags=["Analytics"]
 )
 app.include_router(admin.router, prefix="/api/v1/admin", tags=["Admin"])
+app.include_router(
+    match_tuner.router, prefix="/api/v1/admin", tags=["Match Tuner"]
+)
 app.include_router(search.router, prefix="/api/v1/search", tags=["Search"])
 app.include_router(
     identity.router, prefix="/api/v1/identity", tags=["Identity"]
@@ -121,6 +128,9 @@ app.include_router(
 )
 app.include_router(
     bridges.router, prefix="/api/v1/bridges", tags=["Bridges"]
+)
+app.include_router(
+    preferences.router, prefix="/api/v1/preferences", tags=["Preferences"]
 )
 
 

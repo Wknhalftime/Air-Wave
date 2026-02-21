@@ -1,12 +1,18 @@
+"""Export endpoints for broadcast logs and playlists.
+
+Phase 4: Uses work_id for identity resolution. Recording files are resolved
+via RecordingResolver based on station context.
+"""
+
 import csv
 import io
-import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -14,9 +20,28 @@ from sqlalchemy.orm import selectinload
 from airwave.api.deps import get_db
 from airwave.core.config import settings
 from airwave.core.models import BroadcastLog, LibraryFile, Recording, Work
+from airwave.worker.recording_resolver import RecordingResolver
 
-logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _parse_date_range(
+    start_date: Optional[str], end_date: Optional[str]
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """Parse YYYY-MM-DD date strings. Raises HTTPException on invalid format."""
+    start_dt = None
+    end_dt = None
+    if start_date:
+        try:
+            start_dt = datetime.fromisoformat(f"{start_date}T00:00:00")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_date; use YYYY-MM-DD")
+    if end_date:
+        try:
+            end_dt = datetime.fromisoformat(f"{end_date}T23:59:59")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_date; use YYYY-MM-DD")
+    return start_dt, end_dt
 
 
 @router.get("/logs")
@@ -30,62 +55,41 @@ async def export_logs(
 ):
     """Export broadcast logs as CSV for external music scheduling software.
     
-    Args:
-        start_date: Start date (YYYY-MM-DD). Defaults to all time.
-        end_date: End date (YYYY-MM-DD). Defaults to today.
-        station_id: Filter by specific station. Defaults to all stations.
-        matched_only: Only export matched logs. Defaults to False.
-        unmatched_only: Only export unmatched logs. Defaults to False.
-    
-    Returns:
-        CSV file with columns: Date, Time, Station, Raw Artist, Raw Title,
-        Matched Artist, Matched Title, Match Type, Match Confidence
+    Phase 4: Uses work_id for identity resolution.
     """
-    # Build query
+    # Phase 4: Load work relationship (not recording)
     stmt = (
         select(BroadcastLog)
         .options(
             selectinload(BroadcastLog.station),
-            selectinload(BroadcastLog.recording)
-            .selectinload(Recording.work)
+            selectinload(BroadcastLog.work)
             .selectinload(Work.artist)
         )
         .order_by(BroadcastLog.played_at.asc())
     )
     
-    # Apply filters (validate date format like M3U endpoint)
-    if start_date:
-        try:
-            start_dt = datetime.fromisoformat(f"{start_date}T00:00:00")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid start_date; use YYYY-MM-DD")
+    start_dt, end_dt = _parse_date_range(start_date, end_date)
+    if start_dt:
         stmt = stmt.where(BroadcastLog.played_at >= start_dt)
-
-    if end_date:
-        try:
-            end_dt = datetime.fromisoformat(f"{end_date}T23:59:59")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid end_date; use YYYY-MM-DD")
+    if end_dt:
         stmt = stmt.where(BroadcastLog.played_at <= end_dt)
     
     if station_id:
         stmt = stmt.where(BroadcastLog.station_id == station_id)
     
+    # Phase 4: Check by work_id
     if matched_only:
-        stmt = stmt.where(BroadcastLog.recording_id.is_not(None))
+        stmt = stmt.where(BroadcastLog.work_id.is_not(None))
     
     if unmatched_only:
-        stmt = stmt.where(BroadcastLog.recording_id.is_(None))
+        stmt = stmt.where(BroadcastLog.work_id.is_(None))
     
-    # Execute query
     result = await db.execute(stmt)
     logs = result.scalars().all()
     
-    # Generate CSV in memory
     output = io.StringIO()
     writer = csv.writer(output)
     
-    # Write header
     writer.writerow([
         "Date",
         "Time",
@@ -98,16 +102,16 @@ async def export_logs(
         "Match Confidence"
     ])
     
-    # Write data rows
     for log in logs:
         matched_artist = ""
         matched_title = ""
         match_type = log.match_reason or "Unmatched"
         
-        if log.recording and log.recording.work:
-            if log.recording.work.artist:
-                matched_artist = log.recording.work.artist.name
-            matched_title = log.recording.title
+        # Phase 4: Get info from work
+        if log.work:
+            if log.work.artist:
+                matched_artist = log.work.artist.name
+            matched_title = log.work.title
         
         writer.writerow([
             log.played_at.strftime("%Y-%m-%d"),
@@ -121,7 +125,6 @@ async def export_logs(
             "High" if "Identity Bridge" in match_type else "Medium"
         ])
     
-    # Prepare response
     output.seek(0)
     filename = f"airwave_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     
@@ -144,32 +147,18 @@ async def export_m3u(
 ):
     """Export matched broadcast logs as an M3U playlist with absolute paths to local library files.
 
-    Only logs with a linked recording (recording_id IS NOT NULL) are included.
-    Tracks are ordered chronologically by played_at. Each recording contributes one file (first library file).
+    Phase 4: Uses work_id for identity resolution. Recording files are resolved
+    via RecordingResolver based on station context.
     """
-    # Validate date format if provided
-    if start_date:
-        try:
-            start_dt = datetime.fromisoformat(f"{start_date}T00:00:00")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid start_date; use YYYY-MM-DD")
-    else:
-        start_dt = None
-    if end_date:
-        try:
-            end_dt = datetime.fromisoformat(f"{end_date}T23:59:59")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid end_date; use YYYY-MM-DD")
-    else:
-        end_dt = None
+    start_dt, end_dt = _parse_date_range(start_date, end_date)
 
+    # Phase 4: Load work relationship, resolve recording at runtime
     stmt = (
         select(BroadcastLog)
         .options(
-            selectinload(BroadcastLog.recording).selectinload(Recording.files),
-            selectinload(BroadcastLog.recording).selectinload(Recording.work).selectinload(Work.artist),
+            selectinload(BroadcastLog.work).selectinload(Work.artist),
         )
-        .where(BroadcastLog.recording_id.is_not(None))
+        .where(BroadcastLog.work_id.is_not(None))
         .order_by(BroadcastLog.played_at.asc())
     )
     if start_dt is not None:
@@ -178,8 +167,6 @@ async def export_m3u(
         stmt = stmt.where(BroadcastLog.played_at <= end_dt)
     if station_id is not None:
         stmt = stmt.where(BroadcastLog.station_id == station_id)
-    if not matched_only:
-        pass  # already filtered by recording_id IS NOT NULL above
 
     result = await db.execute(stmt)
     logs = result.scalars().all()
@@ -188,17 +175,28 @@ async def export_m3u(
     lines = ["#EXTM3U"]
 
     data_dir = Path(settings.DATA_DIR)
+    
+    # Phase 4: Use RecordingResolver to get the actual recording
+    resolver = RecordingResolver(db)
 
     for log in logs:
-        rec = log.recording
-        if not rec:
+        if not log.work_id:
             skipped += 1
             continue
+            
+        # Resolve recording for this work (using station context if available)
+        rec = await resolver.resolve(log.work_id, station_id=log.station_id)
+        if not rec:
+            logger.warning("No recording found for work_id=%s; skipping log id=%s", log.work_id, log.id)
+            skipped += 1
+            continue
+            
         files = list(rec.files) if rec.files else []
         if not files:
             logger.warning("Recording id=%s has no library files; skipping log id=%s", rec.id, log.id)
             skipped += 1
             continue
+            
         first_file: LibraryFile = files[0]
         raw_path = first_file.path
         if not raw_path:
@@ -210,10 +208,9 @@ async def export_m3u(
         abs_path = str(path_obj)
 
         artist_name = "Unknown"
-        if rec.work and rec.work.artist:
-            artist_name = rec.work.artist.name
+        if log.work and log.work.artist:
+            artist_name = log.work.artist.name
         title = rec.title or "Unknown"
-        # Comma in EXTINF breaks many M3U parsers; replace with space
         display = f"{artist_name} - {title}".replace(",", " ")
         duration = int(rec.duration) if rec.duration is not None else -1
         lines.append(f"#EXTINF:{duration},{display}")

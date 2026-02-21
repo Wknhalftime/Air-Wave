@@ -59,15 +59,18 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
 
 @router.get("/top-tracks")
 async def get_top_tracks(limit: int = 10, db: AsyncSession = Depends(get_db)):
-    """Get most played recordings."""
-    # Aggregation: Group by recording_id
+    """Get most played works.
+    
+    Phase 4: Groups by work_id (Identity Layer) not recording_id.
+    """
+    # Aggregation: Group by work_id
     stmt = (
         select(
-            BroadcastLog.recording_id,
+            BroadcastLog.work_id,
             func.count(BroadcastLog.id).label("play_count"),
         )
-        .where(BroadcastLog.recording_id.is_not(None))
-        .group_by(BroadcastLog.recording_id)
+        .where(BroadcastLog.work_id.is_not(None))
+        .group_by(BroadcastLog.work_id)
         .order_by(desc("play_count"))
         .limit(limit)
     )
@@ -75,25 +78,24 @@ async def get_top_tracks(limit: int = 10, db: AsyncSession = Depends(get_db)):
     result = await db.execute(stmt)
     rows = result.fetchall()
 
-    # Enrich with Recording info
+    # Enrich with Work info
     data = []
-    for recording_id, count in rows:
-        # Join Rec -> Work -> Artist
-        rec_stmt = (
-            select(Recording)
-            .options(selectinload(Recording.work).selectinload(Work.artist))
-            .where(Recording.id == recording_id)
+    for work_id, count in rows:
+        work_stmt = (
+            select(Work)
+            .options(selectinload(Work.artist))
+            .where(Work.id == work_id)
         )
 
-        res = await db.execute(rec_stmt)
-        recording = res.scalar_one_or_none()
+        res = await db.execute(work_stmt)
+        work = res.scalar_one_or_none()
 
-        if recording and recording.work and recording.work.artist:
+        if work and work.artist:
             data.append(
                 {
-                    "name": f"{recording.work.artist.name} - {recording.title}",
-                    "artist": recording.work.artist.name,
-                    "title": recording.title,
+                    "name": f"{work.artist.name} - {work.title}",
+                    "artist": work.artist.name,
+                    "title": work.title,
                     "count": count,
                 }
             )
@@ -103,15 +105,17 @@ async def get_top_tracks(limit: int = 10, db: AsyncSession = Depends(get_db)):
 
 @router.get("/top-artists")
 async def get_top_artists(limit: int = 10, db: AsyncSession = Depends(get_db)):
-    """Get most played artists."""
-    # Group by Artist.id via Join
+    """Get most played artists.
+    
+    Phase 4: Joins via work_id (Identity Layer) not recording_id.
+    """
+    # Group by Artist.id via Join through Work
     stmt = (
         select(Artist.name, func.count(BroadcastLog.id).label("play_count"))
         .select_from(BroadcastLog)
-        .join(Recording, BroadcastLog.recording_id == Recording.id)
-        .join(Work, Recording.work_id == Work.id)
+        .join(Work, BroadcastLog.work_id == Work.id)
         .join(Artist, Work.artist_id == Artist.id)
-        .where(BroadcastLog.recording_id.is_not(None))
+        .where(BroadcastLog.work_id.is_not(None))
         .group_by(Artist.id)
         .order_by(desc("play_count"))
         .limit(limit)
@@ -154,9 +158,9 @@ async def get_victory_stats(db: AsyncSession = Depends(get_db)):
     total_res = await db.execute(total_stmt)
     total_logs = total_res.scalar_one()
     
-    # 2. Matched Logs (recording_id is not NULL)
+    # 2. Matched Logs (Phase 4: work_id is not NULL)
     matched_stmt = select(func.count(BroadcastLog.id)).where(
-        BroadcastLog.recording_id.is_not(None)
+        BroadcastLog.work_id.is_not(None)
     )
     matched_res = await db.execute(matched_stmt)
     matched_logs = matched_res.scalar_one()

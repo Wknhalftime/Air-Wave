@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { ArrowLeft, Music, Inbox } from 'lucide-react';
+import { toTitleCase, formatArtistForDisplay } from '../utils/format';
 import { useWork, useWorkRecordings } from '../hooks/useLibrary';
 import RecordingRow from '../components/library/RecordingRow';
 import Pagination from '../components/common/Pagination';
@@ -56,19 +57,19 @@ export default function WorkDetail() {
                     Library
                 </Link>
                 <span>/</span>
-                {work?.artist_id && (
+                {work?.artist_id && formatArtistForDisplay(work.artist_name) && (
                     <>
                         <Link
                             to={`/library/artists/${work.artist_id}`}
                             className="hover:text-gray-900"
                         >
-                            {work.artist_name || 'Artist'}
+                            {formatArtistForDisplay(work.artist_name)}
                         </Link>
                         <span>/</span>
                     </>
                 )}
                 <span className="text-gray-900 font-medium">
-                    {work?.title || 'Loading...'}
+                    {work ? toTitleCase(work.title) : 'Loading...'}
                 </span>
             </nav>
 
@@ -83,9 +84,9 @@ export default function WorkDetail() {
                     <div className="flex items-start justify-between">
                         <div className="flex-1">
                             <h1 className="text-3xl font-bold text-gray-900 mb-2">
-                                {work.title}
+                                {toTitleCase(work.title)}
                             </h1>
-                            <p className="text-lg text-gray-600 mb-4">{work.artist_names}</p>
+                            <p className="text-lg text-gray-600 mb-4">{formatArtistForDisplay(work.artist_names)}</p>
                             <div className="flex items-center gap-6 text-sm text-gray-600">
                                 <span className="flex items-center gap-2">
                                     <Music className="w-4 h-4" />
@@ -182,13 +183,13 @@ export default function WorkDetail() {
                                             Title
                                         </th>
                                         <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                            Artist
+                                            Version
                                         </th>
                                         <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                                             Duration
                                         </th>
                                         <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                            Version
+                                            Filename
                                         </th>
                                         <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                                             Status

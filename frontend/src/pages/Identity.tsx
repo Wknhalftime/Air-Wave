@@ -12,6 +12,7 @@ import {
     ExternalLink, Pencil, Trash2
 } from "lucide-react";
 import { useDebounce } from "../hooks/useDebounce";
+import { toTitleCase, formatArtistForDisplay } from "../utils/format";
 
 // Interfaces
 interface Bridge {
@@ -197,12 +198,12 @@ export default function Identity() {
                                         {bridges.map((bridge: Bridge) => (
                                             <tr key={bridge.id} className={`hover:bg-gray-50 ${bridge.is_revoked ? 'bg-gray-50 opacity-75' : ''}`}>
                                                 <td className="px-6 py-4">
-                                                    <div className="font-medium text-gray-900">{bridge.reference_title}</div>
-                                                    <div className="text-gray-500 text-xs">{bridge.reference_artist}</div>
+                                                    <div className="font-medium text-gray-900">{toTitleCase(bridge.reference_title)}</div>
+                                                    <div className="text-gray-500 text-xs">{formatArtistForDisplay(bridge.reference_artist)}</div>
                                                 </td>
                                                 <td className="px-6 py-4">
-                                                    <div className="font-medium text-green-700">{bridge.recording?.title}</div>
-                                                    <div className="text-green-600 text-xs">{bridge.recording?.work?.artist?.name}</div>
+                                                    <div className="font-medium text-green-700">{toTitleCase(bridge.recording?.title)}</div>
+                                                    <div className="text-green-600 text-xs">{formatArtistForDisplay(bridge.recording?.work?.artist?.name)}</div>
                                                 </td>
                                                 <td className="px-6 py-4">
                                                     {bridge.is_revoked ? (

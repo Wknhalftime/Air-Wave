@@ -109,7 +109,7 @@ async def test_metadata_extraction_tracking(async_session):
                 await scanner.scan_directory(tmpdir)
 
         # Should have tracked metadata extraction
-        assert scanner.perf_metrics.metadata_extractions >= 1
+        assert scanner.perf_metrics.file.metadata_extractions >= 1
 
 
 @pytest.mark.asyncio
@@ -139,8 +139,8 @@ async def test_legacy_file_update_tracking(async_session):
             assert mock_extract.call_count == 0
             
             # Should have tracked the legacy file update
-            assert scanner.perf_metrics.legacy_files_updated >= 1
-            assert scanner.perf_metrics.metadata_extractions_skipped >= 1
+            assert scanner.perf_metrics.file.legacy_files_updated >= 1
+            assert scanner.perf_metrics.file.metadata_extractions_skipped >= 1
 
 
 @pytest.mark.asyncio
@@ -158,7 +158,7 @@ async def test_commit_tracking(async_session):
             await scanner.scan_directory(tmpdir)
         
         # Should have tracked commits
-        total_commits = scanner.perf_metrics.commits_executed + scanner.perf_metrics.commits_skipped
+        total_commits = scanner.perf_metrics.db.commits_executed + scanner.perf_metrics.db.commits_skipped
         assert total_commits >= 1  # At least one commit opportunity at 100 files
 
 
@@ -197,8 +197,8 @@ async def test_move_detection_skip_tracking(async_session):
 
         # When no files are missing (path_index is empty, so no missing files),
         # move detection should be skipped
-        assert scanner.perf_metrics.move_detection_queries_skipped >= 1
-        assert scanner.perf_metrics.move_detection_queries == 0
+        assert scanner.perf_metrics.db.move_detection_queries_skipped >= 1
+        assert scanner.perf_metrics.db.move_detection_queries == 0
 
 
 @pytest.mark.asyncio
@@ -228,8 +228,8 @@ async def test_touch_batch_tracking(async_session):
             assert mock_extract.call_count == 0
             
             # Should have tracked touch batch
-            assert scanner.perf_metrics.touch_batches >= 1
-            assert scanner.perf_metrics.touch_files_total >= 1
+            assert scanner.perf_metrics.file.touch_batches >= 1
+            assert scanner.perf_metrics.file.touch_files_total >= 1
 
 
 @pytest.mark.asyncio

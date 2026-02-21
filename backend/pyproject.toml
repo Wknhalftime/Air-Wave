@@ -24,6 +24,8 @@ python-multipart = "^0.0.22"
 blake3 = "^1.0.8"
 alembic = "^1.18.1"
 duckdb = "^1.4.4"
+polars = "^1.4.0"
+aiohttp = "^3.13.3"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"

@@ -25,7 +25,7 @@ async def test_list_bridges(async_client, db_session):
         log_signature="sig1",
         reference_artist="Test Artist",
         reference_title="Test Song",
-        recording_id=rec.id,
+        work_id=work.id,
         is_revoked=False
     )
     # 2. Revoked
@@ -33,7 +33,7 @@ async def test_list_bridges(async_client, db_session):
         log_signature="sig2",
         reference_artist="Bad Artist",
         reference_title="Bad Song",
-        recording_id=rec.id,
+        work_id=work.id,
         is_revoked=True
     )
     # 3. Active, Different Name
@@ -41,7 +41,7 @@ async def test_list_bridges(async_client, db_session):
         log_signature="sig3",
         reference_artist="Other Band",
         reference_title="Other Song",
-        recording_id=rec.id,
+        work_id=work.id,
         is_revoked=False
     )
     db_session.add_all([b1, b2, b3])
@@ -93,7 +93,7 @@ async def test_update_bridge_status(async_client, db_session):
         log_signature="status_sig",
         reference_artist="Status Artist",
         reference_title="Status Title",
-        recording_id=rec.id,
+        work_id=work.id,
         is_revoked=False
     )
     db_session.add(bridge)

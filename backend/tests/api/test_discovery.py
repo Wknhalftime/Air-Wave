@@ -5,6 +5,7 @@ from sqlalchemy import select
 
 from airwave.core.models import (
     Artist,
+    ArtistAlias,
     BroadcastLog,
     DiscoveryQueue,
     IdentityBridge,
@@ -69,11 +70,11 @@ async def test_promote_item(async_client, db_session):
     # Normalizer might clean "New Hit" -> "new hit" or keep case depending on config. 
     # Current normalizer keeps title case usually standard or cleaned.
     
-    # 3. Bridge Created
+    # 3. Bridge Created (pointing to Work)
     bridge = (await db_session.execute(select(IdentityBridge))).scalar_one_or_none()
     assert bridge is not None
     assert bridge.log_signature == sig
-    assert bridge.recording_id == rec.id
+    assert bridge.work_id == rec.work_id
 
 @pytest.mark.asyncio
 async def test_link_item(async_client, db_session):
@@ -97,13 +98,13 @@ async def test_link_item(async_client, db_session):
         raw_artist="Existing Band",
         raw_title="Exist Song",
         count=2,
-        suggested_recording_id=rec.id
+        suggested_work_id=work.id
     )
     db_session.add(item)
     await db_session.commit()
     
-    # Test Link
-    resp = await async_client.post("/api/v1/discovery/link", json={"signature": target_sig, "recording_id": rec.id})
+    # Test Link (Phase 4: API accepts work_id)
+    resp = await async_client.post("/api/v1/discovery/link", json={"signature": target_sig, "work_id": rec.work_id})
     assert resp.status_code == 200
     
     # Verify
@@ -112,7 +113,7 @@ async def test_link_item(async_client, db_session):
     
     bridge = (await db_session.execute(select(IdentityBridge).where(IdentityBridge.log_signature == target_sig))).scalar_one_or_none()
     assert bridge is not None
-    assert bridge.recording_id == rec.id
+    assert bridge.work_id == rec.work_id
 
 @pytest.mark.asyncio
 async def test_dismiss_item(async_client, db_session):
@@ -155,7 +156,7 @@ async def test_relink_revivifies_bridge(async_client, db_session):
     
     bridge = IdentityBridge(
         log_signature=sig,
-        recording_id=rec1.id,
+        work_id=work.id,
         reference_artist=artist_name,
         reference_title=title_name,
         is_revoked=True
@@ -178,18 +179,24 @@ async def test_relink_revivifies_bridge(async_client, db_session):
     db_session.add(item)
     await db_session.commit()
     
-    # Action: Link to Rec2
-    resp = await async_client.post("/api/v1/discovery/link", json={"signature": sig, "recording_id": rec2.id})
+    # Action: Link to Rec2 (bridge points to work, not specific recording)
+    resp = await async_client.post("/api/v1/discovery/link", json={"signature": sig, "work_id": rec2.work_id})
     assert resp.status_code == 200
     
-    # Verify: Bridge is active and points to Rec2
+    # Verify: Bridge is active and points to the Work
     await db_session.refresh(bridge)
     assert bridge.is_revoked == False
-    assert bridge.recording_id == rec2.id
+    assert bridge.work_id == work.id
 
 @pytest.mark.asyncio
 async def test_link_conflict_active_bridge(async_client, db_session):
-    # Setup: Active Bridge
+    """Phase 4: Conflict occurs when linking to a recording from a DIFFERENT work.
+    
+    In Phase 4, bridges link to works. Linking to different recordings of the
+    same work is idempotent (200 OK). But linking to a recording from a different
+    work when an active bridge already exists should return 409 conflict.
+    """
+    # Setup: Active Bridge pointing to Work1
     artist_name = "Conflict Artist"
     title_name = "Conflict Song"
     sig = Normalizer.generate_signature(artist_name, title_name)
@@ -197,19 +204,26 @@ async def test_link_conflict_active_bridge(async_client, db_session):
     artist = Artist(name=artist_name)
     db_session.add(artist)
     await db_session.flush()
-    work = Work(title=title_name, artist_id=artist.id)
-    db_session.add(work)
+    
+    # Work 1 with bridge
+    work1 = Work(title=title_name, artist_id=artist.id)
+    db_session.add(work1)
     await db_session.flush()
-    rec1 = Recording(work_id=work.id, title=title_name)
+    rec1 = Recording(work_id=work1.id, title=title_name)
     db_session.add(rec1)
     
-    rec2 = Recording(work_id=work.id, title=title_name, version_type="Live")
+    # Work 2 (different work) with a different recording
+    work2 = Work(title="Different Song", artist_id=artist.id)
+    db_session.add(work2)
+    await db_session.flush()
+    rec2 = Recording(work_id=work2.id, title="Different Song")
     db_session.add(rec2)
     await db_session.commit()
     
+    # Bridge links to work1
     bridge = IdentityBridge(
         log_signature=sig,
-        recording_id=rec1.id,
+        work_id=work1.id,
         reference_artist=artist_name,
         reference_title=title_name,
         is_revoked=False
@@ -217,7 +231,7 @@ async def test_link_conflict_active_bridge(async_client, db_session):
     db_session.add(bridge)
     
     item = DiscoveryQueue(
-        signature=sig, # Same sig
+        signature=sig,
         raw_artist=artist_name,
         raw_title=title_name,
         count=1
@@ -225,8 +239,8 @@ async def test_link_conflict_active_bridge(async_client, db_session):
     db_session.add(item)
     await db_session.commit()
     
-    # Action: Try to link to Rec2
-    resp = await async_client.post("/api/v1/discovery/link", json={"signature": sig, "recording_id": rec2.id})
+    # Action: Try to link to rec2 from work2 (DIFFERENT work) -> should conflict
+    resp = await async_client.post("/api/v1/discovery/link", json={"signature": sig, "work_id": rec2.work_id})
     assert resp.status_code == 409
     assert "already linked" in resp.json()["detail"]
 
@@ -258,7 +272,7 @@ async def test_signature_validation(async_client, db_session):
     # But the API will calculate md5("Artist", "Title") -> "somesig"
     # And check if "valid|sig" == "somesig" -> False
     
-    resp = await async_client.post("/api/v1/discovery/link", json={"signature": "valid|sig", "recording_id": rec.id})
+    resp = await async_client.post("/api/v1/discovery/link", json={"signature": "valid|sig", "work_id": rec.work_id})
     assert resp.status_code == 400
     assert "Signature mismatch" in resp.json()["detail"]
 
@@ -277,7 +291,7 @@ async def test_link_queue_item_not_found(async_client, db_session):
     await db_session.commit()
     resp = await async_client.post(
         "/api/v1/discovery/link",
-        json={"signature": "nonexistent|sig", "recording_id": rec.id},
+        json={"signature": "nonexistent|sig", "work_id": rec.work_id},
     )
     assert resp.status_code == 404
     assert "Queue item not found" in resp.json()["detail"]
@@ -285,17 +299,17 @@ async def test_link_queue_item_not_found(async_client, db_session):
 
 @pytest.mark.asyncio
 async def test_link_recording_not_found(async_client, db_session):
-    """Link with valid queue item but invalid recording_id returns 404."""
+    """Link with valid queue item but invalid work_id returns 404."""
     sig = Normalizer.generate_signature("Band", "Song")
     item = DiscoveryQueue(signature=sig, raw_artist="Band", raw_title="Song", count=1)
     db_session.add(item)
     await db_session.commit()
     resp = await async_client.post(
         "/api/v1/discovery/link",
-        json={"signature": sig, "recording_id": 99999},
+        json={"signature": sig, "work_id": 99999},
     )
     assert resp.status_code == 404
-    assert "Recording not found" in resp.json()["detail"]
+    assert "Work not found" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -359,28 +373,28 @@ async def test_link_updates_unmatched_logs(async_client, db_session):
         raw_artist="Link Artist",
         raw_title="Link Song",
         played_at=datetime.fromisoformat("2024-01-01T10:00:00"),
-        recording_id=None,
+        work_id=None,
     )
     log2 = BroadcastLog(
         station_id=station.id,
         raw_artist="Link Artist",
         raw_title="Link Song",
         played_at=datetime.fromisoformat("2024-01-01T11:00:00"),
-        recording_id=None,
+        work_id=None,
     )
     db_session.add_all([log1, log2])
     await db_session.commit()
 
     resp = await async_client.post(
         "/api/v1/discovery/link",
-        json={"signature": sig, "recording_id": rec.id},
+        json={"signature": sig, "work_id": rec.work_id},
     )
     assert resp.status_code == 200
 
     await db_session.refresh(log1)
     await db_session.refresh(log2)
-    assert log1.recording_id == rec.id
-    assert log2.recording_id == rec.id
+    assert log1.work_id == rec.work_id
+    assert log2.work_id == rec.work_id
     assert "identity_bridge" in (log1.match_reason or "")
 
 
@@ -403,7 +417,7 @@ async def test_link_idempotent_same_recording(async_client, db_session):
     sig = Normalizer.generate_signature("Idem Artist", "Idem Song")
     bridge = IdentityBridge(
         log_signature=sig,
-        recording_id=rec.id,
+        work_id=work.id,
         reference_artist="Idem Artist",
         reference_title="Idem Song",
         is_revoked=False,
@@ -420,7 +434,7 @@ async def test_link_idempotent_same_recording(async_client, db_session):
 
     resp = await async_client.post(
         "/api/v1/discovery/link",
-        json={"signature": sig, "recording_id": rec.id},
+        json={"signature": sig, "work_id": rec.work_id},
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "linked"
@@ -454,7 +468,7 @@ async def test_link_with_is_batch(async_client, db_session):
 
     resp = await async_client.post(
         "/api/v1/discovery/link",
-        json={"signature": sig, "recording_id": rec.id, "is_batch": True},
+        json={"signature": sig, "work_id": rec.work_id, "is_batch": True},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -580,7 +594,7 @@ async def test_promote_conflict_active_bridge(async_client, db_session):
     sig = Normalizer.generate_signature("Promo Conflict Artist", "Promo Conflict Song")
     bridge = IdentityBridge(
         log_signature=sig,
-        recording_id=rec1.id,
+        work_id=work.id,
         reference_artist="Promo Conflict Artist",
         reference_title="Promo Conflict Song",
         is_revoked=False,
@@ -632,7 +646,7 @@ async def test_promote_conflict_active_bridge(async_client, db_session):
     sig = Normalizer.generate_signature("Other Artist", "Other Title")
     bridge = IdentityBridge(
         log_signature=sig,
-        recording_id=rec_old.id,
+        work_id=work2.id,
         reference_artist="Other Artist",
         reference_title="Other Title",
         is_revoked=False,
@@ -681,7 +695,7 @@ async def test_promote_conflict_active_bridge(async_client, db_session):
     sig = Normalizer.generate_signature("New Artist", "New Song")
     bridge = IdentityBridge(
         log_signature=sig,
-        recording_id=rec_unrelated.id,
+        work_id=work_other.id,
         reference_artist="New Artist",
         reference_title="New Song",
         is_revoked=False,
@@ -720,7 +734,7 @@ async def test_promote_revivifies_bridge(async_client, db_session):
     sig = Normalizer.generate_signature("Promo Rev Artist", "Promo Rev Song")
     bridge = IdentityBridge(
         log_signature=sig,
-        recording_id=rec_old.id,
+        work_id=work.id,
         reference_artist="Promo Rev Artist",
         reference_title="Promo Rev Song",
         is_revoked=True,
@@ -742,10 +756,12 @@ async def test_promote_revivifies_bridge(async_client, db_session):
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "promoted"
-    # Promote creates/finds a recording; bridge should point to it and be active
+    # Promote creates/finds a recording; bridge should point to its work and be active
     await db_session.refresh(bridge)
     assert bridge.is_revoked is False
-    assert bridge.recording_id == data["recording_id"]
+    # Bridge points to work, verify recording's work matches
+    rec_result = await db_session.get(Recording, data["recording_id"])
+    assert bridge.work_id == rec_result.work_id
 
 
 @pytest.mark.asyncio
@@ -770,14 +786,14 @@ async def test_promote_updates_unmatched_logs(async_client, db_session):
         raw_artist="Promo Log Artist",
         raw_title="Promo Log Song",
         played_at=datetime.fromisoformat("2024-01-01T10:00:00"),
-        recording_id=None,
+        work_id=None,
     )
     log2 = BroadcastLog(
         station_id=station.id,
         raw_artist="Promo Log Artist",
         raw_title="Promo Log Song",
         played_at=datetime.fromisoformat("2024-01-01T11:00:00"),
-        recording_id=None,
+        work_id=None,
     )
     db_session.add_all([log1, log2])
     await db_session.commit()
@@ -791,10 +807,12 @@ async def test_promote_updates_unmatched_logs(async_client, db_session):
     assert data["status"] == "promoted"
     rec_id = data["recording_id"]
 
+    # Get the recording's work_id
+    rec_result = await db_session.get(Recording, rec_id)
     await db_session.refresh(log1)
     await db_session.refresh(log2)
-    assert log1.recording_id == rec_id
-    assert log2.recording_id == rec_id
+    assert log1.work_id == rec_result.work_id
+    assert log2.work_id == rec_result.work_id
     assert "user_verified" in (log1.match_reason or "")
 
 
@@ -848,7 +866,7 @@ async def test_get_queue_includes_suggested_recording(async_client, db_session):
         raw_artist="Suggest Artist",
         raw_title="Suggest Song",
         count=3,
-        suggested_recording_id=rec.id,
+        suggested_work_id=work.id,
     )
     db_session.add(item)
     await db_session.commit()
@@ -858,5 +876,388 @@ async def test_get_queue_includes_suggested_recording(async_client, db_session):
     data = resp.json()
     assert len(data) == 1
     assert data[0]["signature"] == sig
-    assert data[0]["suggested_recording_id"] == rec.id
+    assert data[0]["suggested_work_id"] == work.id
 
+
+# =============================================================================
+# Tests for has_suggestion filter (Problem 3 - Verification Hub Redesign)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_queue_has_suggestion_true(async_client, db_session):
+    """Queue with has_suggestion=true returns only items with suggestions."""
+    # Create recording for suggested item
+    artist = Artist(name="Suggested Artist")
+    db_session.add(artist)
+    await db_session.flush()
+    work = Work(title="Suggested Song", artist_id=artist.id)
+    db_session.add(work)
+    await db_session.flush()
+    rec = Recording(work_id=work.id, title="Suggested Song", version_type="Original")
+    db_session.add(rec)
+    await db_session.commit()
+
+    # Create items: one with suggestion, one without
+    sig_with = Normalizer.generate_signature("Suggested Artist", "Suggested Song")
+    item_with = DiscoveryQueue(
+        signature=sig_with,
+        raw_artist="Suggested Artist",
+        raw_title="Suggested Song",
+        count=5,
+        suggested_work_id=work.id,
+    )
+    item_without = DiscoveryQueue(
+        signature="no|suggestion",
+        raw_artist="Unknown",
+        raw_title="Mystery",
+        count=3,
+        suggested_work_id=None,
+    )
+    db_session.add_all([item_with, item_without])
+    await db_session.commit()
+
+    resp = await async_client.get("/api/v1/discovery/queue", params={"has_suggestion": True})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["signature"] == sig_with
+    assert data[0]["suggested_work_id"] == work.id
+
+
+@pytest.mark.asyncio
+async def test_get_queue_has_suggestion_false(async_client, db_session):
+    """Queue with has_suggestion=false returns only items without suggestions."""
+    # Create recording for suggested item
+    artist = Artist(name="Has Suggest Artist")
+    db_session.add(artist)
+    await db_session.flush()
+    work = Work(title="Has Suggest Song", artist_id=artist.id)
+    db_session.add(work)
+    await db_session.flush()
+    rec = Recording(work_id=work.id, title="Has Suggest Song", version_type="Original")
+    db_session.add(rec)
+    await db_session.commit()
+
+    sig_with = Normalizer.generate_signature("Has Suggest Artist", "Has Suggest Song")
+    item_with = DiscoveryQueue(
+        signature=sig_with,
+        raw_artist="Has Suggest Artist",
+        raw_title="Has Suggest Song",
+        count=5,
+        suggested_work_id=work.id,
+    )
+    item_without = DiscoveryQueue(
+        signature="none|here",
+        raw_artist="No Suggestion",
+        raw_title="None Here",
+        count=3,
+        suggested_work_id=None,
+    )
+    db_session.add_all([item_with, item_without])
+    await db_session.commit()
+
+    resp = await async_client.get("/api/v1/discovery/queue", params={"has_suggestion": False})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["signature"] == "none|here"
+    assert data[0]["suggested_work_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_queue_has_suggestion_none_returns_all(async_client, db_session):
+    """Queue without has_suggestion param (None) returns all items (backward compatible)."""
+    artist = Artist(name="All Artist")
+    db_session.add(artist)
+    await db_session.flush()
+    work = Work(title="All Song", artist_id=artist.id)
+    db_session.add(work)
+    await db_session.flush()
+    rec = Recording(work_id=work.id, title="All Song", version_type="Original")
+    db_session.add(rec)
+    await db_session.commit()
+
+    sig_with = Normalizer.generate_signature("All Artist", "All Song")
+    item_with = DiscoveryQueue(
+        signature=sig_with,
+        raw_artist="All Artist",
+        raw_title="All Song",
+        count=5,
+        suggested_work_id=work.id,
+    )
+    item_without = DiscoveryQueue(
+        signature="all|none",
+        raw_artist="All None",
+        raw_title="No Suggest",
+        count=3,
+        suggested_work_id=None,
+    )
+    db_session.add_all([item_with, item_without])
+    await db_session.commit()
+
+    # No has_suggestion param - should return all
+    resp = await async_client.get("/api/v1/discovery/queue")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 2
+
+
+# =============================================================================
+# Tests for Artist Queue (Problem 4 - Verification Hub Redesign)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_artist_queue_basic(async_client, db_session):
+    """Artist queue returns unique raw artist names from BroadcastLogs, sorted by item count."""
+    station = Station(callsign="ARTQ_ST")
+    db_session.add(station)
+    await db_session.flush()
+
+    # BroadcastLog-based: artist queue queries BroadcastLog, not DiscoveryQueue
+    for _ in range(2):
+        db_session.add(BroadcastLog(
+            station_id=station.id, played_at=datetime.now(),
+            raw_artist="Raw Artist One", raw_title="Song One",
+        ))
+    db_session.add(BroadcastLog(
+        station_id=station.id, played_at=datetime.now(),
+        raw_artist="Raw Artist Two", raw_title="Song One",
+    ))
+    await db_session.commit()
+
+    resp = await async_client.get("/api/v1/discovery/artist-queue")
+    assert resp.status_code == 200
+    data = resp.json()
+    
+    # Should return 2 unique artists
+    assert len(data) == 2
+    
+    # Sorted by item_count (number of queue items, not play count)
+    # Raw Artist One has 2 items, Raw Artist Two has 1 item
+    assert data[0]["raw_name"] == "Raw Artist One"
+    assert data[0]["item_count"] == 2
+    assert data[1]["raw_name"] == "Raw Artist Two"
+    assert data[1]["item_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_artist_queue_excludes_verified_aliases(async_client, db_session):
+    """Artist queue excludes artists that already have verified aliases."""
+    alias = ArtistAlias(
+        raw_name="Verified Raw",
+        resolved_name="Canonical Name",
+        is_verified=True,
+    )
+    db_session.add(alias)
+    await db_session.flush()
+
+    station = Station(callsign="ARTQ_ST2")
+    db_session.add(station)
+    await db_session.flush()
+
+    db_session.add(BroadcastLog(
+        station_id=station.id, played_at=datetime.now(),
+        raw_artist="Verified Raw", raw_title="Some Song",
+    ))
+    db_session.add(BroadcastLog(
+        station_id=station.id, played_at=datetime.now(),
+        raw_artist="Unverified Raw", raw_title="Other Song",
+    ))
+    await db_session.commit()
+
+    resp = await async_client.get("/api/v1/discovery/artist-queue")
+    assert resp.status_code == 200
+    data = resp.json()
+    
+    # Only unverified artist should appear
+    assert len(data) == 1
+    assert data[0]["raw_name"] == "Unverified Raw"
+
+
+@pytest.mark.asyncio
+async def test_get_artist_queue_includes_suggested_artist(async_client, db_session):
+    """Artist queue includes suggested library artist when name matches."""
+    library_artist = Artist(name="Test Artist")
+    db_session.add(library_artist)
+    await db_session.flush()
+
+    station = Station(callsign="ARTQ_ST3")
+    db_session.add(station)
+    await db_session.flush()
+
+    db_session.add(BroadcastLog(
+        station_id=station.id, played_at=datetime.now(),
+        raw_artist="Test Artist", raw_title="Test Song",
+    ))
+    await db_session.commit()
+
+    resp = await async_client.get("/api/v1/discovery/artist-queue")
+    assert resp.status_code == 200
+    data = resp.json()
+    
+    assert len(data) == 1
+    assert data[0]["raw_name"] == "Test Artist"
+    assert data[0]["suggested_artist"] is not None
+    assert data[0]["suggested_artist"]["id"] == library_artist.id
+    assert data[0]["suggested_artist"]["name"] == "Test Artist"
+
+
+@pytest.mark.asyncio
+async def test_get_artist_queue_limit_offset(async_client, db_session):
+    """Artist queue supports limit and offset pagination."""
+    station = Station(callsign="ARTQ_ST4")
+    db_session.add(station)
+    await db_session.flush()
+
+    for i in range(5):
+        db_session.add(BroadcastLog(
+            station_id=station.id, played_at=datetime.now(),
+            raw_artist=f"Artist {i}", raw_title="Song",
+        ))
+    await db_session.commit()
+
+    resp = await async_client.get(
+        "/api/v1/discovery/artist-queue",
+        params={"limit": 2, "offset": 1}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 2
+
+
+# =============================================================================
+# Tests for Artist Link (Problem 4 - Verification Hub Redesign)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_artist_link_creates_verified_alias(async_client, db_session):
+    """Artist link creates a verified ArtistAlias entry."""
+    # Create a discovery item
+    item = DiscoveryQueue(
+        signature="link|song",
+        raw_artist="Misspelled Artsit",
+        raw_title="Good Song",
+        count=5,
+    )
+    db_session.add(item)
+    await db_session.commit()
+
+    resp = await async_client.post(
+        "/api/v1/discovery/artist-link",
+        json={
+            "raw_name": "Misspelled Artsit",
+            "resolved_name": "Correct Artist",
+        }
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "success"
+    assert data["raw_name"] == "Misspelled Artsit"
+    assert data["resolved_name"] == "Correct Artist"
+    assert data["affected_items"] == 1
+
+    # Verify alias was created
+    stmt = select(ArtistAlias).where(ArtistAlias.raw_name == "Misspelled Artsit")
+    result = await db_session.execute(stmt)
+    alias = result.scalar_one_or_none()
+    
+    assert alias is not None
+    assert alias.resolved_name == "Correct Artist"
+    assert alias.is_verified is True
+
+
+@pytest.mark.asyncio
+async def test_artist_link_updates_existing_alias(async_client, db_session):
+    """Artist link updates an existing alias if one exists."""
+    # Create existing unverified alias
+    existing_alias = ArtistAlias(
+        raw_name="Old Spelling",
+        resolved_name="Wrong Artist",
+        is_verified=False,
+    )
+    db_session.add(existing_alias)
+    
+    # Create discovery item
+    item = DiscoveryQueue(
+        signature="update|song",
+        raw_artist="Old Spelling",
+        raw_title="A Song",
+        count=3,
+    )
+    db_session.add(item)
+    await db_session.commit()
+
+    resp = await async_client.post(
+        "/api/v1/discovery/artist-link",
+        json={
+            "raw_name": "Old Spelling",
+            "resolved_name": "Right Artist",
+        }
+    )
+    assert resp.status_code == 200
+
+    # Verify alias was updated
+    await db_session.refresh(existing_alias)
+    assert existing_alias.resolved_name == "Right Artist"
+    assert existing_alias.is_verified is True
+
+
+@pytest.mark.asyncio
+async def test_artist_link_counts_affected_items(async_client, db_session):
+    """Artist link returns correct count of affected items."""
+    # Create multiple items with same raw artist
+    for i in range(3):
+        item = DiscoveryQueue(
+            signature=f"multi|song{i}",
+            raw_artist="Common Artist",
+            raw_title=f"Song {i}",
+            count=1,
+        )
+        db_session.add(item)
+    
+    # Create item with different artist
+    other_item = DiscoveryQueue(
+        signature="other|song",
+        raw_artist="Other Artist",
+        raw_title="Different Song",
+        count=1,
+    )
+    db_session.add(other_item)
+    await db_session.commit()
+
+    resp = await async_client.post(
+        "/api/v1/discovery/artist-link",
+        json={
+            "raw_name": "Common Artist",
+            "resolved_name": "Canonical Artist",
+        }
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["affected_items"] == 3  # Only items with "Common Artist"
+
+
+@pytest.mark.asyncio
+async def test_artist_link_no_affected_items(async_client, db_session):
+    """Artist link works even with no matching queue items."""
+    # No discovery items exist for this artist
+    resp = await async_client.post(
+        "/api/v1/discovery/artist-link",
+        json={
+            "raw_name": "Nonexistent Artist",
+            "resolved_name": "Some Artist",
+        }
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "success"
+    assert data["affected_items"] == 0
+
+    # Alias should still be created
+    stmt = select(ArtistAlias).where(ArtistAlias.raw_name == "Nonexistent Artist")
+    result = await db_session.execute(stmt)
+    alias = result.scalar_one_or_none()
+    assert alias is not None

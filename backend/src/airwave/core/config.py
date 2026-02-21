@@ -17,6 +17,7 @@ class Settings(BaseSettings):
 
     # Database
     DB_NAME: str = "airwave.db"
+    DB_BACKUP_RETENTION: int = 5  # Number of backups to retain
 
     @property
     def DB_PATH(self) -> Path:
@@ -35,6 +36,7 @@ class Settings(BaseSettings):
 
     # Performance & Debugging
     DB_ECHO: bool = False  # Enable SQLAlchemy query logging (set to True for debugging)
+    DEBUG_WORK_GROUPING: bool = False  # Enable verbose logging for work-recording grouping
 
     # Matching Thresholds
     MATCH_VARIANT_ARTIST_SCORE: float = 0.85
@@ -60,6 +62,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
-# Ensure data directory exists
-settings.DATA_DIR.mkdir(parents=True, exist_ok=True)

@@ -54,7 +54,7 @@ from airwave.core.normalization import Normalizer
 from airwave.core.performance import PerformanceMetrics
 from airwave.core.scanner_config import ScannerConfig
 from airwave.core.stats import ScanStats
-from airwave.core.task_store import TaskStore
+from airwave.core.task_store import TaskStore, get_task_store
 from airwave.core.vector_db import VectorDB
 from airwave.worker.matcher import Matcher
 
@@ -162,8 +162,9 @@ class LibraryMetadata:
         self.raw_artist = raw_artist
         self.raw_title = raw_title
 
-        # Normalization for Work primary: preserve full collab string (e.g. "daft punk feat pharrell williams")
-        self.artist = Normalizer.normalize_artist_full(raw_artist or "Unknown Artist")
+        # Normalization for Work primary: use clean_artist for uniqueness (strips feat/duet/etc)
+        # so "Daft Punk" and "Daft Punk feat. Pharrell" map to same Artist record
+        self.artist = Normalizer.clean_artist(raw_artist or "Unknown Artist")
 
         # Enhanced version parsing extracts ALL tags and handles edge cases
         clean_title, version_type = Normalizer.extract_version_type_enhanced(
@@ -256,7 +257,7 @@ class FileScanner:
         max_concurrent_files: Optional[int] = None  # Deprecated: use config instead
     ):
         self.session = session
-        self.task_store = task_store or TaskStore.get_global()  # Use global if not provided
+        self.task_store = task_store or get_task_store()  # Use global if not provided
         self.vector_db = vector_db or VectorDB()  # Create VectorDB if not provided
 
         # Handle backward compatibility for max_concurrent_files parameter
@@ -328,7 +329,7 @@ class FileScanner:
             await self.session.commit()
             return True
         except IntegrityError as e:
-            logger.debug(
+            logger.warning(
                 f"IntegrityError during {context} (race condition in parallel processing): {e}"
             )
             await self.session.rollback()
@@ -633,6 +634,9 @@ class FileScanner:
         This is a safety net for cases where version extraction fails
         and creates slightly different work titles.
 
+        Version descriptors are stripped before comparison to allow remixes/mixes
+        to match to base works even with descriptive names.
+
         Args:
             title: Cleaned work title
             artist_id: Primary artist ID
@@ -645,6 +649,8 @@ class FileScanner:
             # These would match (similarity > 0.85):
             "song title" vs "song title " (extra space)
             "song title" vs "song title the" (>85% similar)
+            "song" vs "song davidson ospina radio mix" (version stripped)
+            "song" vs "song the video mix" (version stripped)
 
             # These would NOT match (similarity < 0.85):
             "song title" vs "song title the ballad of love"
@@ -682,15 +688,19 @@ class FileScanner:
         result = await self.session.execute(stmt)
         work_tuples = result.all()
 
-        # Normalize input title for case-insensitive comparison
-        title_lower = title.lower()
+        # Strip version descriptors for better matching of remixes/mixes
+        # This allows "song" to match "song davidson ospina radio mix"
+        title_stripped, _ = Normalizer.extract_version_type_enhanced(title)
+        title_lower = title_stripped.lower()
 
         # Find best match using fuzzy string matching
         best_match_id = None
         best_ratio = 0.0
 
         for work_id, work_title in work_tuples:
-            work_title_lower = work_title.lower()
+            # Strip version descriptors from existing work title too
+            work_title_stripped, _ = Normalizer.extract_version_type_enhanced(work_title)
+            work_title_lower = work_title_stripped.lower()
 
             # ENHANCED: Use comprehensive part number checking
             if self._parts_differ(title, work_title):
@@ -701,7 +711,7 @@ class FileScanner:
                     )
                 continue  # Different parts, skip this work
 
-            # Case-insensitive comparison
+            # Case-insensitive comparison of stripped titles
             ratio = difflib.SequenceMatcher(None, title_lower, work_title_lower).ratio()
 
             # OPTIMIZATION: Early termination on very high match
@@ -1031,7 +1041,7 @@ class FileScanner:
                 cached_mtime = self._folder_mtime_cache.get(dir_path_normalized)
                 if cached_mtime is not None and stat_dir.st_mtime == cached_mtime:
                     if self.perf_metrics:
-                        self.perf_metrics.directories_skipped += 1
+                        self.perf_metrics.file.directories_skipped += 1
                     # Mark paths under this dir as seen so orphan GC won't delete them
                     dir_prefix = dir_path_normalized.rstrip("/") + "/"
                     async with self._processing_lock:
@@ -1045,7 +1055,7 @@ class FileScanner:
 
             # Track directory processing
             if self.perf_metrics:
-                self.perf_metrics.directories_processed += 1
+                self.perf_metrics.file.directories_processed += 1
 
             entries = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: list(os.scandir(current_path))
@@ -1176,7 +1186,7 @@ class FileScanner:
                             self._last_commit_moved = stats.moved
                             # Performance tracking
                             if self.perf_metrics:
-                                self.perf_metrics.commits_executed += 1
+                                self.perf_metrics.db.commits_executed += 1
                             logger.debug(
                                 f"Committed at {current_processed} files "
                                 f"(created={stats.created}, moved={stats.moved}, "
@@ -1185,7 +1195,7 @@ class FileScanner:
                         else:
                             # Performance tracking
                             if self.perf_metrics:
-                                self.perf_metrics.commits_skipped += 1
+                                self.perf_metrics.db.commits_skipped += 1
                             logger.debug(
                                 f"Skipped commit at {current_processed} files (no changes)"
                             )
@@ -1230,7 +1240,7 @@ class FileScanner:
 
         # Initialize performance monitoring
         self.perf_metrics = PerformanceMetrics()
-        self.perf_metrics.max_concurrent_files = self.config.max_concurrent_files
+        self.perf_metrics.file.max_concurrent_files = self.config.max_concurrent_files
 
         if task_id:
             self.task_store.update_total(task_id, 0, "Starting scan...")
@@ -1317,11 +1327,11 @@ class FileScanner:
 
         # Finalize performance metrics
         if self.perf_metrics:
-            self.perf_metrics.files_processed = stats.processed
-            self.perf_metrics.files_skipped = stats.skipped
-            self.perf_metrics.files_created = stats.created
-            self.perf_metrics.files_moved = stats.moved
-            self.perf_metrics.files_errored = stats.errors
+            self.perf_metrics.file.files_processed = stats.processed
+            self.perf_metrics.file.files_skipped = stats.skipped
+            self.perf_metrics.file.files_created = stats.created
+            self.perf_metrics.file.files_moved = stats.moved
+            self.perf_metrics.file.files_errored = stats.errors
             self.perf_metrics.finish()
             self.perf_metrics.log_summary("Scanner")
 
@@ -1507,9 +1517,9 @@ class FileScanner:
         )
         # Performance tracking
         if self.perf_metrics:
-            self.perf_metrics.touch_batches += 1
-            self.perf_metrics.touch_files_total += touch_count
-            self.perf_metrics.db_queries_update += 1
+            self.perf_metrics.file.touch_batches += 1
+            self.perf_metrics.file.touch_files_total += touch_count
+            self.perf_metrics.db.db_queries_update += 1
 
     @staticmethod
     def _content_pid(artist: str, title: str, file_path: Path) -> Tuple[str, Optional[str]]:
@@ -1535,14 +1545,14 @@ class FileScanner:
             self._missing_candidates = []
             # Performance tracking
             if self.perf_metrics:
-                self.perf_metrics.move_detection_queries_skipped += 1
+                self.perf_metrics.db.move_detection_queries_skipped += 1
             logger.debug("No missing files detected - skipping move detection query")
             return
         # Files are missing - need to check for moves
         path_list = list(missing_paths)
         # Performance tracking
         if self.perf_metrics:
-            self.perf_metrics.move_detection_queries += 1
+            self.perf_metrics.db.move_detection_queries += 1
         logger.info(f"Detected {len(missing_paths)} missing files - running move detection query")
         self._missing_candidates = []
         for start in range(0, len(path_list), self.config.missing_chunk_size):
@@ -1990,8 +2000,8 @@ class FileScanner:
                     stats.processed += 1
                     # Performance tracking
                     if self.perf_metrics:
-                        self.perf_metrics.size_changed_files += 1
-                        self.perf_metrics.db_queries_update += 1
+                        self.perf_metrics.file.size_changed_files += 1
+                        self.perf_metrics.db.db_queries_update += 1
                 return (True, stat)  # Skip file (already updated)
             return (False, stat)  # New file, needs processing
 
@@ -2023,9 +2033,9 @@ class FileScanner:
                 stats.processed += 1
                 # Performance tracking
                 if self.perf_metrics:
-                    self.perf_metrics.metadata_extractions_skipped += 1
-                    self.perf_metrics.legacy_files_updated += 1
-                    self.perf_metrics.db_queries_update += 1
+                    self.perf_metrics.file.metadata_extractions_skipped += 1
+                    self.perf_metrics.file.legacy_files_updated += 1
+                    self.perf_metrics.db.db_queries_update += 1
             logger.debug(f"Updated mtime for legacy file: {path_str}")
             return (True, stat)  # Skip file
 
@@ -2052,8 +2062,8 @@ class FileScanner:
 
         # Performance tracking
         if self.perf_metrics:
-            self.perf_metrics.metadata_extractions += 1
-            self.perf_metrics.time_metadata_extraction += t_metadata
+            self.perf_metrics.file.metadata_extractions += 1
+            self.perf_metrics.timing.time_metadata_extraction += t_metadata
 
         if not audio:
             async with self._processing_lock:
@@ -2164,7 +2174,7 @@ class FileScanner:
             )
             t_hash = time.time() - t_hash_start
             if self.perf_metrics:
-                self.perf_metrics.time_file_hashing += t_hash
+                self.perf_metrics.timing.time_file_hashing += t_hash
 
             # Determine primary artist (for Work)
             is_compilation = meta.album_artist and meta.album_artist.lower() in [
@@ -2237,7 +2247,7 @@ class FileScanner:
         # Track database operation time (session lock released)
         t_db = time.time() - t_db_start
         if self.perf_metrics:
-            self.perf_metrics.time_database_ops += t_db
+            self.perf_metrics.timing.time_database_ops += t_db
 
         # Vector indexing (outside session lock for better parallelism).
         # Only increment stats on full success; if this raises, process_file's except
@@ -2255,7 +2265,7 @@ class FileScanner:
                 )
             t_vector = time.time() - t_vector_start
             if self.perf_metrics:
-                self.perf_metrics.time_vector_indexing += t_vector
+                self.perf_metrics.timing.time_vector_indexing += t_vector
 
             stats.created += 1
             stats.processed += 1

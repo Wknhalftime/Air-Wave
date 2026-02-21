@@ -15,7 +15,11 @@ from airwave.core.models import (
     Recording,
     Work,
 )
-from airwave.core.task_store import TaskStore
+from airwave.core.task_store import (
+    complete_task,
+    update_progress,
+    update_total,
+)
 from airwave.core.utils import guess_station_from_filename
 from airwave.core.vector_db import VectorDB
 from airwave.worker.importer import CSVImporter
@@ -34,7 +38,7 @@ async def run_import(file_path: str, task_id: Optional[str] = None) -> None:
     if not path.exists():
         logger.error(f"File not found: {file_path}")
         if task_id:
-            TaskStore.complete_task(
+            complete_task(
                 task_id, success=False, error="File not found"
             )
         return
@@ -56,12 +60,12 @@ async def run_import(file_path: str, task_id: Optional[str] = None) -> None:
 
             # Accurate row count for progress
             if task_id:
-                TaskStore.update_progress(task_id, 0, "Counting rows...")
+                update_progress(task_id, 0, "Counting rows...")
                 # Fast line count
                 with open(path, "rb") as f:
                     actual_rows = sum(1 for _ in f) - 1  # Subtract Header
                 batch.total_rows = actual_rows
-                TaskStore.update_total(
+                update_total(
                     task_id, actual_rows, f"Importing {actual_rows} rows..."
                 )
 
@@ -73,7 +77,7 @@ async def run_import(file_path: str, task_id: Optional[str] = None) -> None:
 
                 # Update progress
                 if task_id:
-                    TaskStore.update_progress(
+                    update_progress(
                         task_id, total_rows, f"Imported {total_rows} rows"
                     )
 
@@ -85,8 +89,8 @@ async def run_import(file_path: str, task_id: Optional[str] = None) -> None:
 
             if task_id:
                 # Set final accurate total in case of small discrepancies
-                TaskStore.update_total(task_id, total_rows)
-                TaskStore.complete_task(task_id, success=True)
+                update_total(task_id, total_rows)
+                complete_task(task_id, success=True)
 
             await session.commit()
 
@@ -97,7 +101,7 @@ async def run_import(file_path: str, task_id: Optional[str] = None) -> None:
             await session.commit()
 
             if task_id:
-                TaskStore.complete_task(task_id, success=False, error=str(e))
+                complete_task(task_id, success=False, error=str(e))
 
 
 async def run_scan(task_id: Optional[str] = None) -> None:
@@ -120,12 +124,12 @@ async def run_scan(task_id: Optional[str] = None) -> None:
             # For now, we trust the Queue Rebuild to be the primary 'Scan' action.
             
             if task_id:
-                TaskStore.complete_task(task_id, success=True)
+                complete_task(task_id, success=True)
 
     except Exception as e:
         logger.exception("Scan failed")
         if task_id:
-            TaskStore.complete_task(task_id, success=False, error=str(e))
+            complete_task(task_id, success=False, error=str(e))
 
 
 async def run_re_evaluate(task_id: Optional[str] = None) -> None:
@@ -137,13 +141,12 @@ async def run_re_evaluate(task_id: Optional[str] = None) -> None:
                 "Starting re-evaluation of unmatched and flagged logs..."
             )
 
-            # Query UNIQUE (raw_artist, raw_title) pairs that are either unmatched OR flagged
-            # This is much more efficient than processing 2.4M individual logs
+            # Phase 4: Query by work_id instead of recording_id
             stmt = (
                 select(BroadcastLog.raw_artist, BroadcastLog.raw_title)
                 .where(
                     or_(
-                        BroadcastLog.recording_id.is_(None),  # Unmatched
+                        BroadcastLog.work_id.is_(None),  # Unmatched
                         BroadcastLog.match_reason.like(
                             "%Review%"
                         ),  # Flagged for review
@@ -159,18 +162,34 @@ async def run_re_evaluate(task_id: Optional[str] = None) -> None:
             logger.info(f"Found {total_pairs} unique song pairs to re-evaluate")
 
             if task_id:
-                TaskStore.update_total(task_id, total_pairs)
-                TaskStore.update_progress(
+                update_total(task_id, total_pairs)
+                update_progress(
                     task_id, 0, f"Re-evaluating {total_pairs} unique songs..."
                 )
 
-            # Convert to list of tuples for batch matching
             queries = [(ra, rt) for ra, rt in unique_pairs]
-
-            # Batch match all unique pairs with current thresholds
             results = await matcher.match_batch(queries)
 
-            # Update logs in bulk for each unique pair
+            # Phase 4: Batch collect all recording_ids to look up work_ids
+            recording_ids_to_lookup = set()
+            for raw_artist, raw_title in unique_pairs:
+                key = (raw_artist, raw_title)
+                if key in results:
+                    match_id, match_reason = results[key]
+                    # Bridge matches already return work_id
+                    # Non-bridge matches return recording_id
+                    if match_id and "Identity Bridge" not in match_reason:
+                        recording_ids_to_lookup.add(match_id)
+            
+            # Batch lookup recording -> work_id mappings
+            rec_to_work = {}
+            if recording_ids_to_lookup:
+                rec_stmt = select(Recording.id, Recording.work_id).where(
+                    Recording.id.in_(list(recording_ids_to_lookup))
+                )
+                rec_result = await session.execute(rec_stmt)
+                rec_to_work = {row[0]: row[1] for row in rec_result.all()}
+
             updated_count = 0
             processed = 0
 
@@ -179,34 +198,42 @@ async def run_re_evaluate(task_id: Optional[str] = None) -> None:
 
                 if key in results:
                     match_id, match_reason = results[key]
-
-                    # Bulk update ALL logs with this exact raw_artist/raw_title pair
-                    stmt_update = (
-                        update(BroadcastLog)
-                        .where(
-                            BroadcastLog.raw_artist == raw_artist,
-                            BroadcastLog.raw_title == raw_title,
-                            or_(
-                                BroadcastLog.recording_id.is_(None),
-                                BroadcastLog.match_reason.like("%Review%"),
-                            ),
+                    
+                    # Phase 4: Determine work_id
+                    if "Identity Bridge" in match_reason:
+                        # Bridge matches return work_id directly
+                        work_id = match_id
+                    else:
+                        # Non-bridge matches return recording_id, look up work_id
+                        work_id = rec_to_work.get(match_id)
+                    
+                    if work_id:
+                        # Phase 4: Set work_id (not recording_id)
+                        stmt_update = (
+                            update(BroadcastLog)
+                            .where(
+                                BroadcastLog.raw_artist == raw_artist,
+                                BroadcastLog.raw_title == raw_title,
+                                or_(
+                                    BroadcastLog.work_id.is_(None),
+                                    BroadcastLog.match_reason.like("%Review%"),
+                                ),
+                            )
+                            .values(
+                                work_id=work_id, match_reason=match_reason
+                            )
                         )
-                        .values(
-                            recording_id=match_id, match_reason=match_reason
-                        )
-                    )
 
-                    result = await session.execute(stmt_update)
-                    rows_updated = result.rowcount
+                        result = await session.execute(stmt_update)
+                        rows_updated = result.rowcount
 
-                    if rows_updated > 0:
-                        updated_count += rows_updated
+                        if rows_updated > 0:
+                            updated_count += rows_updated
 
                 processed += 1
 
-                # Update progress every 100 pairs
                 if task_id and processed % 100 == 0:
-                    TaskStore.update_progress(
+                    update_progress(
                         task_id,
                         processed,
                         f"Processed {processed}/{total_pairs} songs ({updated_count} logs updated)",
@@ -218,12 +245,12 @@ async def run_re_evaluate(task_id: Optional[str] = None) -> None:
             )
 
             if task_id:
-                TaskStore.complete_task(task_id, success=True)
+                complete_task(task_id, success=True)
 
     except Exception as e:
         logger.exception("Re-evaluation failed")
         if task_id:
-            TaskStore.complete_task(task_id, success=False, error=str(e))
+            complete_task(task_id, success=False, error=str(e))
 
 
 async def run_reindex() -> None:
@@ -280,18 +307,15 @@ async def run_sync_files(path: str, task_id: Optional[str] = None) -> None:
 
 async def run_bulk_import(root_dir: str, task_id: str = None):
     """Recursively imports CSV files from a directory.
-    Uses CSVImporter and tracks progress via TaskStore.
-    """
+    Uses CSVImporter and tracks progress via task_store."""
     import glob
     import os
-
-    from airwave.core.task_store import TaskStore
 
     path = Path(root_dir)
     if not path.exists():
         logger.error(f"Directory not found: {root_dir}")
         if task_id:
-            TaskStore.complete_task(
+            complete_task(
                 task_id, success=False, error=f"Directory not found: {root_dir}"
             )
         return
@@ -305,12 +329,12 @@ async def run_bulk_import(root_dir: str, task_id: str = None):
     logger.info(f"Found {total_files} CSV files to process.")
 
     if task_id:
-        TaskStore.update_progress(
+        update_progress(
             task_id, 0, f"Found {total_files} files. Starting import..."
         )
         # We can track "files processed" rather than rows for the parent task?
         # Or just use total files as the unit.
-        TaskStore.update_total(task_id, total_files)
+        update_total(task_id, total_files)
 
     for i, file_path in enumerate(csv_files, 1):
         async with AsyncSessionLocal() as session:
@@ -349,7 +373,7 @@ async def run_bulk_import(root_dir: str, task_id: str = None):
                 await session.commit()
 
                 if task_id:
-                    TaskStore.update_progress(
+                    update_progress(
                         task_id,
                         i,
                         f"Imported {filename} as {station_guess} ({processed_count} rows)",
@@ -365,7 +389,7 @@ async def run_bulk_import(root_dir: str, task_id: str = None):
                 # Don't fail the whole task, just log error
 
     if task_id:
-        TaskStore.complete_task(task_id, success=True)
+        complete_task(task_id, success=True)
     logger.success(f"Bulk import complete. Processed {total_files} files.")
 
 
@@ -387,11 +411,11 @@ async def run_discovery_task(task_id: Optional[str] = None) -> None:
             logger.success(f"Discovery complete. Queue size: {total_items}")
 
             if task_id:
-                TaskStore.complete_task(task_id, success=True)
+                complete_task(task_id, success=True)
     except Exception as e:
         logger.exception("Discovery failed")
         if task_id:
-            TaskStore.complete_task(task_id, success=False, error=str(e))
+            complete_task(task_id, success=False, error=str(e))
 
 
 async def run_debug_match(artist: str, title: str) -> None:

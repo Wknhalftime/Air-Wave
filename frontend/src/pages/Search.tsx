@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { fetcher } from '../lib/api';
 import { Music, Radio, Activity } from 'lucide-react';
 import { clsx } from 'clsx';
+import { toTitleCase, formatArtistForDisplay } from '../utils/format';
 
 interface TrackResult {
     id: number;
@@ -86,8 +87,8 @@ export default function Search() {
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                         {data.tracks.map((track) => (
                             <div key={track.id} className="bg-white p-4 rounded-lg shadow-sm border border-gray-100 hover:shadow-md transition-shadow">
-                                <div className="font-semibold text-gray-900 truncate" title={track.title}>{track.title}</div>
-                                <div className="text-sm text-gray-600 truncate">{track.artist}</div>
+                                <div className="font-semibold text-gray-900 truncate" title={toTitleCase(track.title)}>{toTitleCase(track.title)}</div>
+                                <div className="text-sm text-gray-600 truncate">{formatArtistForDisplay(track.artist)}</div>
                                 {track.album && <div className="text-xs text-gray-400 mt-1 truncate">{track.album}</div>}
                                 <div className="mt-3 text-xs font-mono text-gray-300 truncate" title={track.path}>
                                     {track.path}

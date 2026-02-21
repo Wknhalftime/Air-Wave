@@ -24,12 +24,12 @@ async def test_list_bridges(async_client: AsyncClient, db_session, setup_identit
     """Test GET /identity/bridges returns all bridges."""
     recording = setup_identity_data
     
-    # Create Bridge
+    # Create Bridge (links to work)
     bridge = IdentityBridge(
         log_signature="test_sig_list",
         reference_artist="Raw Artist",
         reference_title="Raw Title",
-        recording_id=recording.id
+        work_id=recording.work_id
     )
     db_session.add(bridge)
     await db_session.commit()
@@ -53,7 +53,7 @@ async def test_delete_bridge(async_client: AsyncClient, db_session, setup_identi
         log_signature="test_sig_del",
         reference_artist="To Delete",
         reference_title="Title",
-        recording_id=recording.id
+        work_id=recording.work_id
     )
     db_session.add(bridge)
     await db_session.commit()

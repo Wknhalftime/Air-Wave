@@ -74,10 +74,11 @@ async def backup_db() -> None:
         shutil.copy2(src, dst)
         logger.info(f"Database backed up to {dst}")
 
-        # Cleanup old backups (keep last 5)
+        # Cleanup old backups (keep last N)
+        max_backups = settings.DB_BACKUP_RETENTION
         backups = sorted(src.parent.glob(f"{settings.DB_NAME}.*.bak"))
-        if len(backups) > 5:
-            for b in backups[:-5]:
+        if len(backups) > max_backups:
+            for b in backups[:-max_backups]:
                 b.unlink()
     except (OSError, shutil.Error) as e:
         logger.error(f"Failed to backup database: {e}")
@@ -90,6 +91,7 @@ async def init_db(force: bool = False) -> None:
         force: If True, drops all existing tables and re-creates them.
             Use with extreme caution as this results in total data loss.
     """
+    settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     if force:
         logger.warning(
             "FORCED database initialization. Existing data might be lost."

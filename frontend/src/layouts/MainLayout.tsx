@@ -1,5 +1,5 @@
 import { Link, Outlet, useLocation } from 'react-router-dom';
-import { Home, ListMusic, History, Activity, BarChart3, Settings, CheckSquare, Radio, Brain, TrendingUp } from 'lucide-react';
+import { Home, ListMusic, History, Activity, BarChart3, Settings, CheckSquare, Radio, Brain, TrendingUp, Sliders } from 'lucide-react';
 import { clsx } from 'clsx';
 import { useQuery } from '@tanstack/react-query';
 import { fetcher } from '../lib/api';
@@ -66,9 +66,13 @@ export default function MainLayout() {
                     </div>
 
                     <div className="p-4 border-t border-gray-100 text-xs">
-                        <Link to="/admin" className="flex items-center gap-2 text-gray-500 hover:text-indigo-600 mb-4 transition-colors">
+                        <Link to="/admin" className="flex items-center gap-2 text-gray-500 hover:text-indigo-600 mb-2 transition-colors">
                             <Settings className="w-4 h-4" />
                             <span>Administration</span>
+                        </Link>
+                        <Link to="/preferences" className="flex items-center gap-2 text-gray-500 hover:text-indigo-600 mb-4 transition-colors">
+                            <Sliders className="w-4 h-4" />
+                            <span>Preferences</span>
                         </Link>
 
                         <div className="flex items-center justify-between text-gray-500">

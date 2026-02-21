@@ -1,4 +1,5 @@
 import { ArtistCard } from './ArtistCard';
+import { isVariousArtist } from '../../utils/format';
 
 interface ArtistStats {
     id: number;
@@ -40,9 +41,10 @@ export function ArtistGrid({ artists, isLoading }: ArtistGridProps) {
         );
     }
 
+    const visibleArtists = artists.filter((a) => !isVariousArtist(a.name));
     return (
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-6">
-            {artists.map((artist) => (
+            {visibleArtists.map((artist) => (
                 <ArtistCard key={artist.id} artist={artist} />
             ))}
         </div>

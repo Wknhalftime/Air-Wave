@@ -28,7 +28,7 @@ async def test_export_m3u_empty(client, db_session):
         played_at=datetime(2025, 1, 15, 12, 0, 0),
         raw_artist="Unknown",
         raw_title="Unknown",
-        recording_id=None,
+        work_id=None,
         import_batch_id=batch.id,
     )
     db_session.add(log)
@@ -70,7 +70,7 @@ async def test_export_m3u_basic(client, db_session):
         played_at=datetime(2025, 1, 15, 12, 0, 0),
         raw_artist="The Beatles",
         raw_title="Hey Jude",
-        recording_id=r.id,
+        work_id=w.id,
         import_batch_id=batch.id,
         match_reason="identity_bridge",
     )
@@ -127,7 +127,7 @@ async def test_export_m3u_chronological_order(client, db_session):
         played_at=datetime(2025, 1, 15, 14, 0, 0),
         raw_artist="Second",
         raw_title="Second Song",
-        recording_id=r2.id,
+        work_id=w2.id,
         import_batch_id=batch.id,
     )
     log2 = BroadcastLog(
@@ -135,7 +135,7 @@ async def test_export_m3u_chronological_order(client, db_session):
         played_at=datetime(2025, 1, 15, 12, 0, 0),
         raw_artist="First",
         raw_title="First Song",
-        recording_id=r1.id,
+        work_id=w1.id,
         import_batch_id=batch.id,
     )
     db_session.add(log1)
@@ -178,7 +178,7 @@ async def test_export_m3u_filter_by_station(client, db_session):
         played_at=datetime(2025, 1, 15, 12, 0, 0),
         raw_artist="Artist",
         raw_title="Title",
-        recording_id=r.id,
+        work_id=w.id,
         import_batch_id=batch.id,
     )
     log2 = BroadcastLog(
@@ -186,7 +186,7 @@ async def test_export_m3u_filter_by_station(client, db_session):
         played_at=datetime(2025, 1, 15, 13, 0, 0),
         raw_artist="Artist",
         raw_title="Title",
-        recording_id=r.id,
+        work_id=w.id,
         import_batch_id=batch.id,
     )
     db_session.add_all([log1, log2])
@@ -223,7 +223,7 @@ async def test_export_m3u_recording_with_no_library_files_skipped(client, db_ses
         played_at=datetime(2025, 1, 15, 12, 0, 0),
         raw_artist="NoFile",
         raw_title="No File Song",
-        recording_id=r.id,
+        work_id=w.id,
         import_batch_id=batch.id,
     )
     db_session.add(log)
@@ -269,7 +269,7 @@ async def test_export_m3u_multiple_files_uses_first(client, db_session):
         played_at=datetime(2025, 1, 15, 12, 0, 0),
         raw_artist="Multi",
         raw_title="Multi",
-        recording_id=r.id,
+        work_id=w.id,
         import_batch_id=batch.id,
     )
     db_session.add(log)
@@ -313,7 +313,7 @@ async def test_export_m3u_filter_by_date_range(client, db_session):
             played_at=datetime(2025, 1, day, 12, 0, 0),
             raw_artist="Artist",
             raw_title="Track",
-            recording_id=r.id,
+            work_id=w.id,
             import_batch_id=batch.id,
         )
         db_session.add(log)
@@ -357,7 +357,7 @@ async def test_export_m3u_relative_path_resolved_to_absolute(client, db_session,
         played_at=datetime(2025, 1, 15, 12, 0, 0),
         raw_artist="Artist",
         raw_title="Title",
-        recording_id=r.id,
+        work_id=w.id,
         import_batch_id=batch.id,
     )
     db_session.add(log)

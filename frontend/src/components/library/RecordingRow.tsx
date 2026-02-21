@@ -1,5 +1,6 @@
-import { Clock, CheckCircle, XCircle, FileAudio } from 'lucide-react';
+import { CheckCircle, XCircle, FileAudio } from 'lucide-react';
 import type { RecordingListItem } from '../../hooks/useLibrary';
+import { toTitleCase } from '../../utils/format';
 
 interface RecordingRowProps {
     recording: RecordingListItem;
@@ -17,23 +18,24 @@ export default function RecordingRow({ recording }: RecordingRowProps) {
         <tr className="hover:bg-gray-50 transition-colors">
             <td className="px-6 py-4">
                 <div className="text-sm font-medium text-gray-900">
-                    {recording.title}
-                </div>
-            </td>
-            <td className="px-6 py-4">
-                <div className="text-sm text-gray-600">
-                    {recording.artist_display}
-                </div>
-            </td>
-            <td className="px-6 py-4">
-                <div className="flex items-center gap-1.5 text-sm text-gray-600">
-                    <Clock className="w-3.5 h-3.5 text-gray-400" />
-                    <span className="font-mono">{formatDuration(recording.duration)}</span>
+                    {toTitleCase(recording.title)}
                 </div>
             </td>
             <td className="px-6 py-4">
                 <div className="text-sm text-gray-600">
                     {recording.version_type || (
+                        <span className="text-gray-400">-</span>
+                    )}
+                </div>
+            </td>
+            <td className="px-6 py-4">
+                <div className="text-sm text-gray-600 font-mono">
+                    {formatDuration(recording.duration)}
+                </div>
+            </td>
+            <td className="px-6 py-4">
+                <div className="text-sm text-gray-600">
+                    {recording.filename || (
                         <span className="text-gray-400">-</span>
                     )}
                 </div>

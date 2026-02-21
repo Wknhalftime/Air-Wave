@@ -1,6 +1,55 @@
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict
+
+
+# Match Tuner schemas
+class MatchCandidate(BaseModel):
+    """Single match candidate with quality analysis."""
+    recording_id: int
+    artist: str
+    title: str
+    artist_sim: float
+    title_sim: float
+    vector_dist: float
+    match_type: str
+    quality_warnings: List[str] = []
+    edge_case: Optional[str] = None
+
+
+class MatchSample(BaseModel):
+    """Sample of unmatched log with match candidates."""
+    id: int
+    raw_artist: str
+    raw_title: str
+    match: Optional[dict]
+    candidates: List[MatchCandidate]
+    category: Optional[str] = None
+    action: Optional[str] = None
+
+
+class MatchImpactResponse(BaseModel):
+    """Response model for match impact analysis."""
+    total_unmatched: int
+    sample_size: int
+    auto_link_count: int
+    auto_link_percentage: float
+    review_count: int
+    review_percentage: float
+    reject_count: int
+    reject_percentage: float
+    identity_bridge_count: int
+    identity_bridge_percentage: float
+    edge_cases: dict
+    thresholds_used: dict
+
+
+class ThresholdSettings(BaseModel):
+    """Matching threshold configuration."""
+    artist_auto: float
+    artist_review: float
+    title_auto: float
+    title_review: float
 
 
 class ArtistStats(BaseModel):
@@ -62,3 +111,4 @@ class RecordingListItem(BaseModel):
     work_title: str  # Work title for the "Work" column
     is_verified: bool  # Matched/Unmatched status
     has_file: bool  # Whether recording has associated library file (Library/Metadata only)
+    filename: Optional[str] = None  # Filename (not full path) from first library file

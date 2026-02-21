@@ -57,9 +57,9 @@ async def test_trigger_scan(client):
         # However, verifying call args might be tricky if it runs async.
         # But we can verify TaskStore content immediately as endpoints create it BEFORE response.
 
-        from airwave.core.task_store import TaskStore
+        from airwave.core.task_store import get_task
 
-        task = TaskStore.get_task(data["task_id"])
+        task = get_task(data["task_id"])
         assert task
         assert task.status == "running"
         assert task.total == 1  # Initial dummy
@@ -75,8 +75,8 @@ async def test_trigger_internal_scan(client):
         data = response.json()
         assert data["task_id"]
 
-        from airwave.core.task_store import TaskStore
+        from airwave.core.task_store import get_task
 
-        task = TaskStore.get_task(data["task_id"])
+        task = get_task(data["task_id"])
         assert task
         assert task.task_type == "scan"

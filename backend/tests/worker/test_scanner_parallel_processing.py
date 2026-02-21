@@ -196,7 +196,7 @@ async def test_performance_metrics_track_concurrency(async_session):
             await scanner.scan_directory(tmpdir)
         
         # Performance metrics should track the concurrency setting
-        assert scanner.perf_metrics.max_concurrent_files == max_concurrent
+        assert scanner.perf_metrics.file.max_concurrent_files == max_concurrent
 
 
 @pytest.mark.asyncio
@@ -223,7 +223,7 @@ async def test_directories_processed_metric(async_session):
             await scanner.scan_directory(tmpdir)
         
         # Should have processed 3 directories: tmpdir, subdir1, subdir2
-        assert scanner.perf_metrics.directories_processed == 3
+        assert scanner.perf_metrics.file.directories_processed == 3
 
 
 @pytest.mark.asyncio
@@ -245,8 +245,8 @@ async def test_commit_coordination_in_parallel_processing(async_session):
         
         # Commits should have been tracked
         total_commit_opportunities = (
-            scanner.perf_metrics.commits_executed + 
-            scanner.perf_metrics.commits_skipped
+            scanner.perf_metrics.db.commits_executed + 
+            scanner.perf_metrics.db.commits_skipped
         )
         # Should have at least 1 commit opportunity at 100 files
         assert total_commit_opportunities >= 1

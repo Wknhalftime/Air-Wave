@@ -1,8 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import { TunerSlider } from '@/components/admin/TunerSlider';
+import { PresetButtons } from '@/components/admin/PresetButtons';
+import { ImpactSummary } from '@/components/admin/ImpactSummary';
+import { ExampleMatches } from '@/components/admin/ExampleMatches';
+import { MatchScatterPlot } from '@/components/admin/MatchScatterPlot';
 import { matchTunerApi } from '@/lib/api';
+import type { MatchImpactResponse } from '@/types/match-tuner';
 import { Button } from '@/components/ui/button';
-import { Loader2 } from 'lucide-react';
+import { Loader2, BarChart3, List, ScatterChart } from 'lucide-react';
 import { toast } from 'sonner';
 import { TaskProgress } from '@/components/TaskProgress';
 
@@ -40,6 +45,9 @@ export const MatchTuner: React.FC = () => {
         title_auto: 0.8, title_review: 0.6
     });
     const [samples, setSamples] = useState<MatchSample[]>([]);
+    const [impact, setImpact] = useState<MatchImpactResponse | null>(null);
+    const [loadingImpact, setLoadingImpact] = useState(false);
+    const [viewMode, setViewMode] = useState<'list' | 'scatter'>('list');
 
     useEffect(() => {
         loadData();
@@ -49,7 +57,7 @@ export const MatchTuner: React.FC = () => {
         try {
             const [tData, sData] = await Promise.all([
                 matchTunerApi.getThresholds(),
-                matchTunerApi.getMatchSamples(30)
+                matchTunerApi.getMatchSamples(10)  // Reduced from 30 to 10 for performance
             ]);
             setThresholds(tData);
             setSamples(sData);
@@ -61,9 +69,9 @@ export const MatchTuner: React.FC = () => {
     };
 
     const refreshSamples = async () => {
-        // Refresh samples only, preserve current threshold values
+        // Refresh samples with current thresholds for stratified categorization
         try {
-            const sData = await matchTunerApi.getMatchSamples(30);
+            const sData = await matchTunerApi.getMatchSamples(10, thresholds, true); // stratified=true
             setSamples(sData);
             toast.success("Samples refreshed");
         } catch (e) {
@@ -90,6 +98,28 @@ export const MatchTuner: React.FC = () => {
             toast.error("Failed to start re-evaluation");
             setReEvaluating(false);
         }
+    };
+
+    const handlePreviewImpact = async () => {
+        setLoadingImpact(true);
+        try {
+            const impactData = await matchTunerApi.getMatchImpact({
+                ...thresholds,
+                sample_size: 1000,
+            });
+            setImpact(impactData);
+            toast.success("Impact analysis complete!");
+        } catch (e) {
+            toast.error("Failed to analyze impact");
+        } finally {
+            setLoadingImpact(false);
+        }
+    };
+
+    const handlePresetSelect = (presetThresholds: Thresholds) => {
+        setThresholds(presetThresholds);
+        setImpact(null); // Clear impact when thresholds change
+        toast.info("Preset applied - click 'Preview Impact' to see results");
     };
 
     // Prepare data for sliders - filter to >= 40%
@@ -120,7 +150,7 @@ export const MatchTuner: React.FC = () => {
     if (loading) return <div className="flex justify-center p-8"><Loader2 className="animate-spin" /></div>;
 
     return (
-        <div className="container mx-auto p-6 max-w-4xl">
+        <div className="container mx-auto p-6 max-w-6xl">
             <header className="mb-8 flex justify-between items-center">
                 <div>
                     <h1 className="text-3xl font-bold tracking-tight">Match Intelligence Tuner</h1>
@@ -135,12 +165,49 @@ export const MatchTuner: React.FC = () => {
                 </div>
             </header>
 
+            {/* Preset Buttons */}
+            <div className="mb-6">
+                <PresetButtons
+                    currentThresholds={thresholds}
+                    onPresetSelect={handlePresetSelect}
+                />
+            </div>
+
+            {/* Impact Summary */}
+            <div className="mb-8">
+                <div className="flex items-center justify-between mb-4">
+                    <h2 className="text-lg font-semibold">Impact Preview</h2>
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handlePreviewImpact}
+                        disabled={loadingImpact}
+                    >
+                        {loadingImpact ? (
+                            <>
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                Analyzing...
+                            </>
+                        ) : (
+                            <>
+                                <BarChart3 className="mr-2 h-4 w-4" />
+                                Preview Impact
+                            </>
+                        )}
+                    </Button>
+                </div>
+                <ImpactSummary impact={impact} loading={loadingImpact} />
+            </div>
+
             <TunerSlider
                 title="Artist Sensitivity (Fuzzy Name Matching)"
                 autoThreshold={thresholds.artist_auto}
                 reviewThreshold={thresholds.artist_review}
                 samples={artistSamples}
-                onChange={(auto, review) => setThresholds(prev => ({ ...prev, artist_auto: auto, artist_review: review }))}
+                onChange={(auto, review) => {
+                    setThresholds(prev => ({ ...prev, artist_auto: auto, artist_review: review }));
+                    setImpact(null); // Clear impact when thresholds change
+                }}
             />
 
             <TunerSlider
@@ -148,8 +215,52 @@ export const MatchTuner: React.FC = () => {
                 autoThreshold={thresholds.title_auto}
                 reviewThreshold={thresholds.title_review}
                 samples={titleSamples}
-                onChange={(auto, review) => setThresholds(prev => ({ ...prev, title_auto: auto, title_review: review }))}
+                onChange={(auto, review) => {
+                    setThresholds(prev => ({ ...prev, title_auto: auto, title_review: review }));
+                    setImpact(null); // Clear impact when thresholds change
+                }}
             />
+
+            {/* Example Matches with View Toggle */}
+            <div className="mb-8 space-y-4">
+                {/* View Toggle */}
+                <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-semibold">Match Examples</h3>
+                    <div className="flex gap-2">
+                        <Button
+                            variant={viewMode === 'list' ? 'default' : 'outline'}
+                            size="sm"
+                            onClick={() => setViewMode('list')}
+                        >
+                            <List className="h-4 w-4 mr-1" />
+                            List View
+                        </Button>
+                        <Button
+                            variant={viewMode === 'scatter' ? 'default' : 'outline'}
+                            size="sm"
+                            onClick={() => setViewMode('scatter')}
+                        >
+                            <ScatterChart className="h-4 w-4 mr-1" />
+                            2D View
+                        </Button>
+                    </div>
+                </div>
+
+                {/* Conditional Rendering */}
+                {viewMode === 'list' ? (
+                    <ExampleMatches
+                        samples={samples}
+                        loading={loading}
+                        onRefresh={refreshSamples}
+                        thresholds={thresholds}
+                    />
+                ) : (
+                    <MatchScatterPlot
+                        samples={samples}
+                        thresholds={thresholds}
+                    />
+                )}
+            </div>
 
             {/* Re-evaluation Progress */}
             {reEvaluateTaskId && (

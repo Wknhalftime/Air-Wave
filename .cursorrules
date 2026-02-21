@@ -1,0 +1,271 @@
+# Airwave - Cursor AI Rules
+
+## Project Overview
+
+Airwave is a broadcast log management system that matches raw artist/title pairs from radio station logs to a music library.
+
+**Tech Stack:**
+- Backend: Python 3.11+, FastAPI, SQLAlchemy, ChromaDB (vector search)
+- Frontend: React, TypeScript, Vite, Recharts
+- Database: PostgreSQL
+
+---
+
+## 📚 Documentation First
+
+**ALWAYS start by reading the documentation before making changes:**
+
+1. **`docs/CURRENT-ARCHITECTURE.md`** - Comprehensive system overview (START HERE)
+2. **`docs/CHANGELOG.md`** - Recent changes and fixes
+3. **`docs/README.md`** - Documentation navigation guide
+
+**Key Architecture Docs:**
+- `docs/match-tuner-all-phases-complete.md` - Match Tuner system
+- `docs/planning/identity-resolution-architecture.md` - Phase 4 architecture
+- `docs/artist-linking-decoupling-fix.md` - Artist linking design
+- `docs/rematch-batching-optimization.md` - Performance patterns
+
+**⚠️ DO NOT use docs in `docs/archive/`** - These describe FIXED bugs, not current system.
+
+---
+
+## 🏗️ Architecture Principles
+
+### Phase 4 Identity Resolution (CRITICAL)
+
+We use a **three-layer architecture**:
+
+| Layer | Concern | Granularity | Field Name |
+|-------|---------|-------------|------------|
+| **Identity** | What song? | Work | `work_id` |
+| **Policy** | Which version? | Recording | `recording_id` |
+| **Resolution** | Which file? | LibraryFile | `library_file_id` |
+
+**ALWAYS use `work_id` for identity resolution:**
+```python
+# ✅ CORRECT (Phase 4)
+BroadcastLog.work_id → Work
+IdentityBridge.work_id → Work
+DiscoveryQueue.suggested_work_id → Work
+
+# ❌ WRONG (Phase 3 - deprecated)
+BroadcastLog.recording_id → Recording
+```
+
+### Artist Linking Independence
+
+**Artist linking is INDEPENDENT of song matching:**
+- Artist Linking queries `BroadcastLog` (all logs), NOT `DiscoveryQueue` (unmatched only)
+- Users can create artist aliases proactively, before songs fail to match
+- Artist identity resolution is separate from song matching
+
+### Three-Range Filtering
+
+Matches are categorized into three ranges:
+
+1. **Auto-Accept** - Both artist AND title ≥ auto thresholds → Auto-link to `BroadcastLog.work_id`
+2. **Review** - Both ≥ review, at least one < auto → Add to `DiscoveryQueue`
+3. **Reject** - Either < review → Don't add to `DiscoveryQueue`
+
+**Thresholds (configurable via Match Tuner):**
+- `MATCH_VARIANT_ARTIST_SCORE` (default: 0.85) - Auto-accept artist threshold
+- `MATCH_VARIANT_TITLE_SCORE` (default: 0.80) - Auto-accept title threshold
+- `MATCH_ALIAS_ARTIST_SCORE` (default: 0.70) - Review artist threshold
+- `MATCH_ALIAS_TITLE_SCORE` (default: 0.70) - Review title threshold
+
+---
+
+## 🚀 Performance Patterns
+
+### Always Use Batching
+
+**ALWAYS process items in batches, never one-at-a-time:**
+
+```python
+# ✅ CORRECT - Batching (500 items per batch)
+BATCH_SIZE = 500
+items = (await db.execute(select(Model).where(...))).scalars().all()
+for i in range(0, len(items), BATCH_SIZE):
+    batch = items[i:i + BATCH_SIZE]
+    batch_queries = [(item.field1, item.field2) for item in batch]
+    results = await process_batch(batch_queries)
+
+# ❌ WRONG - One-at-a-time (10x slower)
+for item_id in item_ids:
+    item = await db.get(Model, item_id)
+    result = await process_single(item)
+```
+
+**Performance Impact:**
+- 10x faster processing
+- 300x fewer database queries
+- 500x fewer vector searches
+
+### Stratified Sampling
+
+For representative examples, use stratified sampling:
+- Sample 1,000 logs for comprehensive coverage
+- Return 10-15 examples per category
+- Performance target: 3-5 seconds
+
+---
+
+## 💻 Code Style
+
+### Backend (Python)
+
+**Type Hints:**
+```python
+# ✅ Use SQLAlchemy 2.0 Mapped types
+class BroadcastLog(Base):
+    id: Mapped[int]
+    work_id: Mapped[Optional[int]]
+    raw_artist: Mapped[str]
+```
+
+**Async/Await:**
+```python
+# ✅ Always use async for database operations
+async def get_items(db: AsyncSession) -> list[Item]:
+    stmt = select(Item).where(...)
+    result = await db.execute(stmt)
+    return result.scalars().all()
+```
+
+### Frontend (TypeScript)
+
+**Type Safety:**
+```typescript
+// ✅ Use proper TypeScript interfaces
+interface MatchCandidate {
+  raw_artist: string;
+  raw_title: string;
+  artist_similarity: number;
+  title_similarity: number;
+  category: "auto_link" | "review" | "reject" | "identity_bridge";
+  edge_case?: boolean;
+}
+```
+
+**Import Types:**
+```typescript
+// ✅ Use 'import type' for type-only imports (required by tsconfig)
+import type { MatchCandidate } from '../types';
+import { useState } from 'react';
+```
+
+---
+
+## 🧪 Testing
+
+**Before running tests, check how they should be run:**
+- Backend: `pytest` or `pytest tests/specific_test.py`
+- Frontend: `npm test` or `npm run test:unit`
+
+**Always suggest writing tests after code changes.**
+
+---
+
+## 📝 Documentation
+
+### When to Update Documentation
+
+**ALWAYS update documentation when:**
+1. Changing architecture or design patterns
+2. Fixing bugs or performance issues
+3. Adding new features or endpoints
+4. Refactoring major components
+
+**Update these files:**
+- `docs/CURRENT-ARCHITECTURE.md` - For architecture changes
+- `docs/CHANGELOG.md` - For all changes (add dated entry)
+- Feature-specific docs - For functionality changes
+
+### When to Archive Documentation
+
+**Move to `docs/archive/` when:**
+- Document describes a bug that has been FIXED
+- Document describes an implementation that has been REPLACED
+- Document is historical reference only
+
+**Update `docs/archive/README.md` with:**
+- Document name and status (✅ FIXED / ✅ IMPLEMENTED)
+- Date and description
+- Resolution summary
+- Link to current documentation
+
+---
+
+## 🔍 Common Patterns
+
+### Matching Pipeline Priority
+
+1. **Identity Bridge** - Pre-verified mappings (instant, highest priority)
+2. **Exact Match** - Normalized exact string matching
+3. **High Confidence** - Fuzzy similarity ≥ auto threshold
+4. **Review Confidence** - Fuzzy similarity ≥ review threshold
+5. **Vector Semantic** - ChromaDB cosine similarity (lowest priority)
+
+### Artist Similarity Calculation
+
+```python
+# ✅ Compare WHOLE raw artist against EACH library artist, take BEST score
+raw_artist_clean = Normalizer.clean_artist(raw_artist)  # "beatles"
+for lib_artist in work.artists:
+    lib_artist_clean = Normalizer.clean_artist(lib_artist.name)  # "the beatles"
+    similarity = difflib.SequenceMatcher(None, raw_artist_clean, lib_artist_clean).ratio()
+    best_similarity = max(best_similarity, similarity)
+```
+
+### Database Queries
+
+```python
+# ✅ Use select() for queries (SQLAlchemy 2.0 style)
+stmt = select(BroadcastLog).where(BroadcastLog.work_id.is_(None))
+results = (await db.execute(stmt)).scalars().all()
+
+# ✅ Use joins efficiently
+stmt = (
+    select(BroadcastLog)
+    .join(Work)
+    .where(Work.artist_id == artist_id)
+)
+```
+
+---
+
+## ⚠️ Common Pitfalls
+
+1. **DON'T use `recording_id` for identity** - Use `work_id` (Phase 4)
+2. **DON'T query DiscoveryQueue for artist linking** - Use `BroadcastLog`
+3. **DON'T process items one-at-a-time** - Use batching (500 items)
+4. **DON'T read archived docs** - They describe fixed bugs
+5. **DON'T forget to update CHANGELOG.md** - Document all changes
+
+---
+
+## 🎯 Quick Reference
+
+**Key Files:**
+- `backend/src/airwave/worker/matcher.py` - Matching engine
+- `backend/src/airwave/api/routers/discovery.py` - Discovery/Verification API
+- `backend/src/airwave/api/routers/admin.py` - Match Tuner API
+- `frontend/src/pages/admin/MatchTuner.tsx` - Match Tuner UI
+- `frontend/src/components/admin/ExampleMatches.tsx` - Match examples
+- `frontend/src/components/admin/MatchScatterPlot.tsx` - 2D visualization
+
+**Key Constants:**
+- `BATCH_SIZE = 500` - Standard batch size for processing
+- Sample size: 1,000 logs for impact analysis
+- Edge case threshold: 5% of any threshold boundary
+
+---
+
+## 📞 When Stuck
+
+1. Read `docs/CURRENT-ARCHITECTURE.md` for system overview
+2. Check `docs/CHANGELOG.md` for recent changes
+3. Search feature-specific docs in `docs/`
+4. Ask user for clarification
+5. **NEVER** assume based on archived docs in `docs/archive/`
+

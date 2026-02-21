@@ -31,7 +31,7 @@ async def test_list_stations(async_client: AsyncClient, db_session: AsyncSession
         played_at=datetime.fromisoformat("2023-01-01 10:00:00"), 
         raw_artist="Artist", 
         raw_title="Title",
-        recording_id=recording.id
+        work_id=work.id
     )
     log2 = BroadcastLog(
         station_id=station1.id, 

@@ -182,19 +182,9 @@ class VectorDB:
             query_texts=[query_text], n_results=limit, where=where
         )
 
-        matches = []
-        if (
-            results["ids"]
-            and len(results["ids"]) > 0
-            and results["distances"]
-            and len(results["distances"]) > 0
-        ):
-            for i in range(len(results["ids"][0])):
-                track_id = int(results["ids"][0][i])
-                distance = results["distances"][0][i]
-                matches.append((track_id, distance))
-
-        return matches
+        ids = results.get("ids", [[]])[0] if results.get("ids") else []
+        distances = results.get("distances", [[]])[0] if results.get("distances") else []
+        return self._parse_chroma_results(ids, distances)
 
     def search_batch(
         self, queries: List[Tuple[str, str]], limit: int = 1
@@ -237,22 +227,34 @@ class VectorDB:
             )
 
             # Chroma returns nested lists for batch queries
-            if (
-                results["ids"]
-                and len(results["ids"]) > 0
-                and results["distances"]
-                and len(results["distances"]) > 0
-            ):
-                for j in range(len(query_texts)):
-                    row_matches = []
-                    ids = results["ids"][j]
-                    dists = results["distances"][j]
-
-                    for k in range(len(ids)):
-                        track_id = int(ids[k])
-                        dist = dists[k]
-                        row_matches.append((track_id, dist))
-
-                    all_matches.append(row_matches)
+            ids_batch = results.get("ids") or []
+            dists_batch = results.get("distances") or []
+            for j in range(len(query_texts)):
+                ids = ids_batch[j] if j < len(ids_batch) else []
+                dists = dists_batch[j] if j < len(dists_batch) else []
+                all_matches.append(self._parse_chroma_results(ids, dists))
 
         return all_matches
+
+    def _parse_chroma_results(
+        self,
+        ids: List[Any],
+        distances: List[Any],
+    ) -> List[Tuple[int, float]]:
+        """Parse ChromaDB query results into (track_id, distance) tuples.
+
+        Args:
+            ids: List of track ID strings from ChromaDB.
+            distances: List of distance values from ChromaDB.
+
+        Returns:
+            List of (track_id, distance) tuples.
+        """
+        matches: List[Tuple[int, float]] = []
+        if not ids or not distances:
+            return matches
+        for i in range(len(ids)):
+            track_id = int(ids[i])
+            distance = float(distances[i])
+            matches.append((track_id, distance))
+        return matches

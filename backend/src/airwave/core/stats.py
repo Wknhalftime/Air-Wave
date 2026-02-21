@@ -52,6 +52,7 @@ class ScanStats:
             "errors": self.errors,
             "linked": self.linked,
             "moved": self.moved,
+            "cancelled": self.cancelled,
         }
 
     def __str__(self) -> str:

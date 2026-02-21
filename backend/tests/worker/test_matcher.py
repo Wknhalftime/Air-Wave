@@ -62,19 +62,20 @@ async def test_matcher_logic(db_session):
         assert match_id == track.id
 
         # Test 3: Identity Bridge Match
-        # Create Bridge
+        # Phase 4: Create Bridge with work_id
         sig = Normalizer.generate_signature("Nirvana", "Live at Reading")
         bridge = IdentityBridge(
             log_signature=sig,
             reference_artist="Nirvana",
             reference_title="Live at Reading",
-            recording_id=track.id,
+            work_id=w.id,  # Phase 4: Use work_id
         )
         db_session.add(bridge)
         await db_session.commit()
 
+        # Phase 4: Bridge matches return work_id
         match_id, _ = await matcher.find_match("Nirvana", "Live at Reading")
-        assert match_id == track.id
+        assert match_id == w.id  # Phase 4: Returns work_id
     finally:
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)

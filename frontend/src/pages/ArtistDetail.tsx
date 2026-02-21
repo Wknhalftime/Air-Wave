@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { ArrowLeft, Music, Disc, Inbox } from 'lucide-react';
+import { toTitleCase, formatArtistForDisplay } from '../utils/format';
 import { useArtist, useArtistWorks } from '../hooks/useLibrary';
-import WorkCard from '../components/library/WorkCard';
+import WorkRow from '../components/library/WorkRow';
 import Pagination from '../components/common/Pagination';
 import EmptyState from '../components/common/EmptyState';
 
@@ -51,7 +52,7 @@ export default function ArtistDetail() {
                 </Link>
                 <span>/</span>
                 <span className="text-gray-900 font-medium">
-                    {artist?.name || 'Loading...'}
+                    {artist ? (formatArtistForDisplay(artist.name) || '–') : 'Loading...'}
                 </span>
             </nav>
 
@@ -70,11 +71,11 @@ export default function ArtistDetail() {
                 <div className="bg-white p-8 rounded-xl border border-gray-100 shadow-sm">
                     <div className="flex items-center gap-6">
                         <div className="w-32 h-32 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-4xl font-bold text-white">
-                            {artist.name.charAt(0).toUpperCase()}
+                            {formatArtistForDisplay(artist.name).charAt(0)}
                         </div>
                         <div className="flex-1">
                             <h1 className="text-3xl font-bold text-gray-900 mb-2">
-                                {artist.name}
+                                {formatArtistForDisplay(artist.name)}
                             </h1>
                             <div className="flex items-center gap-6 text-sm text-gray-600">
                                 <span className="flex items-center gap-2">
@@ -100,24 +101,36 @@ export default function ArtistDetail() {
                         <p className="text-red-500">Error loading works</p>
                     </div>
                 ) : worksLoading ? (
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                        {[...Array(6)].map((_, i) => (
-                            <div
-                                key={i}
-                                className="animate-pulse bg-white p-6 rounded-lg border border-gray-100"
-                            >
-                                <div className="h-5 bg-gray-200 w-3/4 mb-3 rounded" />
-                                <div className="h-4 bg-gray-200 w-1/2 mb-2 rounded" />
-                                <div className="h-4 bg-gray-200 w-1/3 rounded" />
-                            </div>
-                        ))}
+                    <div className="bg-white rounded-lg border border-gray-100 overflow-hidden">
+                        <div className="animate-pulse p-6 space-y-4">
+                            {[...Array(6)].map((_, i) => (
+                                <div key={i} className="h-12 bg-gray-200 rounded" />
+                            ))}
+                        </div>
                     </div>
                 ) : works && works.length > 0 ? (
                     <>
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                            {works.map((work) => (
-                                <WorkCard key={work.id} work={work} />
-                            ))}
+                        <div className="bg-white rounded-lg border border-gray-100 overflow-hidden shadow-sm">
+                            <table className="w-full">
+                                <thead className="bg-gray-50 border-b border-gray-200">
+                                    <tr>
+                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                            Title
+                                        </th>
+                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                            Artist
+                                        </th>
+                                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                                            Recordings
+                                        </th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-200 bg-white">
+                                    {works.map((work) => (
+                                        <WorkRow key={work.id} work={work} compact />
+                                    ))}
+                                </tbody>
+                            </table>
                         </div>
 
                         <Pagination

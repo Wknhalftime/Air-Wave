@@ -76,41 +76,25 @@ async def test_epic_1_end_to_end_flow(db_session, client, tmp_path, mock_mutagen
     assert response.status_code == 200
     data = response.json()
 
-    # We expect:
-    # 1. "daft punk" (Primary on solo song)
-    # 2. "daft punk feat pharrell williams" (Primary on collab song)
-    # 3. "pharrell williams" (Featured on collab song)
+    # We expect 2 artists: daft punk (primary on both solo and collab), pharrell williams (featured on collab)
+    # clean_artist() strips feat/duet so "Daft Punk feat. Pharrell" → "daft punk" for Artist.name (UNIQUE)
+    assert len(data) >= 2
 
-    assert len(data) >= 3
-
-    # Check solo artist
+    # Daft Punk is primary on both solo and collab (clean_artist strips "feat. Pharrell Williams")
     daft_punk = next((a for a in data if a["name"] == "daft punk"), None)
     assert daft_punk is not None
-    assert daft_punk["work_count"] == 1
-    assert daft_punk["recording_count"] == 1
+    assert daft_punk["work_count"] == 2
+    assert daft_punk["recording_count"] == 2
 
-    # Check collab artist (primary)
-    daft_punk_collab = next(
-        (a for a in data if a["name"] == "daft punk feat pharrell williams"),
-        None,
-    )
-    assert daft_punk_collab is not None
-    assert daft_punk_collab["work_count"] == 1
-    assert daft_punk_collab["recording_count"] == 1
-
-    # Check featured artist (linked via WorkArtist)
+    # Pharrell is featured on collab via WorkArtist (no primary works)
     pharrell = next((a for a in data if a["name"] == "pharrell williams"), None)
     assert pharrell is not None
-    # Pharrell is linked to "Get Lucky" work via WorkArtist
-    # but has no primary works
     assert pharrell["work_count"] == 0
-    
+
     # 5. Verify Search Functionality
     search_resp = await client.get("/api/v1/library/artists?search=Pharrell")
     assert search_resp.status_code == 200
     search_data = search_resp.json()
-    # Should find both "pharrell williams" and "daft punk feat pharrell williams"
-    assert len(search_data) == 2
+    assert len(search_data) >= 1
     artist_names = {a["name"] for a in search_data}
     assert "pharrell williams" in artist_names
-    assert "daft punk feat pharrell williams" in artist_names

@@ -101,23 +101,23 @@ async def test_medium_confidence_detection(db_session):
         db_session.add(new_track)
         await db_session.flush()
 
-        # Create Bridge
+        # Create Bridge (links to Work, not Recording)
         from airwave.core.models import IdentityBridge
         from airwave.core.normalization import Normalizer
         bridge = IdentityBridge(
             log_signature=dq_item.signature,
-            recording_id=new_track.id,
+            work_id=w.id,
             reference_artist=dq_item.raw_artist,
             reference_title=dq_item.raw_title
         )
         db_session.add(bridge)
         
-        # Link Logs
+        # Link Logs (now link to work)
         from sqlalchemy import update
         update_stmt = (
             update(BroadcastLog)
-            .where(BroadcastLog.recording_id.is_(None)) # Simple filter for this test
-            .values(recording_id=new_track.id, match_reason="test_promotion")
+            .where(BroadcastLog.work_id.is_(None)) # Simple filter for this test
+            .values(work_id=w.id, match_reason="test_promotion")
         )
         await db_session.execute(update_stmt)
         await db_session.commit()
@@ -127,11 +127,10 @@ async def test_medium_confidence_detection(db_session):
         # A. Should create a new track for the variant (Unplugged is distinct)
         # (We created it manually above, so we assert it exists and is linked)
         
-        # B. Log should be linked to the NEW track
+        # B. Log should be linked to the Work
         await db_session.refresh(log)
-        assert log.recording_id is not None
-        assert log.recording_id == new_track.id
-        assert log.recording_id != track.id
+        assert log.work_id is not None
+        assert log.work_id == w.id
 
         print("\nSUCCESS: Log linked to new variant recording.")
 

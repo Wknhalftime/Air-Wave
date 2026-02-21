@@ -92,3 +92,26 @@ async def client(db_session):
 @pytest.fixture(scope="function")
 async def async_client(client):
     return client
+
+
+def pytest_ignore_collect(path, config):
+    """Ignore standalone scripts in tests directory during pytest collection.
+    
+    Note: pytest 8.x still uses 'path' (py.path.local) but will transition to
+    'collection_path' (pathlib.Path) in pytest 9.x.
+    """
+    # Handle py.path.local (pytest 8.x) - uses .basename
+    # Will also work with pathlib.Path (pytest 9.x) - uses .name
+    if hasattr(path, 'basename'):
+        # py.path.local (current pytest 8.x API)
+        filename = path.basename
+    elif hasattr(path, 'name'):
+        # pathlib.Path (future pytest 9.x API)
+        filename = path.name
+    else:
+        # Fallback: convert to string and extract filename
+        filename = str(path).split('/')[-1].split('\\')[-1]
+    
+    if filename == "load_test.py":
+        return True
+    return None

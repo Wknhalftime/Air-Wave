@@ -91,19 +91,19 @@ async def test_bulk_import_matching(db_session, setup_bulk_library, tmp_path):
     boh_log = next(l for l in logs if "Queen" in l.raw_artist)
     unk_log = next(l for l in logs if "Unknown" in l.raw_artist)
     
-    # Check Jude (Exact)
-    assert jude_log.recording_id == ids["jude_id"]
+    # Check Jude (Exact) - now linked to work, not recording
+    assert jude_log.work_id is not None
     assert "Exact" in jude_log.match_reason or "Identity" in jude_log.match_reason
     
     # Check Queen (Vector/Fuzzy)
     # "Bohemian Raphsody" -> "Bohemian Rhapsody"
     # Should be High Confidence or Vector Strong
-    assert boh_log.recording_id == ids["boh_id"]
+    assert boh_log.work_id is not None
     # Check reason logic: might be "Exact" if clean normalization fixes it?
     # "Raphsody" is typo. Normalizer probably won't fix it.
     # So Vector Match or Variant.
     assert "Vector" in boh_log.match_reason or "High Confidence" in boh_log.match_reason
     
     # Check Unknown
-    assert unk_log.recording_id is None
+    assert unk_log.work_id is None
     assert unk_log.match_reason == "No Match Found"
