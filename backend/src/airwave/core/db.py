@@ -14,18 +14,22 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool, StaticPool
 
 # Create Async Engine
-# check_same_thread=False is needed for SQLite, though less critical for asyncio
-# busy_timeout (ms) allows SQLite to wait instead of failing immediately with "database is locked"
+# For SQLite:
+#   - check_same_thread=False allows SQLite to be used across threads
+#   - timeout controls how long to wait for locks (in seconds)
+#   - StaticPool maintains a single connection to serialize writes and prevent "database is locked"
+# For PostgreSQL:
+#   - Uses default QueuePool for connection pooling
+#   - No SQLite-specific parameters
 # echo=True enables SQLAlchemy query logging for debugging (controlled by DB_ECHO setting)
-#
-# For SQLite, we use StaticPool to maintain a single connection and serialize all writes.
-# This prevents "database is locked" errors from concurrent write attempts.
-# For production with PostgreSQL, this should be changed to use the default QueuePool.
+
+is_sqlite = settings.DB_URL.startswith("sqlite")
+
 engine = create_async_engine(
     settings.DB_URL,
     echo=settings.DB_ECHO,
-    connect_args={"check_same_thread": False, "timeout": 30},
-    poolclass=StaticPool if settings.DB_URL.startswith("sqlite") else None,
+    connect_args={"check_same_thread": False, "timeout": 30} if is_sqlite else {},
+    poolclass=StaticPool if is_sqlite else None,
     pool_pre_ping=True,  # Verify connections before using them
 )
 
