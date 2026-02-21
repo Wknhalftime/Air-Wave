@@ -14,6 +14,7 @@ Usage:
 Requirements:
     pip install aiohttp rich
 """
+from __future__ import annotations
 
 import asyncio
 import time
@@ -23,10 +24,10 @@ import argparse
 import random
 
 try:
-    import aiohttp
-    from rich.console import Console
-    from rich.table import Table
-    from rich.progress import Progress, SpinnerColumn, TextColumn
+    import aiohttp  # type: ignore[import-untyped]
+    from rich.console import Console  # type: ignore[import-untyped]
+    from rich.table import Table  # type: ignore[import-untyped]
+    from rich.progress import Progress, SpinnerColumn, TextColumn  # type: ignore[import-untyped]
 except ImportError:
     # Don't exit during pytest collection - this is a standalone script
     import sys

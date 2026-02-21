@@ -34,6 +34,7 @@ ruff = "^0.1.14"
 mypy = "^1.8.0"
 httpx = "^0.28.1"
 pytest-cov = "^7.0.0"
+rich = "^14.3.3"
 
 [build-system]
 requires = ["poetry-core"]
